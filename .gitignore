@@ -1,0 +1,35 @@
+# Ignore MacOS files
+.DS_Store
+~$*
+
+# Ignore R data files
+*.RData
+*.rds
+
+# Ignore h5 files
+*.h5ad
+*.h5Seurat
+
+# Ignore R history files
+.Rhistory
+.Rapp.history
+
+# Ignore temporary files
+*.tmp
+*.swp
+
+# Ignore powerpoint presentations
+*.pptx
+
+# Ignore figures
+*.pdf
+*.png
+
+# Ignore directories
+data/output/
+figures/
+documents/notes/
+
+# renv infrastructure (keep lockfile + activate.R tracked, ignore libs)
+renv/library/
+renv/staging/
