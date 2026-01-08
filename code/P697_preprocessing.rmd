@@ -1,0 +1,2842 @@
+---
+title: "P697: TEAseq studies on samples from a low dose IL-2 trial in T1D"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+setwd("/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+library(knitr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(GGally)
+theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 1),
+      axis.text = element_text(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      legend.key = element_blank(),
+      strip.text.x = element_text(size = 14, margin = margin(b = 2, t = 2)),
+      strip.background = element_rect(fill = "white", colour = "black")))
+
+library(ggthemes)
+library(ggforce)
+library(ggbeeswarm)
+library(ggvenn)
+library(viridis)
+library(stringr)
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(kableExtra)
+library(RColorBrewer)
+library(plotly)
+library(tidyr)
+library(gtools)
+library(data.table)
+library(miscHelpers)
+library(tcrGraph)
+library(edgeR)
+library(limma)
+library(ggrepel)
+library(mixtools)
+library(ComplexHeatmap)
+library(egg) # For ggarrange
+library(ggpubr) # Also for ggarrange
+library(umap)
+library(igraph)
+library(forcats)
+library(Seurat)
+library(apird)
+library(randomcoloR)
+library(rcartocolor)
+library(paletteer)
+library(circlize)
+library(gridExtra)
+library(ggpointdensity)
+library(cowplot)
+library(clusterSim) # for cluster-evaluation metrics
+library(foreach) # for parallel for-loops
+library(TCRtools) # for making circos plots with Matt D's code
+library(scDEED)
+library(dsb)
+library(monocle3)
+library(rstatix)
+library(SeuratData)
+library(SeuratWrappers)
+library(magrittr)
+library(purrr)
+library(msigdbr)
+library(clusterProfiler)
+library(enrichplot)
+library(patchwork)
+library(alphahull) # for boundary curves around clusters
+library(MASS) # for contour plots with density (provides kernal)
+library(ggh4x)
+library(mclust)
+library(readr)
+library(pracma) # for permuting data prior to scDEED calls
+library(ggalluvial)
+library(networkD3) # for html sankey diagram
+library(htmlwidgets) # for html sankey diagram
+library(jsonlite) # for html sankey diagram
+library(Rsamtools)
+library(GenomicAlignments)
+library(Signac)
+opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, cache.lazy = FALSE, results = "hide")
+opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+options(stringsAsFactors = FALSE)
+
+options(future.globals.maxSize = 1591289600)
+```
+
+```{r setupFunctions}
+
+# scratch for testing
+# hyperParamGridPCA.df <- expand.grid(
+#   findNeighborsDim = c(8, 15), # these values were chosen after examining the elbow plot.
+#   findClustersRes = c(0.05, 0.3) # these values were chosen somewhat arbitrarily
+# )
+
+# # the size of these vectors largely determines the cost of this function in walltime
+# min.dist.vector <- c(0.1, 1) # c(0.1, 0.2)
+# nNeighborsVector <- c(5, 30) # c(5, 20)
+
+# results <- optimizeRNAseqClustering(
+# seuratObject = seuratMergedIntegrated,
+# hyperParamGridPCA.df = hyperParamGridPCA.df,
+# min.dist.vector = min.dist.vector,
+# nNeighborsVector = nNeighborsVector,
+# reduction = "harmony",
+# integrated = TRUE,
+# useParallel = TRUE,
+# computeSilhouette = TRUE,
+# silhouetteSample = NULL
+# )
+
+
+# RNA cluster optimization
+optimizeRNAseqClustering <- function(seuratObject,
+                                     hyperParamGridPCA.df,
+                                     min.dist.vector,
+                                     nNeighborsVector,
+                                     reduction = "pca",
+                                     integrated = FALSE,
+                                     useParallel = FALSE,
+                                     computeSilhouette = TRUE,
+                                     silhouetteSample = NULL,
+                                     maxNClusters = 10,
+                                     minNClusters = 2) {
+  # ------------------------------------------------INPUTS------------------------------------------------
+  # seuratObject is... a Seurat object
+  # hyperParamGridPCA.df is an expanded grid for a full grid search for PCA clustering. type: dataframe
+  # min.dist.vector is a vector of min.dist values to pass to UMAP (via scDEED())
+  # nNeighborsVector is a vector of nNeighbors values to pass to UMAP (via scDEED())
+  # maxNClusters is the maximum number of clusters to be considered (will evaluate 2 through maxNClusters)
+  #-------------------------------------------------------------------------------------------------------
+
+  #----------------------------------------------OUTPUTS--------------------------------------------------
+  # result contains $hyperParamGridOptClusterAndUMAP.df and $hyperParamGridClusterOnly.df
+  #   Extract like:
+  #     hyperParamGridOptClusterAndUMAP.df <- result$hyperParamGridOptClusterAndUMAP.df (smaller output with opt PCA clustering and UMAP embedding params)
+  #     hyperParamGridClusterOnly.df <- result$hyperParamGridClusterOnly.df (larger output with full PCA clustering gridsearch and results)
+  #--------------------------------------------------------------------------------------------------------
+
+  #-----------------------------------------REQUIRED PACKAGES----------------------------------------------
+  # Seurat, parallel, doParallel, foreach, clusterSim, cluster, dplyr, scDEED, stringr, pracma
+  #--------------------------------------------------------------------------------------------------------
+
+  # STEP 1: grid search over FindNeighbors() and FindClusters() hyperparameters to find
+  # the best combinations for each nClusters obtained
+
+  # Extract embedding matrix outside of the loop(s)
+  fullEmbeddingMatrix <- Embeddings(seuratObject, reduction = reduction)
+
+  if (useParallel) {
+    # Existing parallel path (kept for backwards compatibility); note: higher memory footprint
+    nCores <- parallel::detectCores() - 2 # leave 2 cores unused to reduce risk of RAM overuse.
+    myCluster <- parallel::makeCluster(nCores, type = "FORK")
+    doParallel::registerDoParallel(cl = myCluster)
+    clusteringMetrics <- foreach(
+      findNeighborsDim = hyperParamGridPCA.df$findNeighborsDim,
+      findClustersRes = hyperParamGridPCA.df$findClustersRes,
+      .combine = "cbind"
+    ) %dopar% {
+      set.seed(6022)
+      obj <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:findNeighborsDim, verbose = FALSE)
+      obj <- FindClusters(obj, resolution = findClustersRes, verbose = FALSE)
+      metaData.df <- obj@meta.data
+      clusterMat <- fullEmbeddingMatrix[, 1:findNeighborsDim, drop = FALSE]
+      clusterVect <- as.numeric(metaData.df$seuratClusters)
+      nClusters <- dim(table(metaData.df$seuratClusters))
+      daviesBouldinIdx <- index.DB(clusterMat, clusterVect)
+      calinskiHarabasz <- index.G1(clusterMat, clusterVect)
+      medianSilScore <- NaN
+      if (computeSilhouette) {
+        silMat <- clusterMat
+        if (!is.null(silhouetteSample) && silhouetteSample < nrow(silMat)) {
+          sampleIdx <- sample.int(nrow(silMat), silhouetteSample)
+          silMat <- silMat[sampleIdx, , drop = FALSE]
+          silVec <- clusterVect[sampleIdx]
+        } else {
+          silVec <- clusterVect
+        }
+        silScore <- silhouette(silVec, dist(silMat))
+        if (!anyNA(silScore)) {
+          silScoreSummary <- summary(silScore)
+          medianSilScore <- unname(silScoreSummary$si.summary["Median"])
+        }
+      }
+      out <- c(
+        nClusters = nClusters,
+        DBIndex = daviesBouldinIdx$DB,
+        CHMetric = calinskiHarabasz,
+        medianSilScore = medianSilScore
+      )
+      rm(obj, metaData.df, clusterMat, clusterVect)
+      gc(verbose = FALSE)
+      out
+    }
+    clusteringMetrics <- t(clusteringMetrics)
+    hyperParamGridPCA.df$DBIndex <- clusteringMetrics[, "DBIndex"]
+    hyperParamGridPCA.df$CHMetric <- clusteringMetrics[, "CHMetric"]
+    hyperParamGridPCA.df$medianSilScore <- clusteringMetrics[, "medianSilScore"]
+    hyperParamGridPCA.df$nClusters <- clusteringMetrics[, "nClusters"]
+    parallel::stopCluster(cl = myCluster)
+  } else {
+    # Memory-optimized sequential path with neighbor graph reuse
+    nRows <- nrow(hyperParamGridPCA.df)
+    DBIndexVec <- numeric(nRows)
+    CHVec <- numeric(nRows)
+    SilVec <- numeric(nRows)
+    nClusVec <- numeric(nRows)
+    lastDim <- NA_integer_
+    for (rowIdx in seq_len(nRows)) {
+      findNeighborsDim <- hyperParamGridPCA.df$findNeighborsDim[rowIdx]
+      findClustersRes <- hyperParamGridPCA.df$findClustersRes[rowIdx]
+      # Recompute neighbor graph only when dimension changes
+      if (is.na(lastDim) || findNeighborsDim != lastDim) {
+        seuratObject <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:findNeighborsDim, verbose = FALSE)
+        lastDim <- findNeighborsDim
+      }
+      seuratObject <- FindClusters(seuratObject, resolution = findClustersRes, verbose = FALSE)
+      metaData.df <- seuratObject@meta.data
+      clusterMat <- fullEmbeddingMatrix[, 1:findNeighborsDim, drop = FALSE]
+      clusterVect <- as.numeric(metaData.df$seuratClusters)
+      nClusVec[rowIdx] <- dim(table(metaData.df$seuratClusters))
+      daviesBouldinIdx <- index.DB(clusterMat, clusterVect)
+      calinskiHarabasz <- index.G1(clusterMat, clusterVect)
+      DBIndexVec[rowIdx] <- daviesBouldinIdx$DB
+      CHVec[rowIdx] <- calinskiHarabasz
+      SilVec[rowIdx] <- NaN
+      if (computeSilhouette) {
+        silMat <- clusterMat
+        if (!is.null(silhouetteSample) && silhouetteSample < nrow(silMat)) {
+          sampleIdx <- sample.int(nrow(silMat), silhouetteSample)
+          silMat <- silMat[sampleIdx, , drop = FALSE]
+          silVec <- clusterVect[sampleIdx]
+        } else {
+          silVec <- clusterVect
+        }
+        silScore <- silhouette(silVec, dist(silMat))
+        if (!anyNA(silScore)) {
+          silScoreSummary <- summary(silScore)
+          SilVec[rowIdx] <- unname(silScoreSummary$si.summary["Median"])
+        }
+      }
+      gc(verbose = FALSE)
+    }
+    hyperParamGridPCA.df$DBIndex <- DBIndexVec
+    hyperParamGridPCA.df$CHMetric <- CHVec
+    hyperParamGridPCA.df$medianSilScore <- SilVec
+    hyperParamGridPCA.df$nClusters <- nClusVec
+  }
+
+  # scale the clustering metrics to fall between 0 and 1
+  hyperParamGridPCA.df$DBIndex <- (hyperParamGridPCA.df$DBIndex - min(hyperParamGridPCA.df$DBIndex, na.rm = TRUE)) /
+    (max(hyperParamGridPCA.df$DBIndex, na.rm = TRUE) - min(hyperParamGridPCA.df$DBIndex, na.rm = TRUE))
+
+  hyperParamGridPCA.df$CHMetric <- (hyperParamGridPCA.df$CHMetric - min(hyperParamGridPCA.df$CHMetric, na.rm = TRUE)) /
+    (max(hyperParamGridPCA.df$CHMetric, na.rm = TRUE) - min(hyperParamGridPCA.df$CHMetric, na.rm = TRUE))
+
+  hyperParamGridPCA.df$medianSilScore <- (hyperParamGridPCA.df$medianSilScore - min(hyperParamGridPCA.df$medianSilScore, na.rm = TRUE)) /
+    (max(hyperParamGridPCA.df$medianSilScore, na.rm = TRUE) - min(hyperParamGridPCA.df$medianSilScore, na.rm = TRUE))
+
+  # make an inverse DB score so that it is more easily compared to the other two metrics
+  # (small DB is best, but large CH and silscore are best)
+  hyperParamGridPCA.df$DBIndexInverse <- 1 - hyperParamGridPCA.df$DBIndex
+
+  # create hyperParamGridPCA.df$meanEvalMetric, as the mean of $DBIndex, $CHMetric, $medianSilScore
+  hyperParamGridPCA.df$meanEvalMetric <- rowMeans(hyperParamGridPCA.df[, c("DBIndexInverse", "CHMetric", "medianSilScore")], na.rm = TRUE)
+
+  # sort and export (optional) the hyperparamgrid
+  hyperParamGridPCA.df <- hyperParamGridPCA.df %>%
+    arrange(nClusters, desc(meanEvalMetric))
+
+  # create a subset of hyperParamGridPCA.df with the best option for each nClusters
+  hyperParamGridOptSubset.df <- hyperParamGridPCA.df %>%
+    group_by(nClusters) %>%
+    filter(meanEvalMetric == max(meanEvalMetric)) %>%
+    ungroup()
+
+  # Pre-allocate min.dist and nNeighbors columns with NA values
+  hyperParamGridOptSubset.df$min.dist <- NA
+  hyperParamGridOptSubset.df$nNeighbors <- NA
+
+  permutedObject <- NULL
+
+  if (isTRUE(integrated)) {
+    baseEmbedding <- Embeddings(seuratObject, reduction = reduction)
+    if (is.null(baseEmbedding)) {
+      stop(sprintf("Reduction '%s' not found on supplied Seurat object", reduction))
+    }
+
+    permutedEmbedding <- baseEmbedding
+    set.seed(314)
+    for (colIdx in seq_len(ncol(permutedEmbedding))) {
+      rowOrder <- pracma::randperm(nrow(permutedEmbedding))
+      permutedEmbedding[, colIdx] <- baseEmbedding[rowOrder, colIdx]
+    }
+
+    permutedObject <- seuratObject
+    reductionKey <- tryCatch(Seurat::Key(seuratObject[[reduction]]), error = function(...) NULL)
+    if (is.null(reductionKey)) {
+      reductionKey <- paste0(reduction, "_")
+    }
+    permutedObject[[reduction]] <- CreateDimReducObject(
+      embeddings = permutedEmbedding,
+      key = reductionKey,
+      assay = DefaultAssay(permutedObject)
+    )
+  }
+
+  # STEP 2: use scDEED to optimize the UMAP hyperparameters
+  # ---------------------------start of scDEED UMAP opt---------------------------------------
+  # if nrow(hyperParamGridOptSubset.df) is smaller than maxNClusters, then set maxNClusters to nrow(hyperParamGridOptSubset.df)
+  if (nrow(hyperParamGridOptSubset.df) < maxNClusters) {
+    maxNClusters <- nrow(hyperParamGridOptSubset.df)
+  }
+
+  # Loop over the rows of hyperParamGridOptSubset.df, finding the best UMAP embedding for each nClusters
+  for (i in minNClusters:maxNClusters) {
+    # Extract necessary values from hyperParamGridOptSubset.df
+    nClusters <- hyperParamGridOptSubset.df$nClusters[i]
+    numPCs <- hyperParamGridOptSubset.df$findNeighborsDim[i]
+    findClustersRes <- hyperParamGridOptSubset.df$findClustersRes[i]
+
+    set.seed(6022)
+    seuratObject <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:numPCs)
+    seuratObject <- FindClusters(seuratObject, resolution = findClustersRes)
+
+    if (isTRUE(integrated)) {
+      scDEEDResult <- scDEED(seuratObject, # input Seurat object (must have UMAP or t-SNE already run)
+        K = numPCs, # number of PCs
+        reduction.method = "umap", # 'umap' or 'tsne'
+        min.dist =  min.dist.vector, # scDEED default is 0.1 & 0.4; Seurat default is 0.3
+        nNeighbors = nNeighborsVector, # scDEED defaults are c(5, 20, 30, 40, 50). Seurat default is 30.
+        preEmbedding = reduction,
+        permuted = permutedObject,
+        similarityPercent = 0.5, # scDEED default
+        dubiousCutoff = 0.05, # scDEED default
+        trustworthyCutoff = 0.95) # scDEED default
+    } else {
+      scDEEDResult <- scDEED(seuratObject, # input Seurat object (must have UMAP or t-SNE already run)
+        K = numPCs, # number of PCs
+        reduction.method = "umap", # 'umap' or 'tsne'
+        min.dist =  min.dist.vector, # scDEED default is 0.1 & 0.4; Seurat default is 0.3
+        nNeighbors = nNeighborsVector, # scDEED defaults are c(5, 20, 30, 40, 50). Seurat default is 30.
+        similarityPercent = 0.5, # scDEED default
+        dubiousCutoff = 0.05, # scDEED default
+        trustworthyCutoff = 0.95) # scDEED default
+    }
+
+    # Extract optimal UMAP hyperparameters (minimizing number of dubious cells)
+    if (!is.null(scDEEDResult) && !is.null(scDEEDResult$numDubious)) {
+      nd <- scDEEDResult$numDubious
+      if (all(c("numberDubiousCells", "min.dist", "nNeighbors") %in% colnames(nd))) {
+        optIdx <- which(nd$numberDubiousCells == min(nd$numberDubiousCells, na.rm = TRUE))[1]
+        if (!is.na(optIdx)) {
+          hyperParamGridOptSubset.df$min.dist[i] <- nd$min.dist[optIdx]
+          hyperParamGridOptSubset.df$nNeighbors[i] <- nd$nNeighbors[optIdx]
+        }
+      }
+    }
+  }
+
+  # Reorder columns to place min.dist and nNeighbors after findClustersRes
+  hyperParamGridOptSubset.df <- hyperParamGridOptSubset.df %>%
+    dplyr::select(findNeighborsDim, findClustersRes, min.dist, nNeighbors, everything())
+
+  # Return the hyperparam dataframes
+  return(list(hyperParamGridOptClusterAndUMAP.df = hyperParamGridOptSubset.df, hyperParamGridClusterOnly.df = hyperParamGridPCA.df))
+}
+
+# function for saving plots as both pdf and png
+savePlot <- function(
+    plot,
+    plotDir,
+    filename,
+    height,
+    width,
+    units = "in",
+    dpi = 600,
+    formats = c("pdf", "png")
+    ) {
+  # Ensure plotDir exists
+  if (!dir.exists(plotDir)) dir.create(plotDir, recursive = TRUE)
+
+  # Save as PDF
+  if ("pdf" %in% formats) {
+    pdf(file.path(plotDir, paste0(filenameSuffix, "_", filename, ".pdf")), height = height, width = width)
+    print(plot)
+    dev.off()
+  }
+
+  # Save as PNG
+  if ("png" %in% formats) {
+    png(
+      file.path(plotDir, paste0(filenameSuffix, "_", filename, ".png")),
+      height = height,
+      width = width,
+      units = units,
+      res = dpi
+    )
+    print(plot)
+    dev.off()
+  }
+}
+
+# Remove cells with: a) 3+ alphas, b) cells with 2 alphas and 2 betas, and c) 2 betas
+# Remove iNKT and MAIT cells
+callMultiplets <- function(tcrs,
+                           nAlphaCut = 3,
+                           nBetaCut = 2,
+                           alphaAndBetaCut = 2,
+                           callINKT = TRUE,
+                           callMAIT = TRUE) {
+  # Count chains
+  chainCounts <- tcrs %>%
+    dplyr::group_by(barcode) %>%
+    dplyr::summarise(nAlpha = sum(chain ==  "TRA"),
+      nBeta = sum(chain == "TRB"))
+
+  multiplets <- chainCounts %>%
+    dplyr::filter(nAlpha >= nAlphaCut |
+      nBeta >= nBetaCut |
+      (nAlpha >= alphaAndBetaCut & nBeta >= alphaAndBetaCut))
+
+  tcrs$multiplet <- tcrs$barcode %in% multiplets$barcode
+
+  if (callMAIT == TRUE) {
+    tcrs <- tcrs %>%
+      dplyr::mutate(isMAIT = (str_detect(vGene, "TRAV1-2") &
+        str_detect(jGene, "TRAJ(33|12|20)")))
+  }
+
+  if (callINKT == TRUE) {
+    tcrs <- tcrs %>%
+      dplyr::mutate(isINKT = (str_detect(vGene, "TRAV10") &
+        str_detect(jGene, "TRAJ18")))
+  }
+  return(tcrs)
+}
+
+# finds all pairs of alpha/beta TCRs
+# TCRs is a dataframe that has a detected TCR chain for each row (alpha or beta or gamma, etc.) This is the output of mixcr, and maybe something analogous for 10x. But the columns might be named something different for 10x.
+# adapted from A.Hu code
+combinePairs <- function(tcrDf) {
+  a <- tcrDf[tcrDf$chain %in% c("TRA", "a"), ]
+  b <- tcrDf[tcrDf$chain %in% c("TRB", "b"), ]
+  commonbarcodes <- intersect(a$barcode, b$barcode) # get barcodes that have both an alpha or beta chain
+  a <- a[a$barcode %in% commonbarcodes, ]
+  b <- b[b$barcode %in% commonbarcodes, ]
+
+  # Compute how many alpha/beta pairs there should be
+  atab <- table(a$barcode)
+  btab <- table(b$barcode)
+  nPairs <- sum(atab[commonbarcodes] * btab[commonbarcodes])
+
+  # Initialize the pairs data frame
+  pairs <- data.frame(CDR3b = rep("", nPairs),
+    CDR3bnt = rep("", nPairs),
+    TRBV = rep("", nPairs),
+    TRBJ = rep("", nPairs),
+    CDR3a = rep("", nPairs),
+    CDR3ant = rep("", nPairs),
+    TRAV = rep("", nPairs),
+    TRAJ = rep("", nPairs),
+    barcode = rep("", nPairs),
+    fullLengthNTa = rep("", nPairs),
+    fullLengthNTb = rep("", nPairs))
+
+  # Iterate through the TCR alphas and betas and fill out the pair dataframe
+  k <- 1
+  for (barcode in commonbarcodes) {
+    arows <- which(a$barcode == barcode)
+    brows <- which(b$barcode == barcode)
+    for (i in arows) {
+      for (j in brows) {
+        pairs[k, ] <- c(b$cdr3[j],
+          b$cdr3_nt[j],
+          b$vGene[j],
+          b$jGene[j],
+          a$cdr3[i],
+          a$cdr3_nt[i],
+          a$vGene[i],
+          a$jGene[i],
+          barcode,
+          a$fullLengthNT[i],
+          b$fullLengthNT[j])
+        k <- k + 1
+      }
+    }
+  }
+  return(pairs)
+}
+
+# Create Sankey diagram showing hierarchical clustering splits
+# With custom JS for full-lineage highlighting on hover
+createClusteringSankey <- function(clusterTrackingDf, plotTitle = "Hierarchical Clustering",
+                                   plotDir = NULL, filename = NULL,
+                                   height = 8, width = 12) {
+  # clusterTrackingDf should have columns: cellId, and one column per nClusters value
+  # e.g., clusters_n3, clusters_n4, clusters_n5, etc.
+
+  if (!requireNamespace("networkD3", quietly = TRUE)) {
+    warning("networkD3 package not available. Sankey plot will not be created.")
+    return(NULL)
+  }
+  if (!requireNamespace("htmlwidgets", quietly = TRUE)) {
+    warning("htmlwidgets package not available. Sankey plot will not be created.")
+    return(NULL)
+  }
+
+  # Get cluster column names in order
+  clusterCols <- grep("^clusters_n", colnames(clusterTrackingDf), value = TRUE)
+  if (length(clusterCols) < 2) {
+    warning("Need at least 2 clustering levels to create Sankey diagram")
+    return(NULL)
+  }
+
+  # Sort by nClusters value
+  clusterNums <- as.integer(sub("clusters_n", "", clusterCols))
+  clusterCols <- clusterCols[order(clusterNums)]
+
+  # Build links dataframe for Sankey
+  linksList <- list()
+
+  for (i in 1:(length(clusterCols) - 1)) {
+    fromCol <- clusterCols[i]
+    toCol <- clusterCols[i + 1]
+
+    # Create flow table
+    flowDf <- clusterTrackingDf %>%
+      dplyr::group_by(!!rlang::sym(fromCol), !!rlang::sym(toCol)) %>%
+      dplyr::summarise(value = dplyr::n(), .groups = "drop") %>%
+      dplyr::mutate(
+        source = paste0(fromCol, "_", !!rlang::sym(fromCol)),
+        target = paste0(toCol, "_", !!rlang::sym(toCol))
+      )
+
+    linksList[[i]] <- flowDf %>%
+      dplyr::select(source, target, value)
+  }
+
+  # Combine all links
+  links <- dplyr::bind_rows(linksList)
+
+  # Create nodes dataframe
+  nodes <- data.frame(
+    name = unique(c(links$source, links$target)),
+    stringsAsFactors = FALSE
+  )
+
+  # Convert links to use node indices
+  links$IDsource <- match(links$source, nodes$name) - 1
+  links$IDtarget <- match(links$target, nodes$name) - 1
+
+  # Create Sankey diagram
+  sankeyPlot <- networkD3::sankeyNetwork(
+    Links = links,
+    Nodes = nodes,
+    Source = "IDsource",
+    Target = "IDtarget",
+    Value = "value",
+    NodeID = "name",
+    fontSize = 12,
+    nodeWidth = 30,
+    nodePadding = 10
+  )
+
+  # Build cell-level lineage data for JavaScript
+
+  # Each cell has a path through all clustering levels
+  # Convert to JSON format: array of objects, each with the node names at each level
+  cellLineages <- lapply(1:nrow(clusterTrackingDf), function(i) {
+    rowData <- clusterTrackingDf[i, clusterCols, drop = FALSE]
+    nodeNames <- sapply(clusterCols, function(col) {
+      paste0(col, "_", rowData[[col]])
+    })
+    as.list(nodeNames)
+  })
+
+  # Convert to JSON string
+  cellLineages_json <- jsonlite::toJSON(cellLineages, auto_unbox = TRUE)
+
+  # Custom JavaScript for full-lineage highlighting based on CELL-LEVEL data
+  # When hovering over a node, find all cells that pass through that node,
+  # then highlight only the other nodes those same cells pass through
+  # AND rescale link widths to show lineage-specific cell counts
+  fullLineageJs <- sprintf('
+function(el, x) {
+  setTimeout(function() {
+    var svg = d3.select(el).select("svg");
+    var link = svg.selectAll(".link");
+    var node = svg.selectAll(".node");
+
+    // Cell-level lineage data: each element is an object with node names for one cell
+    var cellLineages = %s;
+
+    // Build index: nodeName -> array of cell indices that pass through this node
+    var nodeToCell = {};
+    for (var cellIdx = 0; cellIdx < cellLineages.length; cellIdx++) {
+      var cellPath = cellLineages[cellIdx];
+      for (var key in cellPath) {
+        var nodeName = cellPath[key];
+        if (!nodeToCell[nodeName]) nodeToCell[nodeName] = [];
+        nodeToCell[nodeName].push(cellIdx);
+      }
+    }
+
+    // Store original link stroke-widths for restoration
+    link.each(function(d) {
+      d.originalStrokeWidth = d3.select(this).style("stroke-width");
+      d.originalValue = d.value;
+    });
+
+    // Helper to make a link key from source->target names
+    function linkKey(srcName, tgtName) {
+      return srcName + "|||" + tgtName;
+    }
+
+    // Remove existing handlers and add new ones
+    node.on("mouseover", null).on("mouseout", null);
+
+    node.on("mouseover", function(arg1, arg2) {
+      // D3 v4: function(d, i) - D3 v6: function(event, d)
+      var nodeData;
+      if (arg1 && typeof arg1.name === "string") {
+        nodeData = arg1;
+      } else if (arg2 && typeof arg2.name === "string") {
+        nodeData = arg2;
+      } else {
+        nodeData = d3.select(this).datum();
+      }
+
+      if (!nodeData || !nodeData.name) {
+        return;
+      }
+
+      var nodeName = nodeData.name;
+
+      // Find all cells that pass through this node
+      var cellsInNode = nodeToCell[nodeName] || [];
+      var cellSet = {};
+      for (var i = 0; i < cellsInNode.length; i++) {
+        cellSet[cellsInNode[i]] = true;
+      }
+
+      // Find ALL nodes that these cells pass through AND count lineage-specific flows
+      var lineageNodes = {};
+      var lineageFlows = {};  // linkKey -> count of cells in lineage that use this link
+
+      for (var i = 0; i < cellsInNode.length; i++) {
+        var cellIdx = cellsInNode[i];
+        var cellPath = cellLineages[cellIdx];
+
+        // Sort keys by numeric value (clusters_n3, clusters_n4, ..., clusters_n17)
+        // Extract the number from "clusters_nX" and sort numerically
+        var keys = Object.keys(cellPath).sort(function(a, b) {
+          var numA = parseInt(a.replace("clusters_n", ""), 10);
+          var numB = parseInt(b.replace("clusters_n", ""), 10);
+          return numA - numB;
+        });
+
+        // Mark all nodes in this cells path
+        for (var j = 0; j < keys.length; j++) {
+          lineageNodes[cellPath[keys[j]]] = true;
+        }
+
+        // Count flows between consecutive levels for this cell
+        for (var j = 0; j < keys.length - 1; j++) {
+          var srcNode = cellPath[keys[j]];
+          var tgtNode = cellPath[keys[j + 1]];
+          var lk = linkKey(srcNode, tgtNode);
+          lineageFlows[lk] = (lineageFlows[lk] || 0) + 1;
+        }
+      }
+
+      // Find max lineage flow for scaling
+      var maxLineageFlow = 0;
+      for (var lk in lineageFlows) {
+        if (lineageFlows[lk] > maxLineageFlow) {
+          maxLineageFlow = lineageFlows[lk];
+        }
+      }
+
+      // Dim nodes not in lineage
+      node.style("opacity", function(nd) {
+        return (nd && nd.name && lineageNodes[nd.name]) ? 1.0 : 0.15;
+      });
+
+      // Update links: dim non-lineage links, rescale lineage links
+      link.each(function(ld) {
+        var srcName = ld.source.name;
+        var tgtName = ld.target.name;
+        var lk = linkKey(srcName, tgtName);
+        var lineageCount = lineageFlows[lk] || 0;
+        var inLineage = lineageCount > 0;
+
+        var elem = d3.select(this);
+
+        if (inLineage) {
+          // Rescale stroke-width based on lineage-specific count
+          // Use same scaling as original Sankey but with lineage count
+          var originalWidth = parseFloat(ld.originalStrokeWidth) || ld.dy || 1;
+          var originalValue = ld.originalValue || ld.value || 1;
+
+          // Scale: newWidth = originalWidth * (lineageCount / originalValue)
+          var scaledWidth = Math.max(1, originalWidth * (lineageCount / originalValue));
+
+          elem.style("stroke-width", scaledWidth + "px");
+          elem.style("stroke-opacity", 0.7);
+        } else {
+          elem.style("stroke-opacity", 0.02);
+        }
+      });
+    });
+
+    node.on("mouseout", function() {
+      node.style("opacity", 1.0);
+      // Restore original link widths and opacity
+      link.each(function(ld) {
+        var elem = d3.select(this);
+        elem.style("stroke-width", ld.originalStrokeWidth);
+        elem.style("stroke-opacity", 0.5);
+      });
+    });
+
+  }, 100);
+}
+', cellLineages_json)
+
+  # Attach the custom JS to the widget
+  sankeyPlot <- htmlwidgets::onRender(sankeyPlot, fullLineageJs)
+
+  # Save if directory and filename provided
+  if (!is.null(plotDir) && !is.null(filename)) {
+    htmlFile <- file.path(plotDir, paste0(filename, ".html"))
+    htmlwidgets::saveWidget(sankeyPlot, htmlFile, selfcontained = TRUE)
+    cat("Sankey plot saved to:", htmlFile, "\n")
+  }
+
+  return(sankeyPlot)
+}
+
+# Create static Sankey diagram using ggsankey for clustering hierarchy
+createClusteringSankey_static <- function(clusterTrackingDf, plotTitle = "Hierarchical Clustering",
+                                          plotDir = NULL, filename = NULL,
+                                          height = 8, width = 12) {
+  # clusterTrackingDf should have columns: cellId, and one column per nClusters value
+  # e.g., clusters_n3, clusters_n4, clusters_n5, etc.
+
+  if (!requireNamespace("ggsankey", quietly = TRUE)) {
+    warning("ggsankey package not available. Installing...")
+    if (!requireNamespace("remotes", quietly = TRUE)) {
+      install.packages("remotes")
+    }
+    remotes::install_github("davidsjoberg/ggsankey")
+  }
+  library(ggsankey)
+
+  # Get cluster column names in order
+  clusterCols <- grep("^clusters_n", colnames(clusterTrackingDf), value = TRUE)
+  if (length(clusterCols) < 2) {
+    warning("Need at least 2 clustering levels to create Sankey diagram")
+    return(NULL)
+  }
+
+  # Sort by nClusters value
+  clusterNums <- as.integer(sub("clusters_n", "", clusterCols))
+  clusterCols <- clusterCols[order(clusterNums)]
+
+  # Prepare data for ggsankey - convert to long format
+  sankeyLong <- clusterTrackingDf %>%
+    ggsankey::make_long(!!!rlang::syms(clusterCols))
+
+  # Count cells at each node
+  nodeCounts <- sankeyLong %>%
+    dplyr::filter(!is.na(node)) %>%
+    dplyr::group_by(x, node) %>%
+    dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
+    dplyr::mutate(
+      label = paste0(node, "\n(n=", format(count, big.mark = ","), ")")
+    )
+
+  # Join counts back to sankey data
+  sankeyLong <- sankeyLong %>%
+    dplyr::left_join(nodeCounts %>% dplyr::select(x, node, label), by = c("x", "node"))
+
+  # Create color palette - use a colorblind-friendly palette
+  uniqueClusters <- unique(sankeyLong$node)
+  nColors <- length(uniqueClusters)
+  clusterColors <- setNames(
+    grDevices::colorRampPalette(RColorBrewer::brewer.pal(min(12, nColors), "Set3"))(nColors),
+    uniqueClusters
+  )
+
+  # Create axis labels from column names
+  axisLabels <- paste0("n=", clusterNums)
+
+  # Create static Sankey plot
+  p <- ggplot(sankeyLong,
+    aes(x = x,
+      nextX = nextX,
+      node = node,
+      nextNode = nextNode,
+      fill = factor(node),
+      label = label)) +
+    geom_sankey(flow.alpha = 0.5, node.color = "black", smooth = 6) +
+    geom_sankey_label(size = 2.5, color = "black", fill = "white", alpha = 0.85) +
+    scale_fill_manual(values = clusterColors, guide = "none") +
+    scale_x_discrete(labels = axisLabels) +
+    labs(title = plotTitle,
+      subtitle = paste0("Showing how clusters split across ", length(clusterCols), " granularity levels"),
+      x = "Clustering Resolution (number of clusters)") +
+    theme_void() +
+    theme(
+      axis.text.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 5)),
+      plot.subtitle = element_text(size = 11, hjust = 0.5, margin = margin(b = 15)),
+      plot.margin = margin(10, 10, 10, 10)
+    )
+
+  # Save if directory and filename provided
+  if (!is.null(plotDir) && !is.null(filename)) {
+    tryCatch(
+      {
+        savePlot(
+          plot = p,
+          plotDir = plotDir,
+          filename = filename,
+          height = height,
+          width = width,
+          units = "in",
+          dpi = 600,
+          formats = c("pdf", "png")
+        )
+        cat("Static Sankey plot saved to:", file.path(plotDir, paste0(filename, ".pdf/.png")), "\n")
+      },
+      error = function(e) {
+        warning("Failed to save static Sankey plot: ", e$message)
+      })
+  }
+
+  return(p)
+}
+
+# Extract UMAP coordinates and relevant metadata
+createFacetedUmap <- function(seuratObj,
+                              reduction = "ref.umap_Treg",
+                              group_by = "seuratClusters_Treg",
+                              facetBy = "stimulationFigures",
+                              colorPalette = palRNAClustersTreg,
+                              ptSize = 1,
+                              ptAlpha = 0.8) {
+  # Extract UMAP coordinates
+  umapCoords.tmp <- as.data.frame(Embeddings(seuratObj, reduction = reduction))
+  colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
+
+  # Add cell metadata
+  umapCoords.tmp$cellId <- rownames(umapCoords.tmp)
+  metadata <- seuratObj@meta.data
+  metadata$cellId <- rownames(metadata)
+
+  # Combine coordinates and metadata
+  plotData <- merge(umapCoords.tmp, metadata, by = "cellId")
+
+  # Get the cluster column and convert to factor if needed
+  plotData[[group_by]] <- factor(plotData[[group_by]])
+
+  # Create the plot
+  ggplot(plotData, aes(x = UMAP_1, y = UMAP_2, color = .data[[group_by]])) +
+    geom_point(size = ptSize, alpha = ptAlpha) +
+    scale_color_manual(values = colorPalette) +
+    facet_wrap(reformulate(facetBy)) +
+    labs(x = "UMAP 1", y = "UMAP 2", color = "Cluster", title = "") +
+    theme_minimal() +
+    theme(
+      aspect.ratio = 1,
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      strip.background = element_rect(fill = "white", color = "black"),
+      strip.text = element_text(size = 8)
+    )
+}
+
+# can be used for faceted expression UMAPs
+createFeatureUmap <- function(seuratObj,
+                              feature,
+                              assay = "RNA", # or "FB"
+                              reduction = "ref.umap",
+                              facetBy = "stimulationFigures",
+                              ptSize = 1,
+                              ptAlpha = 0.8) {
+  # Extract UMAP coordinates
+  umapCoords.tmp <- as.data.frame(Embeddings(seuratObj, reduction = reduction))
+  colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
+  umapCoords.tmp$cellId <- rownames(umapCoords.tmp)
+
+  # Extract feature expression
+  expr <- FetchData(seuratObj, vars = feature, assay = assay)
+  expr$cellId <- rownames(expr)
+
+  # Add metadata
+  metadata <- seuratObj@meta.data
+  metadata$cellId <- rownames(metadata)
+
+  # Combine all
+  plotData <- merge(umapCoords.tmp, metadata, by = "cellId")
+  plotData <- merge(plotData, expr, by = "cellId")
+
+  # Plot
+  ggplot(plotData, aes(x = UMAP_1, y = UMAP_2, color = .data[[feature]])) +
+    geom_point(size = ptSize, alpha = ptAlpha) +
+    scale_color_viridis() +
+    facet_wrap(reformulate(facetBy)) +
+    labs(x = "UMAP 1", y = "UMAP 2", color = feature, title = paste(feature, "expression")) +
+    theme_minimal() +
+    theme(
+      aspect.ratio = 1,
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(color = "black", fill = NA, size = 0.5),
+      strip.background = element_rect(fill = "white", color = "black"),
+      strip.text = element_text(size = 8)
+    )
+}
+```
+
+```{r setUpDirectories, cache = TRUE}
+projNumber <- "P697"
+baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
+dataInputDir <- file.path(baseDir, "data/inputData")
+plotDir <- file.path(baseDir, "figures")
+dataOutputDir <- file.path(baseDir, "data/outputData")
+dataDate <- "2026-01-06"
+filenameSuffix <- paste0(projNumber, ".", dataDate)
+
+## ---------------------------------------------------------------------------
+## Define pools and construct file paths for processed (filtered) & raw h5
+## P697 is a TEAseq project with a single subproject (P697-1) containing 4 pools.
+## Unlike P650 which had 4 separate subprojects, here we have:
+##   pool697-1_1_arc, pool697-1_2_arc, pool697-1_3_arc, pool697-1_4_arc
+## ---------------------------------------------------------------------------
+
+# Base paths for the sequencing run
+P697_runDir <- "/Volumes/bioinformatics-1/pipeline/Illumina/251216_VH00126_442_AACYV5KHV"
+P697_processedDir <- "Project_P697-1Processed_bri_251218"
+
+# Define the 4 pools within subproject P697-1
+P697_pools <- tibble::tribble(
+  ~pool,           ~poolDir,
+  "pool697-1_1",   "pool697-1_1_arc",
+  "pool697-1_2",   "pool697-1_2_arc",
+  "pool697-1_3",   "pool697-1_3_arc",
+  "pool697-1_4",   "pool697-1_4_arc"
+)
+
+# Construct file paths for each pool
+# TEAseq/ARC output structure: poolDir/outs/filtered_feature_bc_matrix.h5
+P697_files_df <- P697_pools %>%
+  mutate(
+    filtered_h5 = file.path(P697_runDir, P697_processedDir, poolDir,
+      "outs", "filtered_feature_bc_matrix.h5"),
+    raw_h5 = file.path(P697_runDir, P697_processedDir, poolDir,
+      "outs", "raw_feature_bc_matrix.h5")
+  )
+
+# Vectors for downstream compatibility with prior code
+P697_samplePools <- P697_files_df$pool
+P697_files <- P697_files_df$filtered_h5
+P697_rawFiles <- P697_files_df$raw_h5
+```
+
+```{r setHashtagNames}
+## Programmatically derive donor hashtag (HT) variable names from featureReference.csv
+## Keep only features whose 'name' contains 'EXTEND' (donor hashtags), ignoring antibody capture, etc.
+## NOTE: For TEAseq, hashtag structure may differ - update pattern as needed
+
+# TODO: Update this function if/when featureReference.csv files are available for P697
+# For now, we'll read hashtag info directly from the h5 files after loading
+getHashtagVars <- function(poolName) {
+  featureFile <- file.path(dataInputDir, paste0("P697-1_", poolName, "_featureReference.csv"))
+  if (!file.exists(featureFile)) {
+    warning(paste("Feature reference file not found:", featureFile))
+    return(character(0))
+  }
+  df <- readr::read_csv(featureFile, show_col_types = FALSE)
+  # Adjust the pattern as needed for P697 hashtag naming convention
+  df %>% dplyr::filter(grepl("EXTEND|HT", name, ignore.case = TRUE)) %>% dplyr::pull(name)
+}
+
+# Build a named list of hashtag vectors per pool
+# This will be populated after we know the hashtag naming convention
+P697HashtagList <- list()
+# Uncomment and modify once featureReference files are available:
+# P697HashtagList <- setNames(lapply(P697_pools$pool, getHashtagVars),
+#   P697_pools$pool)
+```
+
+```{r read10XGEXDataFromAllFlowcells}
+# Read the filtered feature bc matrices from all 4 pools
+# TEAseq/ARC data may have different structure - Gene Expression and Peaks
+cat("Reading GEX data from", length(P697_files), "pools...\n")
+
+# Check which files exist before attempting to read
+filesExist <- file.exists(P697_files)
+cat("Files found:", sum(filesExist), "of", length(P697_files), "\n")
+if (any(!filesExist)) {
+  cat("Missing files:\n")
+  cat(paste(P697_files[!filesExist], collapse = "\n"), "\n")
+}
+
+# Read only existing files
+gexObjects.tmp <- list()
+peakObjects.tmp <- list()  # For ATAC peaks (will be ignored for now)
+
+for (i in seq_along(P697_files)) {
+  if (filesExist[i]) {
+    cat("Reading:", P697_files[i], "\n")
+    h5_data <- Read10X_h5(P697_files[i])
+
+    # TEAseq/ARC outputs may have different assay names
+    # Common names: "Gene Expression", "Peaks", "Antibody Capture"
+    availableAssays <- names(h5_data)
+    cat("  Available assays:", paste(availableAssays, collapse = ", "), "\n")
+
+    # Extract Gene Expression data
+    if ("Gene Expression" %in% availableAssays) {
+      gexObjects.tmp[[P697_samplePools[i]]] <- h5_data[["Gene Expression"]]
+    } else {
+      warning(paste("No Gene Expression assay found in", P697_files[i]))
+    }
+
+    # Extract Peaks data (for future ATAC analysis - storing but not processing)
+    if ("Peaks" %in% availableAssays) {
+      peakObjects.tmp[[P697_samplePools[i]]] <- h5_data[["Peaks"]]
+      cat("  Found", nrow(h5_data[["Peaks"]]), "peaks\n")
+    }
+  }
+}
+
+cat("\nSuccessfully loaded GEX data from", length(gexObjects.tmp), "pools\n")
+
+# Print summary of cells and genes per pool
+cat("\nSummary of loaded data:\n")
+for (poolName in names(gexObjects.tmp)) {
+  gex <- gexObjects.tmp[[poolName]]
+  cat(sprintf("  %s: %d genes x %d cells\n", poolName, nrow(gex), ncol(gex)))
+}
+
+# Make a list of Seurat gene expression count objects
+# Set parameters to define cells
+cat("\nCreating Seurat objects...\n")
+seuratObjects.tmp <- lapply(gexObjects.tmp,
+  function(x) CreateSeuratObject(counts = x,
+    min.features = 100,
+    min.cells = 3))
+
+# Print summary of Seurat objects
+cat("\nSeurat objects created:\n")
+for (poolName in names(seuratObjects.tmp)) {
+  seurat <- seuratObjects.tmp[[poolName]]
+  cat(sprintf("  %s: %d genes x %d cells\n", poolName, nrow(seurat), ncol(seurat)))
+}
+```
+
+```{r addFBData, eval = FALSE}
+# NOTE: This chunk is disabled for TEAseq data.
+# TEAseq typically includes GEX and ATAC data, not antibody capture (FB/ADT).
+# If your TEAseq experiment includes antibody capture, uncomment and adapt this code.
+
+# Create a separate "FB" assay slot within the Seurat object
+# This is preferable over adding the ab data as metadata because
+# it allows for seurat's normalization routine to be run on it.
+
+# # Separate hashtags into HT assay and surface antibody tags into FB assay, per pool
+# for (i in seq_along(seuratObjects.tmp)) {
+#   seurat.tmp <- seuratObjects.tmp[[i]]
+#   poolName <- names(seuratObjects.tmp)[i]
+#
+#   # Skip if Antibody Capture not available for this pool
+#   # abMat <- abObjects.tmp[[poolName]]
+#   # if (is.null(abMat)) {
+#   #   next
+#   # }
+#
+#   # TODO: Add antibody capture handling if needed
+#   seuratObjects.tmp[[i]] <- seurat.tmp
+# }
+```
+
+```{r loadGeneLists}
+# load the gene lists (for later when the PI specifies genes of interest)
+```
+
+```{r addQCMetricsAnno}
+## Add QC metrics: percent mito, ribo, hemoglobin, complexity, and pool/project info
+## Also check for Cell Ranger per_barcode_metrics.csv if available
+
+for (i in seq_along(seuratObjects.tmp)) {
+  seurat <- seuratObjects.tmp[[i]]
+  poolName <- names(seuratObjects.tmp)[i]
+
+  # ----- Standard computed QC metrics -----
+
+  # Percent mitochondrial genes (MT-)
+  seurat[["percentMt"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+
+
+  # Percent ribosomal genes (RPS and RPL)
+  seurat[["percentRibo"]] <- PercentageFeatureSet(seurat, pattern = "^RP[SL]")
+
+  # Percent hemoglobin genes (HBA, HBB, etc. but not HBP)
+  seurat[["percentHb"]] <- PercentageFeatureSet(seurat, pattern = "^HB[^(P)]")
+
+  # Library complexity: log10(genes) / log10(UMIs)
+  # Higher values indicate more complex libraries; low values may indicate low quality
+  seurat[["complexity"]] <- log10(seurat$nFeature_RNA) / log10(seurat$nCount_RNA)
+
+  # Percent of counts from top 20 genes (high values may indicate ambient RNA or low diversity)
+  countsMat <- GetAssayData(seurat, slot = "counts")
+  top20Pct <- apply(countsMat, 2, function(x) {
+    sum(sort(x, decreasing = TRUE)[1:min(20, length(x))]) / sum(x) * 100
+  })
+  seurat[["pctCountsInTop20Genes"]] <- top20Pct
+
+  # ----- Pool/project identifiers -----
+  seurat[["pool"]] <- poolName
+  seurat[["poolNum"]] <- i
+  # add explicit project label for downstream per-project demux
+  seurat[["project"]] <- "P697-1"  # All pools belong to P697-1
+
+  # ----- Check for Cell Ranger per_barcode_metrics.csv -----
+  # This file contains additional QC metrics from the Cell Ranger pipeline
+  poolDir <- P697_files_df$poolDir[i]
+  metricsFile <- file.path(P697_runDir, P697_processedDir, poolDir, "outs", "per_barcode_metrics.csv")
+
+  if (file.exists(metricsFile)) {
+    cat(sprintf("  Reading per_barcode_metrics.csv for %s...\n", poolName))
+    metricsDf <- read.csv(metricsFile, row.names = 1)
+
+    # Filter to cells in our Seurat object
+    commonCells <- intersect(colnames(seurat), rownames(metricsDf))
+
+    if (length(commonCells) > 0) {
+      metricsDf <- metricsDf[commonCells, , drop = FALSE]
+
+      # Add each metric column to metadata (prefix with "cr_" for Cell Ranger)
+      for (col in colnames(metricsDf)) {
+        # Skip if column is all NA or already exists
+        if (!all(is.na(metricsDf[[col]])) && !(col %in% colnames(seurat@meta.data))) {
+          seurat[[paste0("cr_", col)]] <- metricsDf[[col]]
+        }
+      }
+      cat(sprintf("    Added %d Cell Ranger metrics for %d cells\n",
+        ncol(metricsDf), length(commonCells)))
+    }
+  }
+
+  seuratObjects.tmp[[i]] <- seurat
+}
+
+# Print summary of QC metrics added
+cat("\nQC metrics summary for first pool:\n")
+qcCols <- grep("percent|complexity|pct|cr_", colnames(seuratObjects.tmp[[1]]@meta.data), value = TRUE)
+cat("  Computed metrics:", paste(qcCols[!grepl("^cr_", qcCols)], collapse = ", "), "\n")
+crCols <- qcCols[grepl("^cr_", qcCols)]
+if (length(crCols) > 0) {
+  cat("  Cell Ranger metrics:", paste(crCols, collapse = ", "), "\n")
+}
+```
+
+```{r plotNFeatures, fig.height = 3, fig.width=3}
+# Select QC cutoffs
+nFeatureLow <- 500
+nFeatureHigh <- 4000
+pctMt <- 15
+
+# Look at distributions of quality features using ggplot
+nf <- length(seuratObjects.tmp)
+ncol <- ceiling(sqrt(nf))
+nrow <- ceiling(nf / ncol)
+
+nfeaturePlots.tmp <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(nFeature_RNA = x$nFeature_RNA)
+  ggplot(df, aes(x = nFeature_RNA)) +
+    geom_histogram(bins = 50) +
+    coord_cartesian(xlim = c(0, 6000)) +
+    geom_vline(xintercept = c(nFeatureLow, nFeatureHigh), linetype = "dashed") +
+    labs(title = nm, x = "nFeature RNA", y = "Count") +
+    theme_bw()
+})
+
+nfeatureArranged.tmp <- ggpubr::ggarrange(plotlist = nfeaturePlots.tmp, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = nfeatureArranged.tmp,
+  plotDir = plotDir,
+  filename = "NFeatureHistograms",
+  height = 5.5,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotPctMito, fig.height = 3, fig.width=3}
+mitoPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(percentMt = x$percentMt)
+  ggplot(df, aes(x = percentMt)) +
+    geom_histogram(bins = 100) +
+    coord_cartesian(xlim = c(0, 25)) +
+    geom_vline(xintercept = pctMt, linetype = "dashed") +
+    labs(title = nm, x = "% mitochondrial reads", y = "Count") +
+    theme_bw()
+})
+
+mitoArranged <- ggpubr::ggarrange(plotlist = mitoPlots, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = mitoArranged,
+  plotDir = plotDir,
+  filename = "PctMitoHistograms",
+  height = 5.5,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r inspectQCCutoffs, fig.width=10, fig.height=6}
+# Density scatter plots for QC cutoff inspection
+library(ggpointdensity)
+
+featureDensityPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(
+    nFeature_RNA = x$nFeature_RNA,
+    percentMt = x$percentMt
+  )
+
+  ggplot(df, aes(x = nFeature_RNA, y = percentMt)) +
+    geom_pointdensity(size = 0.5) +
+    scale_color_viridis_c() +
+    geom_vline(xintercept = nFeatureLow, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = nFeatureHigh, linetype = "dashed", color = "red") +
+    geom_hline(yintercept = pctMt, linetype = "dashed", color = "red") +
+    labs(x = "Number of genes",
+      y = "% mito reads",
+      title = nm) +
+    xlim(c(0, 7000)) +
+    ylim(c(0, 50)) +
+    theme_bw() +
+    theme(legend.position = "none")
+})
+
+nf <- length(featureDensityPlots)
+ncol <- ceiling(sqrt(nf))
+nrow <- ceiling(nf / ncol)
+
+arranged <- ggpubr::ggarrange(plotlist = featureDensityPlots, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = arranged,
+  plotDir = plotDir,
+  filename = "QCdensityPlots",
+  height = 8,
+  width = 10,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotPctRibo, fig.height = 3, fig.width = 3}
+# Ribosomal gene percentage
+pctRibo <- 15  # QC cutoff for ribosomal percentage
+
+riboPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(percentRibo = x$percentRibo)
+  ggplot(df, aes(x = percentRibo)) +
+    geom_histogram(bins = 50) +
+    geom_vline(xintercept = pctRibo, linetype = "dashed", color = "red") +
+    coord_cartesian(xlim = c(0, 60)) +
+    labs(title = nm, x = "% ribosomal reads", y = "Count") +
+    theme_bw()
+})
+
+riboArranged <- ggpubr::ggarrange(plotlist = riboPlots, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = riboArranged,
+  plotDir = plotDir,
+  filename = "PctRiboHistograms",
+  height = 5.5,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotPctHb, fig.height = 3, fig.width = 3}
+# Hemoglobin gene percentage (blood contamination indicator)
+hbPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(percentHb = x$percentHb)
+  ggplot(df, aes(x = percentHb)) +
+    geom_histogram(bins = 50) +
+    coord_cartesian(xlim = c(0, 5)) +
+    labs(title = nm, x = "% hemoglobin reads", y = "Count") +
+    theme_bw()
+})
+
+hbArranged <- ggpubr::ggarrange(plotlist = hbPlots, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = hbArranged,
+  plotDir = plotDir,
+  filename = "PctHemoglobinHistograms",
+  height = 5.5,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotComplexity, fig.height = 3, fig.width = 3}
+# Library complexity: log10(genes) / log10(UMIs)
+# Values typically range 0.7-0.95; low values may indicate damaged/low-quality cells
+complexityPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(complexity = x$complexity)
+  ggplot(df, aes(x = complexity)) +
+    geom_histogram(bins = 50) +
+    coord_cartesian(xlim = c(0.6, 1.0)) +
+    geom_vline(xintercept = 0.8, linetype = "dashed", color = "red") +
+    labs(title = nm, x = "Library complexity (log10 genes / log10 UMIs)", y = "Count") +
+    theme_bw()
+})
+
+complexityArranged <- ggpubr::ggarrange(plotlist = complexityPlots, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = complexityArranged,
+  plotDir = plotDir,
+  filename = "ComplexityHistograms",
+  height = 5.5,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotTop20Genes, fig.height = 3, fig.width = 3}
+# Percent counts in top 20 genes (high values may indicate ambient RNA or low diversity)
+top20_plots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(pctTop20 = x$pctCountsInTop20Genes)
+  ggplot(df, aes(x = pctTop20)) +
+    geom_histogram(bins = 50) +
+    coord_cartesian(xlim = c(0, 80)) +
+    labs(title = nm, x = "% counts in top 20 genes", y = "Count") +
+    theme_bw()
+})
+
+top20_arranged <- ggpubr::ggarrange(plotlist = top20_plots, ncol = ncol, nrow = nrow)
+
+savePlot(
+  plot = top20_arranged,
+  plotDir = plotDir,
+  filename = "PctTop20GenesHistograms",
+  height = 5.5,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotQCCorrelations, fig.height = 6, fig.width = 8}
+# Multi-metric QC scatter plots to examine correlations between QC metrics
+qcScatterPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- data.frame(
+    nCount_RNA = x$nCount_RNA,
+    nFeature_RNA = x$nFeature_RNA,
+    percentMt = x$percentMt,
+    percentRibo = x$percentRibo,
+    complexity = x$complexity
+  )
+
+  # UMI vs genes colored by mito %
+  p1 <- ggplot(df, aes(x = nCount_RNA, y = nFeature_RNA, color = percentMt)) +
+    geom_point(size = 0.3, alpha = 0.5) +
+    scale_color_viridis_c(option = "plasma", limits = c(0, 20)) +
+    scale_x_log10() +
+    labs(x = "UMI counts", y = "Genes detected", color = "% mito") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  # Mito vs Ribo
+  p2 <- ggplot(df, aes(x = percentMt, y = percentRibo)) +
+    geom_pointdensity(size = 0.3) +
+    scale_color_viridis_c() +
+    geom_vline(xintercept = pctMt, linetype = "dashed", color = "red") +
+    geom_hline(yintercept = pctRibo, linetype = "dashed", color = "red") +
+    labs(x = "% mitochondrial", y = "% ribosomal") +
+    theme_bw() +
+    theme(legend.position = "none")
+
+  # Complexity vs UMI counts
+  p3 <- ggplot(df, aes(x = nCount_RNA, y = complexity, color = percentMt)) +
+    geom_point(size = 0.3, alpha = 0.5) +
+    scale_color_viridis_c(option = "plasma", limits = c(0, 20)) +
+    scale_x_log10() +
+    geom_hline(yintercept = 0.8, linetype = "dashed", color = "red") +
+    labs(x = "UMI counts", y = "Complexity", color = "% mito") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  combined <- (p1 | p2 | p3) +
+    patchwork::plot_annotation(title = nm)
+
+  return(combined)
+})
+
+# Save each pool's correlation plot
+for (i in seq_along(qcScatterPlots)) {
+  nm <- names(seuratObjects.tmp)[i]
+  savePlot(
+    plot = qcScatterPlots[[i]],
+    plotDir = plotDir,
+    filename = paste0("QCcorrelations_", nm),
+    height = 4,
+    width = 12,
+    formats = c("pdf", "png")
+  )
+}
+```
+
+```{r plotQCViolinCombined, fig.height = 8, fig.width = 10}
+# Combined violin plots of key QC metrics across all pools
+# First, combine metadata from all pools
+combinedMeta <- do.call(rbind, lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- x@meta.data
+  df$pool <- nm
+  df
+}))
+
+# Create violin plots for key metrics
+pNFeature <- ggplot(combinedMeta, aes(x = pool, y = nFeature_RNA, fill = pool)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+  geom_hline(yintercept = c(nFeatureLow, nFeatureHigh), linetype = "dashed", color = "red") +
+  labs(x = "", y = "Genes detected") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+pNCount <- ggplot(combinedMeta, aes(x = pool, y = nCount_RNA, fill = pool)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+  scale_y_log10() +
+  labs(x = "", y = "UMI counts (log10)") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+pMito <- ggplot(combinedMeta, aes(x = pool, y = percentMt, fill = pool)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+  geom_hline(yintercept = pctMt, linetype = "dashed", color = "red") +
+  labs(x = "", y = "% mitochondrial") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+pRibo <- ggplot(combinedMeta, aes(x = pool, y = percentRibo, fill = pool)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+  geom_hline(yintercept = pctRibo, linetype = "dashed", color = "red") +
+  labs(x = "", y = "% ribosomal") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+pComplexity <- ggplot(combinedMeta, aes(x = pool, y = complexity, fill = pool)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "red") +
+  labs(x = "", y = "Complexity") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+pTop20 <- ggplot(combinedMeta, aes(x = pool, y = pctCountsInTop20Genes, fill = pool)) +
+  geom_violin(scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+  labs(x = "", y = "% in top 20 genes") +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+qcViolinsCombined <- (pNCount | pNFeature | pMito) / (pRibo | pComplexity | pTop20) +
+  patchwork::plot_annotation(title = "QC metrics across pools")
+
+savePlot(
+  plot = qcViolinsCombined,
+  plotDir = plotDir,
+  filename = "QCviolins_allPools",
+  height = 8,
+  width = 12,
+  formats = c("pdf", "png")
+)
+```
+
+```{r plotCellRangerGEXMetrics, fig.height = 6, fig.width = 10}
+# Visualize key Cell Ranger GEX metrics if available
+# Check if CR metrics exist in the first pool
+hasCRMetrics <- any(grepl("^cr_", colnames(seuratObjects.tmp[[1]]@meta.data)))
+
+if (hasCRMetrics) {
+  cat("Plotting Cell Ranger GEX metrics...\n")
+
+  # Exonic vs Intronic ratio - useful for distinguishing nuclei from whole cells
+  # Nuclei tend to have higher intronic reads due to unspliced transcripts
+  if (all(c("cr_gex_conf_exonic_reads", "cr_gex_conf_intronic_reads") %in%
+    colnames(combinedMeta))) {
+
+    combinedMeta$exonicIntronicRatio <- combinedMeta$cr_gex_conf_exonic_reads /
+      (combinedMeta$cr_gex_conf_intronic_reads + 1)  # +1 to avoid div by zero
+
+    combinedMeta$pctIntronic <- combinedMeta$cr_gex_conf_intronic_reads /
+      (combinedMeta$cr_gex_conf_exonic_reads + combinedMeta$cr_gex_conf_intronic_reads) * 100
+
+    pIntronic <- ggplot(combinedMeta, aes(x = pool, y = pctIntronic, fill = pool)) +
+      geom_violin(scale = "width") +
+      geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+      labs(x = "", y = "% intronic reads",
+        title = "Intronic read fraction (higher = more nuclear RNA)") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    savePlot(
+      plot = pIntronic,
+      plotDir = plotDir,
+      filename = "CR_PctIntronicReads",
+      height = 5,
+      width = 8,
+      formats = c("pdf", "png")
+    )
+  }
+
+  # Mapped reads distribution
+  if ("cr_gex_mapped_reads" %in% colnames(combinedMeta)) {
+    pMapped <- ggplot(combinedMeta, aes(x = pool, y = cr_gex_mapped_reads, fill = pool)) +
+      geom_violin(scale = "width") +
+      geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+      scale_y_log10() +
+      labs(x = "", y = "Mapped reads (log10)", title = "GEX mapped reads per cell") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    savePlot(
+      plot = pMapped,
+      plotDir = plotDir,
+      filename = "CR_GEXMappedReads",
+      height = 5,
+      width = 8,
+      formats = c("pdf", "png")
+    )
+  }
+
+  # Duplication rate - high duplication can indicate over-sequencing or low complexity
+  if (all(c("cr_gex_conf_exonic_dup_reads", "cr_gex_conf_exonic_unique_reads") %in%
+    colnames(combinedMeta))) {
+
+    combinedMeta$gexDupRate <- combinedMeta$cr_gex_conf_exonic_dup_reads /
+      (combinedMeta$cr_gex_conf_exonic_dup_reads + combinedMeta$cr_gex_conf_exonic_unique_reads) * 100
+
+    pDup <- ggplot(combinedMeta, aes(x = pool, y = gexDupRate, fill = pool)) +
+      geom_violin(scale = "width") +
+      geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+      labs(x = "", y = "GEX duplication rate (%)", title = "Exonic read duplication rate") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+    savePlot(
+      plot = pDup,
+      plotDir = plotDir,
+      filename = "CR_GEXDuplicationRate",
+      height = 5,
+      width = 8,
+      formats = c("pdf", "png")
+    )
+  }
+} else {
+  cat("No Cell Ranger metrics found - skipping CR GEX plots\n")
+}
+```
+
+```{r plotCellRangerATACMetrics, fig.height = 8, fig.width = 12}
+# Visualize key Cell Ranger ATAC metrics - critical for TEAseq QC
+if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
+  cat("Plotting Cell Ranger ATAC metrics...\n")
+
+  # ATAC fragments per cell - key metric for ATAC quality
+  pATACFrags <- ggplot(combinedMeta, aes(x = pool, y = cr_atac_fragments, fill = pool)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+    scale_y_log10() +
+    labs(x = "", y = "ATAC fragments (log10)", title = "ATAC fragments per cell") +
+    theme_bw() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  # TSS enrichment score - fragments at TSS / expected
+  # Higher is better; typically want > 4-5
+  if ("cr_atac_TSS_fragments" %in% colnames(combinedMeta)) {
+    combinedMeta$tssEnrichment <- combinedMeta$cr_atac_TSS_fragments /
+      (combinedMeta$cr_atac_fragments + 1) * 100
+
+    pTSS <- ggplot(combinedMeta, aes(x = pool, y = tssEnrichment, fill = pool)) +
+      geom_violin(scale = "width") +
+      geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+      labs(x = "", y = "% fragments at TSS", title = "TSS enrichment") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+  }
+
+  # Fraction of reads in peaks (FRiP) - key ATAC quality metric
+  # Higher is better; typically want > 20-30%
+  if ("cr_atac_peak_region_fragments" %in% colnames(combinedMeta)) {
+    combinedMeta$frip <- combinedMeta$cr_atac_peak_region_fragments /
+      (combinedMeta$cr_atac_fragments + 1) * 100
+
+    pFRiP <- ggplot(combinedMeta, aes(x = pool, y = frip, fill = pool)) +
+      geom_violin(scale = "width") +
+      geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+      geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+      labs(x = "", y = "% fragments in peaks (FRiP)",
+        title = "Fraction of reads in peaks") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+  }
+
+  # ATAC mitochondrial reads - should be low for good quality
+  if ("cr_atac_mitochondrial_reads" %in% colnames(combinedMeta)) {
+    combinedMeta$atacMitoPct <- combinedMeta$cr_atac_mitochondrial_reads /
+      (combinedMeta$cr_atac_raw_reads + 1) * 100
+
+    pATACMito <- ggplot(combinedMeta, aes(x = pool, y = atacMitoPct, fill = pool)) +
+      geom_violin(scale = "width") +
+      geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+      labs(x = "", y = "% ATAC mitochondrial reads",
+        title = "ATAC mitochondrial contamination") +
+      theme_bw() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+  }
+
+  # Combine ATAC QC plots
+  atacPlotsAvailable <- c(
+    exists("pATACFrags"), exists("pTSS"), exists("pFRiP"), exists("pATACMito")
+  )
+
+  if (sum(atacPlotsAvailable) >= 4) {
+    atacCombined <- (pATACFrags | pTSS) / (pFRiP | pATACMito) +
+      patchwork::plot_annotation(title = "ATAC QC metrics across pools")
+  } else if (sum(atacPlotsAvailable) >= 2) {
+    atacCombined <- pATACFrags | pFRiP +
+      patchwork::plot_annotation(title = "ATAC QC metrics across pools")
+  } else {
+    atacCombined <- pATACFrags
+  }
+
+  savePlot(
+    plot = atacCombined,
+    plotDir = plotDir,
+    filename = "CR_ATACmetrics_combined",
+    height = 8,
+    width = 12,
+    formats = c("pdf", "png")
+  )
+} else {
+  cat("No ATAC metrics found - skipping CR ATAC plots\n")
+}
+```
+
+```{r plotInsertSizeDistributions, fig.height = 6, fig.width = 10, message = FALSE}
+# Insert size distribution from BAM files
+# For ATAC-seq, this should show nucleosomal periodicity:
+#   - Peak ~100bp: nucleosome-free regions
+#   - Peak ~200bp: mono-nucleosome
+#   - Peak ~400bp: di-nucleosome
+#   - Peak ~600bp: tri-nucleosome
+# For GEX, the distribution depends on library prep method
+
+# Find BAM files for each pool
+# TEAseq/ARC has separate GEX and ATAC BAM files
+insertSizePlots <- list()
+
+for (i in seq_along(P697_pools$poolDir)) {
+  poolName <- P697_pools$pool[i]
+  poolDir <- P697_pools$poolDir[i]
+  outsDir <- file.path(P697_runDir, P697_processedDir, poolDir, "outs")
+
+  # Look for ATAC BAM file (most informative for insert size in TEAseq)
+  atacBAM <- file.path(outsDir, "atacPossortedBam.bam")
+  gexBAM <- file.path(outsDir, "gexPossortedBam.bam")
+
+  # Process ATAC BAM if available (prioritize this for TEAseq)
+  if (file.exists(atacBAM)) {
+    cat(sprintf("Processing ATAC BAM for %s...\n", poolName))
+
+    # Sample reads for efficiency (full BAM can be huge)
+    # Read a subset of alignments
+    tryCatch(
+      {
+        param <- ScanBamParam(what = c("isize"),
+          flag = scanBamFlag(isPaired = TRUE, isProperPair = TRUE))
+
+        # Sample from BAM file - read first N records for speed
+        # For production, you might want to sample across the whole file
+        aln <- readGAlignments(atacBAM, param = param,
+          use.names = FALSE)
+
+        # Limit to first 1M reads for speed if file is large
+        if (length(aln) > 1000000) {
+          set.seed(42)
+          aln <- aln[sample(length(aln), 1000000)]
+        }
+
+        isizes <- abs(mcols(aln)$isize)
+        isizes <- isizes[isizes > 0 & isizes < 1000 & !is.na(isizes)]
+
+        if (length(isizes) > 1000) {
+          # Create histogram data
+          dfATAC <- data.frame(
+            insertSize = isizes,
+            pool = poolName,
+            assay = "ATAC"
+          )
+
+          # Linear scale plot - better for seeing nucleosomal pattern
+          pLinear <- ggplot(dfATAC, aes(x = insertSize)) +
+            geom_histogram(aes(y = ..density..), bins = 200, fill = "steelblue", alpha = 0.7) +
+            geom_density(color = "red", linewidth = 0.8) +
+            geom_vline(xintercept = c(100, 200, 400, 600),
+              linetype = "dashed", color = "darkgrey", alpha = 0.7) +
+            annotate("text", x = c(100, 200, 400, 600), y = Inf,
+              label = c("NFR", "mono", "di", "tri"),
+              vjust = 2, size = 3, color = "darkgrey") +
+            coord_cartesian(xlim = c(0, 800)) +
+            labs(title = paste0("ATAC Insert Size: ", poolName),
+              x = "Insert Size (bp)", y = "Density") +
+            theme_bw()
+
+          # Log scale plot - better for seeing overall distribution
+          pLog <- ggplot(dfATAC, aes(x = insertSize)) +
+            geom_histogram(aes(y = ..density..), bins = 100, fill = "steelblue", alpha = 0.7) +
+            geom_density(color = "red", linewidth = 0.8) +
+            scale_x_log10() +
+            labs(title = paste0("ATAC Insert Size (log10): ", poolName),
+              x = "Insert Size (bp, log10)", y = "Density") +
+            theme_bw()
+
+          insertSizePlots[[paste0(poolName, "_ATAC")]] <- list(
+            linear = pLinear,
+            log = pLog,
+            data = dfATAC
+          )
+
+          # Save individual plot
+          savePlot(
+            plot = pLinear,
+            plotDir = plotDir,
+            filename = paste0("InsertSize_ATAC_", poolName),
+            height = 5,
+            width = 8,
+            formats = c("pdf", "png")
+          )
+        }
+      },
+      error = function(e) {
+        cat(sprintf("  Error reading ATAC BAM for %s: %s\n", poolName, e$message))
+      })
+  } else {
+    cat(sprintf("  ATAC BAM not found for %s\n", poolName))
+  }
+}
+
+# Combine all ATAC insert size distributions in one plot
+if (length(insertSizePlots) > 0) {
+  # Combine data from all pools
+  allATACData <- do.call(rbind, lapply(insertSizePlots, function(x) x$data))
+
+  # Combined faceted plot
+  pCombined <- ggplot(allATACData, aes(x = insertSize)) +
+    geom_histogram(aes(y = ..density..), bins = 200, fill = "steelblue", alpha = 0.7) +
+    geom_density(color = "red", linewidth = 0.8) +
+    geom_vline(xintercept = c(100, 200, 400, 600),
+      linetype = "dashed", color = "darkgrey", alpha = 0.7) +
+    coord_cartesian(xlim = c(0, 800)) +
+    facet_wrap(~pool, ncol = 2, scales = "freeY") +
+    labs(title = "ATAC Insert Size Distributions",
+      subtitle = "Vertical lines: NFR (~100bp), mono- (~200bp), di- (~400bp), tri-nucleosome (~600bp)",
+      x = "Insert Size (bp)", y = "Density") +
+    theme_bw()
+
+  savePlot(
+    plot = pCombined,
+    plotDir = plotDir,
+    filename = "InsertSize_ATAC_allPools",
+    height = 6,
+    width = 10,
+    formats = c("pdf", "png")
+  )
+
+  # Overlay plot for direct comparison
+  pOverlay <- ggplot(allATACData, aes(x = insertSize, color = pool)) +
+    geom_density(linewidth = 1) +
+    geom_vline(xintercept = c(100, 200, 400, 600),
+      linetype = "dashed", color = "darkgrey", alpha = 0.7) +
+    coord_cartesian(xlim = c(0, 800)) +
+    labs(title = "ATAC Insert Size Distributions (Overlay)",
+      subtitle = "Vertical lines: NFR (~100bp), mono- (~200bp), di- (~400bp), tri-nucleosome (~600bp)",
+      x = "Insert Size (bp)", y = "Density",
+      color = "Pool") +
+    theme_bw()
+
+  savePlot(
+    plot = pOverlay,
+    plotDir = plotDir,
+    filename = "InsertSize_ATAC_overlay",
+    height = 5,
+    width = 10,
+    formats = c("pdf", "png")
+  )
+} else {
+  cat("No ATAC BAM files were successfully processed for insert size analysis\n")
+}
+```
+
+```{r atacNucleosomeSignal, fig.height = 8, fig.width = 12, message = FALSE}
+# Compute nucleosome signal per cell from fragment files
+# This is the main Signac-style metric we don't already have from Cell Ranger
+#
+# Nucleosome signal = mononucleosomal fragments (147-294bp) / nucleosome-free fragments (<147bp)
+# Lower values indicate more open/accessible chromatin (good for ATAC)
+# Signac recommends filtering cells with NS > 4
+
+# Function to read fragment file and compute nucleosome signal
+computeNucleosomeSignalFromFrags <- function(fragFile, validBarcodes, nSample = 5000000) {
+  cat(sprintf("  Reading fragment file...\n"))
+
+  # Read fragments using data.table (handles 6-column Cell Ranger ARC format)
+  cmd <- sprintf("gunzip -c '%s' | grep -v '^#' | head -n %d", fragFile, nSample)
+  frags <- data.table::fread(cmd = cmd, header = FALSE, sep = "\t",
+    col.names = c("chr", "start", "end", "barcode", "count", "strand"))
+
+  # Calculate fragment length
+  frags$length <- frags$end - frags$start
+
+  # Filter to valid barcodes
+  frags <- frags[frags$barcode %in% validBarcodes, ]
+  cat(sprintf("  %d fragments from %d valid cells\n", nrow(frags), length(unique(frags$barcode))))
+
+  # Expand by count and classify by fragment length
+  cat("  Computing nucleosome signal...\n")
+  fragsExpanded <- frags[rep(seq_len(nrow(frags)), frags$count), ]
+  fragsExpanded$region <- ifelse(fragsExpanded$length < 147, "nucleosomeFree",
+    ifelse(fragsExpanded$length <= 294, "mononucleosomal", "other"))
+
+  # Count per barcode
+  nsDF <- fragsExpanded %>%
+    group_by(barcode, region) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = region, values_from = n, values_fill = 0) %>%
+    mutate(
+      nucleosomeSignal = mononucleosomal / (nucleosomeFree + 1)
+    )
+
+  return(list(nsDF = nsDF, frags = frags))
+}
+
+# Process each pool
+nsResults <- list()
+
+for (i in seq_along(P697_pools$poolDir)) {
+  poolName <- P697_pools$pool[i]
+  poolDir <- P697_pools$poolDir[i]
+  outsDir <- file.path(P697_runDir, P697_processedDir, poolDir, "outs")
+  fragmentsFile <- file.path(outsDir, "atac_fragments.tsv.gz")
+
+  if (!file.exists(fragmentsFile)) {
+    cat(sprintf("Fragments file not found for %s, skipping\n", poolName))
+    next
+  }
+
+  cat(sprintf("\nProcessing nucleosome signal for %s...\n", poolName))
+
+  tryCatch(
+    {
+      validBarcodes <- colnames(seuratObjects.tmp[[poolName]])
+      result <- computeNucleosomeSignalFromFrags(fragmentsFile, validBarcodes)
+      result$nsDF$pool <- poolName
+      nsResults[[poolName]] <- result
+      cat(sprintf("  Computed for %d cells\n", nrow(result$nsDF)))
+    },
+    error = function(e) {
+      cat(sprintf("  Error: %s\n", e$message))
+    })
+}
+
+# Create plots if we have results
+if (length(nsResults) > 0) {
+  # Combine nucleosome signal data
+  combinedNSDF <- do.call(rbind, lapply(nsResults, function(x) x$nsDF))
+  combinedNSDF$nucleosomeGroup <- ifelse(combinedNSDF$nucleosomeSignal > 4, "NS > 4", "NS ≤ 4")
+
+  # 1. Fragment length histograms grouped by nucleosome signal (per pool)
+  for (poolName in names(nsResults)) {
+    frags <- nsResults[[poolName]]$frags
+    nsDF <- nsResults[[poolName]]$nsDF
+    nsDF$nucleosomeGroup <- ifelse(nsDF$nucleosomeSignal > 4, "NS > 4", "NS ≤ 4")
+
+    # Merge nucleosome group into fragments
+    fragsPlot <- merge(frags, nsDF[, c("barcode", "nucleosomeGroup")], by = "barcode")
+
+    # Sample for plotting
+    if (nrow(fragsPlot) > 500000) {
+      set.seed(42)
+      fragsPlot <- fragsPlot[sample(nrow(fragsPlot), 500000), ]
+    }
+
+    pFragNS <- ggplot(fragsPlot, aes(x = length, fill = nucleosomeGroup)) +
+      geom_histogram(aes(y = after_stat(density)), bins = 200, alpha = 0.7, position = "identity") +
+      geom_vline(xintercept = c(147, 294), linetype = "dashed", color = "darkgrey") +
+      annotate("text", x = c(73, 220), y = Inf, label = c("NFR", "Mono"),
+        vjust = 2, size = 3, color = "darkgrey") +
+      coord_cartesian(xlim = c(0, 800)) +
+      scale_fill_manual(values = c("NS ≤ 4" = "steelblue", "NS > 4" = "coral")) +
+      labs(title = paste0("Fragment Length by Nucleosome Signal: ", poolName),
+        subtitle = "Cells with NS > 4 (coral) have more mononucleosomal fragments",
+        x = "Fragment Length (bp)", y = "Density", fill = "") +
+      theme_bw() +
+      theme(legend.position = "top")
+
+    savePlot(
+      plot = pFragNS,
+      plotDir = plotDir,
+      filename = paste0("ATAC_FragmentByNS_", poolName),
+      height = 5,
+      width = 8,
+      formats = c("pdf", "png")
+    )
+  }
+
+  # 2. Nucleosome signal violin plots across pools
+  pNSViolin <- ggplot(combinedNSDF, aes(x = pool, y = nucleosomeSignal, fill = pool)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+    geom_hline(yintercept = 4, linetype = "dashed", color = "red") +
+    scale_y_log10() +
+    labs(x = "", y = "Nucleosome Signal (log10)",
+      title = "Nucleosome Signal",
+      subtitle = "Ratio of mononucleosomal to nucleosome-free fragments (lower is better)") +
+    theme_bw() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  # 3. NFR and mononucleosomal fragment counts
+  pNFR <- ggplot(combinedNSDF, aes(x = pool, y = nucleosomeFree, fill = pool)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+    scale_y_log10() +
+    labs(x = "", y = "NFR Fragments (log10)", title = "Nucleosome-Free Fragments \n(<147bp)") +
+    theme_bw() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  pMono <- ggplot(combinedNSDF, aes(x = pool, y = mononucleosomal, fill = pool)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
+    scale_y_log10() +
+    labs(x = "", y = "Mono Fragments (log10)", title = "Mononucleosomal Fragments \n(147-294bp)") +
+    theme_bw() +
+    theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  # 4. Combined panel
+  nsCombined <- (pNSViolin | pNFR | pMono) +
+    plot_annotation(
+      title = "ATAC Nucleosome Signal QC",
+      subtitle = "Red dashed line at NS = 4 (cells above may have poor chromatin accessibility)"
+    )
+
+  savePlot(
+    plot = nsCombined,
+    plotDir = plotDir,
+    filename = "ATAC_NucleosomeSignal_allPools",
+    height = 5,
+    width = 12,
+    formats = c("pdf", "png")
+  )
+
+  # 5. Scatter: nucleosome signal vs ATAC fragments (from Cell Ranger if available)
+  # Add nucleosome signal to Seurat objects for downstream use
+  for (poolName in names(nsResults)) {
+    nsDF <- nsResults[[poolName]]$nsDF
+    seuratObj <- seuratObjects.tmp[[poolName]]
+
+    # Match barcodes
+    nsVals <- nsDF$nucleosomeSignal[match(colnames(seuratObj), nsDF$barcode)]
+    seuratObj[["nucleosomeSignal"]] <- nsVals
+
+    nfrVals <- nsDF$nucleosomeFree[match(colnames(seuratObj), nsDF$barcode)]
+    seuratObj[["nfrFragments"]] <- nfrVals
+
+    monoVals <- nsDF$mononucleosomal[match(colnames(seuratObj), nsDF$barcode)]
+    seuratObj[["monoFragments"]] <- monoVals
+
+    seuratObjects.tmp[[poolName]] <- seuratObj
+  }
+
+  # Print summary
+  cat("\n=== Nucleosome Signal Summary ===\n")
+  nsSummary <- combinedNSDF %>%
+    group_by(pool) %>%
+    summarise(
+      nCells = n(),
+      median_NS = round(median(nucleosomeSignal, na.rm = TRUE), 3),
+      median_NFR = round(median(nucleosomeFree, na.rm = TRUE), 0),
+      medianMono = round(median(mononucleosomal, na.rm = TRUE), 0),
+      pctPassNS = round(mean(nucleosomeSignal < 4, na.rm = TRUE) * 100, 1),
+      .groups = "drop"
+    )
+  print(as.data.frame(nsSummary), row.names = FALSE)
+
+  cat("\n  Suggested threshold: nucleosomeSignal < 4\n")
+  cat("  Lower values indicate more accessible chromatin (better ATAC quality)\n")
+
+} else {
+  cat("No nucleosome signal results - check that fragment files exist\n")
+}
+```
+
+```{r atacTSSEnrichmentProfile, fig.height = 6, fig.width = 10, message = FALSE}
+# TSS Enrichment Profiles and Density Scatter plots
+# These are key Signac-style ATAC QC visualizations
+
+# Load gene annotations from Cell Ranger reference GTF for TSS positions
+cellRangerArcRef <- "/Volumes/bioinformatics-1/pipeline/annotation/pipeline/10x/refdata-cellranger-arc-GRCh38-2024-A"
+gtfFile <- file.path(cellRangerArcRef, "genes", "genes.gtf.gz")
+
+if (file.exists(gtfFile)) {
+  cat("Loading gene annotations for TSS positions...\n")
+  annotations <- rtracklayer::import(gtfFile)
+  annotations <- annotations[annotations$type == "gene"]
+
+  # Get TSS positions (start for + strand, end for - strand)
+  tssPos <- ifelse(strand(annotations) == "+", start(annotations), end(annotations))
+  tssGR <- GRanges(
+    seqnames = seqnames(annotations),
+    ranges = IRanges(start = tssPos, width = 1),
+    strand = strand(annotations)
+  )
+  cat(sprintf("  Loaded %d gene TSS positions\n", length(tssGR)))
+
+  # Compute TSS enrichment profiles from fragment files
+  tssProfiles <- list()
+  flankSize <- 2000  # bp on each side of TSS
+
+  for (poolName in names(nsResults)) {
+    cat(sprintf("\nComputing TSS enrichment profile for %s...\n", poolName))
+
+    tryCatch(
+      {
+        frags <- nsResults[[poolName]]$frags
+
+        # Convert fragments to GRanges (use fragment midpoints)
+        fragsGR <- GRanges(
+          seqnames = frags$chr,
+          ranges = IRanges(start = (frags$start + frags$end) / 2, width = 1),
+          count = frags$count
+        )
+
+        # Find overlaps with TSS flanking regions
+        tssFlanks <- promoters(tssGR, upstream = flankSize, downstream = flankSize)
+        overlaps <- findOverlaps(fragsGR, tssFlanks)
+
+        if (length(overlaps) > 0) {
+          # Get distances from TSS
+          fragHits <- fragsGR[queryHits(overlaps)]
+          tssHits <- tssGR[subjectHits(overlaps)]
+
+          distances <- start(fragHits) - start(tssHits)
+          # Adjust for strand (flip for minus strand genes)
+          distances <- ifelse(strand(tssHits) == "-", -distances, distances)
+
+          # Create profile data
+          profileDF <- data.frame(
+            distance = distances,
+            count = fragHits$count
+          )
+
+          # Bin and aggregate
+          profileDF$bin <- cut(profileDF$distance,
+            breaks = seq(-flankSize, flankSize, by = 25),
+            labels = seq(-flankSize + 12.5, flankSize - 12.5, by = 25),
+            include.lowest = TRUE)
+
+          aggProfile <- profileDF %>%
+            group_by(bin) %>%
+            summarise(signal = sum(count), .groups = "drop") %>%
+            mutate(
+              position = as.numeric(as.character(bin)),
+              pool = poolName
+            )
+
+          tssProfiles[[poolName]] <- aggProfile
+          cat(sprintf("  Computed profile from %d overlapping fragments\n", length(overlaps)))
+        }
+      },
+      error = function(e) {
+        cat(sprintf("  Error: %s\n", e$message))
+      })
+  }
+
+  # Plot TSS enrichment profiles
+  if (length(tssProfiles) > 0) {
+    combinedTSSProfiles <- do.call(rbind, tssProfiles)
+
+    # Normalize each pool's profile to flanking regions
+    combinedTSSProfiles <- combinedTSSProfiles %>%
+      group_by(pool) %>%
+      mutate(
+        flankMean = mean(signal[abs(position) > 1500], na.rm = TRUE),
+        normalizedSignal = signal / flankMean
+      ) %>%
+      ungroup()
+
+    # Per-pool TSS profiles
+    for (poolName in names(tssProfiles)) {
+      poolProfile <- combinedTSSProfiles %>% filter(pool == poolName)
+
+      pTSS <- ggplot(poolProfile, aes(x = position, y = normalizedSignal)) +
+        geom_line(color = "steelblue", linewidth = 1) +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "red", alpha = 0.7) +
+        geom_hline(yintercept = 1, linetype = "dotted", color = "grey50") +
+        labs(
+          title = paste0("TSS Enrichment Profile: ", poolName),
+          subtitle = "Fragment signal normalized to flanking regions",
+          x = "Distance from TSS (bp)",
+          y = "Normalized Signal"
+        ) +
+        theme_bw()
+
+      savePlot(
+        plot = pTSS,
+        plotDir = plotDir,
+        filename = paste0("ATAC_TSSProfile_", poolName),
+        height = 5,
+        width = 8,
+        formats = c("pdf", "png")
+      )
+    }
+
+    # Combined overlay plot
+    pTSSOverlay <- ggplot(combinedTSSProfiles, aes(x = position, y = normalizedSignal, color = pool)) +
+      geom_line(linewidth = 1) +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "red", alpha = 0.7) +
+      geom_hline(yintercept = 1, linetype = "dotted", color = "grey50") +
+      labs(
+        title = "TSS Enrichment Profiles (All Pools)",
+        subtitle = "Fragment signal normalized to flanking regions; peak at TSS indicates good ATAC quality",
+        x = "Distance from TSS (bp)",
+        y = "Normalized Signal",
+        color = "Pool"
+      ) +
+      theme_bw() +
+      theme(legend.position = "right")
+
+    savePlot(
+      plot = pTSSOverlay,
+      plotDir = plotDir,
+      filename = "ATAC_TSSProfile_allPools",
+      height = 5,
+      width = 10,
+      formats = c("pdf", "png")
+    )
+
+    cat("\nTSS enrichment profiles saved\n")
+  }
+
+} else {
+  cat("GTF file not found - skipping TSS enrichment profiles\n")
+}
+```
+
+```{r atacDensityScatter, fig.height = 6, fig.width = 10, message = FALSE}
+# Signac-style density scatter: TSS enrichment vs nCount_peaks
+# Uses Cell Ranger metrics already loaded in the Seurat objects
+
+# ATAC QC thresholds for density scatter plots
+peakFragmentsMin <- 1500   # Minimum fragments in peaks per cell
+tssEnrichmentMin <- 2      # Minimum TSS enrichment percentage
+
+# Combine metadata from all pools (need to recreate combinedMeta here)
+combinedMetaATAC <- do.call(rbind, lapply(names(seuratObjects.tmp), function(nm) {
+  x <- seuratObjects.tmp[[nm]]
+  df <- x@meta.data
+  df$pool <- nm
+  df$barcode <- rownames(df)
+  df
+}))
+
+# Check if we have the required Cell Ranger ATAC metrics
+hasATACMetrics <- all(c("cr_atac_peak_region_fragments", "cr_atac_TSS_fragments") %in%
+  colnames(combinedMetaATAC))
+
+if (hasATACMetrics) {
+  cat("Creating density scatter plots using Cell Ranger ATAC metrics...\n")
+
+  # Calculate TSS enrichment as % of fragments at TSS
+  combinedMetaATAC$tssEnrichmentPct <- combinedMetaATAC$cr_atac_TSS_fragments /
+    (combinedMetaATAC$cr_atac_fragments + 1) * 100
+
+  # Per-pool density scatter plots
+  for (poolName in unique(combinedMetaATAC$pool)) {
+    poolData <- combinedMetaATAC %>% filter(pool == poolName)
+
+    # Filter out zeros/NAs for log scale
+    poolData <- poolData %>%
+      filter(cr_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
+
+    pDensity <- ggplot(poolData, aes(x = cr_atac_peak_region_fragments, y = tssEnrichmentPct)) +
+      geom_pointdensity(size = 0.5) +
+      scale_color_viridis_c() +
+      scale_x_log10(labels = scales::comma) +
+      geom_vline(xintercept = peakFragmentsMin, linetype = "dashed", color = "red", alpha = 0.7) +
+      geom_hline(yintercept = tssEnrichmentMin, linetype = "dashed", color = "red", alpha = 0.7) +
+      labs(
+        title = paste0("ATAC QC Density Scatter: ", poolName),
+        subtitle = sprintf("Red lines: QC thresholds (peaks > %d, TSS > %d%%)", peakFragmentsMin, tssEnrichmentMin),
+        x = "Fragments in Peaks (log10)",
+        y = "TSS Enrichment (%)"
+      ) +
+      theme_bw() +
+      theme(legend.position = "none")
+
+    savePlot(
+      plot = pDensity,
+      plotDir = plotDir,
+      filename = paste0("ATAC_DensityScatter_", poolName),
+      height = 5,
+      width = 6,
+      formats = c("pdf", "png")
+    )
+  }
+
+  # Combined faceted density scatter
+  combinedMetaATACFiltered <- combinedMetaATAC %>%
+    filter(cr_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
+
+  pDensityAll <- ggplot(combinedMetaATACFiltered,
+    aes(x = cr_atac_peak_region_fragments, y = tssEnrichmentPct)) +
+    geom_pointdensity(size = 0.3) +
+    scale_color_viridis_c() +
+    scale_x_log10(labels = scales::comma) +
+    geom_vline(xintercept = peakFragmentsMin, linetype = "dashed", color = "red", alpha = 0.7) +
+    geom_hline(yintercept = tssEnrichmentMin, linetype = "dashed", color = "red", alpha = 0.7) +
+    facet_wrap(~pool, ncol = 2) +
+    labs(
+      title = "ATAC QC Density Scatter (All Pools)",
+      subtitle = sprintf("Red lines: QC thresholds (peaks > %d, TSS > %d%%)", peakFragmentsMin, tssEnrichmentMin),
+      x = "Fragments in Peaks (log10)",
+      y = "TSS Enrichment (%)"
+    ) +
+    theme_bw() +
+    theme(legend.position = "none")
+
+  savePlot(
+    plot = pDensityAll,
+    plotDir = plotDir,
+    filename = "ATAC_DensityScatter_allPools",
+    height = 8,
+    width = 10,
+    formats = c("pdf", "png")
+  )
+
+  # Also create nucleosome signal vs TSS enrichment scatter if we have both
+  if ("nucleosomeSignal" %in% colnames(combinedMetaATAC)) {
+    combinedMetaATACNS <- combinedMetaATAC %>%
+      filter(!is.na(nucleosomeSignal), nucleosomeSignal > 0, tssEnrichmentPct > 0)
+
+    pNSTSS <- ggplot(combinedMetaATACNS, aes(x = nucleosomeSignal, y = tssEnrichmentPct)) +
+      geom_pointdensity(size = 0.3) +
+      scale_color_viridis_c() +
+      scale_x_log10() +
+      geom_vline(xintercept = 4, linetype = "dashed", color = "red", alpha = 0.7) +
+      geom_hline(yintercept = 2, linetype = "dashed", color = "red", alpha = 0.7) +
+      facet_wrap(~pool, ncol = 2) +
+      labs(
+        title = "Nucleosome Signal vs TSS Enrichment",
+        subtitle = "Good cells: low NS (<4), high TSS (>2%)",
+        x = "Nucleosome Signal (log10)",
+        y = "TSS Enrichment (%)"
+      ) +
+      theme_bw() +
+      theme(legend.position = "none")
+
+    savePlot(
+      plot = pNSTSS,
+      plotDir = plotDir,
+      filename = "ATAC_NS_vs_TSS_allPools",
+      height = 8,
+      width = 10,
+      formats = c("pdf", "png")
+    )
+  }
+
+  cat("\nDensity scatter plots saved\n")
+
+} else {
+  cat("Cell Ranger ATAC metrics not found - skipping density scatter plots\n")
+  cat("  Required: cr_atac_peak_region_fragments, cr_atac_TSS_fragments\n")
+}
+```
+
+```{r plotGEXATACCorrelation, fig.height = 6, fig.width = 10}
+# Joint GEX-ATAC QC scatter plots - important for TEAseq to ensure both modalities are good
+# Define ATAC-specific QC thresholds (use same as atacDensityScatter where applicable)
+atacFragmentsMin <- 1000   # Minimum total ATAC fragments per cell
+# peakFragmentsMin defined in atacDensityScatter chunk
+# tssEnrichmentMin defined in atacDensityScatter chunk
+fripMin <- 20              # Minimum fraction of reads in peaks (%)
+
+if (hasCRMetrics && all(c("cr_atac_fragments", "cr_gex_umis_count") %in% colnames(combinedMeta))) {
+  cat("Plotting GEX-ATAC correlation metrics...\n")
+
+  # GEX UMIs vs ATAC fragments - should be correlated for good multiome cells
+  pGEXATAC <- ggplot(combinedMeta, aes(x = cr_gex_umis_count, y = cr_atac_fragments, color = pool)) +
+    geom_point(size = 0.3, alpha = 0.3) +
+    scale_x_log10() +
+    scale_y_log10() +
+    geom_hline(yintercept = atacFragmentsMin, linetype = "dashed", color = "red", alpha = 0.7) +
+    labs(x = "GEX UMI counts (log10)", y = "ATAC fragments (log10)",
+      title = "GEX vs ATAC quality correlation") +
+    theme_bw() +
+    facet_wrap(~pool, ncol = 2)
+
+  savePlot(
+    plot = pGEXATAC,
+    plotDir = plotDir,
+    filename = "GEX_ATAC_correlation",
+    height = 6,
+    width = 10,
+    formats = c("pdf", "png")
+  )
+
+  # Combined quality: cells should have both good GEX and ATAC
+
+  # GEX pass criteria: nFeature within range, low mito, low ribo
+  combinedMeta$gexPass <- combinedMeta$nFeature_RNA > nFeatureLow &
+    combinedMeta$nFeature_RNA < nFeatureHigh &
+    combinedMeta$percentMt < pctMt &
+    combinedMeta$percentRibo < pctRibo
+
+  # ATAC pass criteria: sufficient fragments and FRiP (if available)
+  if ("frip" %in% colnames(combinedMeta)) {
+    combinedMeta$atacPass <- combinedMeta$cr_atac_fragments > atacFragmentsMin &
+      combinedMeta$frip > fripMin
+  } else {
+    combinedMeta$atacPass <- combinedMeta$cr_atac_fragments > atacFragmentsMin
+  }
+
+  combinedMeta$jointQC <- case_when(
+    combinedMeta$gexPass & combinedMeta$atacPass ~ "Both pass",
+    combinedMeta$gexPass & !combinedMeta$atacPass ~ "GEX only",
+    !combinedMeta$gexPass & combinedMeta$atacPass ~ "ATAC only",
+    TRUE ~ "Neither"
+  )
+
+  pJointQC <- ggplot(combinedMeta, aes(x = cr_gex_umis_count, y = cr_atac_fragments,
+    color = jointQC)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    scale_x_log10() +
+    scale_y_log10() +
+    scale_color_manual(values = c("Both pass" = "darkgreen", "GEX only" = "blue",
+      "ATAC only" = "orange", "Neither" = "grey70")) +
+    geom_hline(yintercept = atacFragmentsMin, linetype = "dashed", color = "red", alpha = 0.7) +
+    labs(x = "GEX UMI counts (log10)", y = "ATAC fragments (log10)",
+      color = "QC status", title = "Joint GEX-ATAC quality classification") +
+    theme_bw() +
+    facet_wrap(~pool, ncol = 2)
+
+  savePlot(
+    plot = pJointQC,
+    plotDir = plotDir,
+    filename = "GEX_ATAC_jointQC",
+    height = 6,
+    width = 10,
+    formats = c("pdf", "png")
+  )
+
+  # Summary table of joint QC
+  jointQCSummary <- combinedMeta %>%
+    group_by(pool, jointQC) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    group_by(pool) %>%
+    mutate(pct = round(n / sum(n) * 100, 1)) %>%
+    ungroup()
+
+  cat("\nJoint GEX-ATAC QC summary:\n")
+  cat(sprintf("GEX criteria: %d < nFeature < %d, percentMt < %d%%, percentRibo < %d%%\n",
+    nFeatureLow, nFeatureHigh, pctMt, pctRibo))
+  cat(sprintf("ATAC criteria: fragments > %d, FRiP > %d%%\n", atacFragmentsMin, fripMin))
+  print(as.data.frame(jointQCSummary), row.names = FALSE)
+
+  # Save joint QC summary to CSV
+  write.csv(jointQCSummary,
+    file = file.path(dataOutputDir, "jointQCSummary.csv"),
+    row.names = FALSE)
+  cat(sprintf("\nJoint QC summary saved to: %s\n", file.path(dataOutputDir, "jointQCSummary.csv")))
+
+  # Save condensed summary (all pools combined)
+  jointQCSummaryCombined <- combinedMeta %>%
+    group_by(jointQC) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(pct = round(n / sum(n) * 100, 1))
+
+  write.csv(jointQCSummaryCombined,
+    file = file.path(dataOutputDir, "jointQCSummaryCombined.csv"),
+    row.names = FALSE)
+  cat(sprintf("Combined QC summary saved to: %s\n", file.path(dataOutputDir, "jointQCSummaryCombined.csv")))
+
+  cat("\nCombined Joint QC summary (all pools):\n")
+  print(as.data.frame(jointQCSummaryCombined), row.names = FALSE)
+
+} else {
+  cat("GEX-ATAC correlation plot requires both cr_atac_fragments and cr_gex_umis_count\n")
+}
+```
+
+```{r addAnno}
+# note: colnames cleaned up manually because doing it programmatically was going to be essentially manual, anyway.
+annoP697 <- read_excel(file.path(dataInputDir, "LabDB _ P697-1_ TEAseq studies on samples from a low dose IL-2 trial in T1D.xlsx"))
+```
+
+```{r setupPalettes}
+# Extract unique donor IDs
+uniqueDonorIDs <- unique(annoP697$donorID)
+
+# Ensure the number of colors matches the number of unique donor IDs
+colors <- as.character(paletteer::paletteer_d("Polychrome::palette36", n = length(uniqueDonorIDs)))
+
+# Create named vector
+palDonorId <- setNames(colors, uniqueDonorIDs)
+
+# create project number color palette
+palProject <- c("P697-1" = "blue",
+  "P697-2" = "red",
+  "P697-3" = "darkred",
+  "P697-4" = "lightcoral")
+```
+
+```{r checkForTCRGenesPreQC}
+# TODO: we'll add this later. Moving on for now.
+```
+
+```{r makeQCCuts, results = "show"}
+# Initialize cell tracking dataframe
+# Get all starting barcodes before QC cuts
+startingBarcodesList <- list()
+for (i in seq_along(seuratObjects.tmp)) {
+  projectName <- names(seuratObjects.tmp)[i]
+  barcodesRaw <- colnames(seuratObjects.tmp[[i]])
+  # Add project prefix to match post-merge barcodes
+  barcodesPrefixed <- paste0(projectName, "_", barcodesRaw)
+  startingBarcodesList[[projectName]] <- barcodesPrefixed
+}
+allStartingBarcodes <- unlist(startingBarcodesList)
+
+# Create tracking dataframe
+cellFateTrackingDF <- data.frame(
+  barcode = allStartingBarcodes,
+  project = rep(names(startingBarcodesList),
+    sapply(startingBarcodesList, length)),
+  stage_0_initial = 1,
+  stage_1_pass_QC = 0,
+  stage_2_pass_HT = 0,
+  stage_3_pass_TCR = 0,
+  stage_4_pass_BCell = 0,
+  finalCompartment = NA_character_,
+  removedAtStage = NA_character_,
+  removalReason = NA_character_,
+  stringsAsFactors = FALSE
+)
+
+cat("Initialized cell fate tracking for", length(allStartingBarcodes), "cells\n")
+
+seuratQC.tmp <- vector("list", length(seuratObjects.tmp))
+names(seuratQC.tmp) <- names(seuratObjects.tmp)
+
+for (i in seq_along(seuratObjects.tmp)) {
+  seurat <- seuratObjects.tmp[[i]]
+  seuratQC.tmp[[i]] <- subset(
+    seurat,
+    subset = nFeature_RNA > nFeatureLow & nFeature_RNA < nFeatureHigh & percentMt < pctMt
+  )
+}
+
+# Tally how many cells pass QC by pool
+projIds <- names(seuratObjects.tmp)
+projAnno <- data.frame(
+  project = projIds,
+  nCells = NA_integer_,
+  nCellsQC = NA_integer_,
+  stringsAsFactors = FALSE
+)
+
+for (i in seq_along(seuratObjects.tmp)) {
+  projAnno$nCells[i] <- ncol(seuratObjects.tmp[[i]])
+  projAnno$nCellsQC[i] <- ncol(seuratQC.tmp[[i]])
+}
+
+projAnno$pctPass <- round(projAnno$nCellsQC / projAnno$nCells * 100, 2)
+
+# Update cell fate tracking for QC step
+qcPassedBarcodesList <- list()
+for (i in seq_along(seuratQC.tmp)) {
+  projectName <- names(seuratQC.tmp)[i]
+  barcodesRaw <- colnames(seuratQC.tmp[[i]])
+  barcodesPrefixed <- paste0(projectName, "_", barcodesRaw)
+  qcPassedBarcodesList[[projectName]] <- barcodesPrefixed
+}
+qcPassedBarcodes <- unlist(qcPassedBarcodesList)
+
+cellFateTrackingDF$stage_1_pass_QC[cellFateTrackingDF$barcode %in% qcPassedBarcodes] <- 1
+cellFateTrackingDF$removedAtStage[cellFateTrackingDF$stage_1_pass_QC == 0] <- "Stage_1_QC"
+cellFateTrackingDF$removalReason[cellFateTrackingDF$stage_1_pass_QC == 0] <- "nFeature or pctMT"
+
+cat("\nCell fate after QC filtering:\n")
+cat("  Passed QC:", sum(cellFateTrackingDF$stage_1_pass_QC), "\n")
+cat("  Removed at QC:", sum(cellFateTrackingDF$stage_1_pass_QC == 0), "\n")
+
+projAnno$pctPass <- round(projAnno$nCellsQC / projAnno$nCells * 100, 2)
+
+projAnno %>%
+  dplyr::select(project, nCells, nCellsQC, pctPass) %>%
+  dplyr::rename(
+    Project = project,
+    `Number of cells` = nCells,
+    `Number of high quality cells` = nCellsQC,
+    `Percent of cells that pass QC` = pctPass
+  ) %>%
+  kable(row.names = FALSE, caption = "Quality analysis summary") %>%
+  kable_styling(full_width = FALSE, position = "left")
+```
+
+```{r programmaticHTODemux, message=FALSE, warning=FALSE}
+# Fit two gaussians to find hashtag demultiplexing cutoffs
+# For cases without a good high-expression peak, fit negative (left) population with single Gaussian, use mean+2*sd or 99th percentile as cutoff if GMM is poor, optionally use mclust for GMM
+# requires mclust and mixtools
+findHashtagCutoff <- function(x, featureName = NULL, poolName = NULL, plotDir = NULL) {
+  x <- x[!is.na(x) & x > 0]
+  logx <- log1p(x)
+  cutoff <- NA
+  gmmOk <- FALSE
+  negMu <- NA
+  negSd <- NA
+  posMu <- NA
+  posSd <- NA
+
+  if (length(logx) < 50) {
+    cutoff <- NA
+  } else {
+    gmm <- try(Mclust(logx, G = 2, modelNames = "V"), silent = TRUE)
+    if (!inherits(gmm, "try-error") && !is.null(gmm$parameters$mean)) {
+      mu <- sort(gmm$parameters$mean)
+      sd <- sqrt(gmm$parameters$variance$sigmasq)
+      if (abs(diff(mu)) > 0.7) {
+        densX <- seq(min(logx), max(logx), length.out = 400)
+        densY1 <- gmm$parameters$pro[1] * dnorm(densX, mu[1], sd[1])
+        densY2 <- gmm$parameters$pro[2] * dnorm(densX, mu[2], sd[2])
+        densY <- densY1 + densY2
+        valleyRange <- densX[densX > mu[1] & densX < mu[2]]
+        valleyY <- densY[densX > mu[1] & densX < mu[2]]
+        if (length(valleyRange) > 5) {
+          valley <- valleyRange[which.min(valleyY)]
+          cutoff <- valley
+          gmmOk <- TRUE
+        }
+      }
+      negMu <- mu[1]
+      posMu <- mu[2]
+      negSd <- sd[1]
+      posSd <- sd[2]
+    }
+    # Quantile/density minimum fallback if no positive peak
+    if (!gmmOk) {
+      d <- density(logx, bw = "nrd0")
+      peakIdx <- which.max(d$y[d$x < median(logx)])
+      negPeak <- d$x[d$x < median(logx)][peakIdx]
+      rightLimit <- quantile(logx, 0.9995)
+      idx <- which(d$x > negPeak & d$x < rightLimit)
+      valley <- NA
+      if (length(idx) > 5) {
+        minIdx <- idx[which.min(d$y[idx])]
+        valley <- d$x[minIdx]
+      }
+      # Negative population: left of midpoint between negPeak and max
+      midpoint <- (negPeak + max(logx)) / 2
+      negVals <- logx[logx < midpoint]
+      q99_5 <- if (length(negVals) > 10) quantile(negVals, 0.99995) else quantile(logx, 0.99995)
+      # Use min of quantile and density minimum, but only if valley > negPeak
+      if (!is.na(valley) && valley > negPeak) {
+        cutoff <- min(q99_5, valley)
+      } else {
+        cutoff <- q99_5
+      }
+    }
+  }
+
+  # Diagnostic plot
+  if (!is.null(plotDir) && !is.null(featureName) && !is.null(poolName)) {
+    plotFile <- file.path(plotDir, paste0(filenameSuffix, "_HashtagFit_", poolName, "_", featureName, ".pdf"))
+    pdf(plotFile, width = 5, height = 4)
+    hist(logx, breaks = 80, col = "grey90", border = "white", freq = FALSE, main = paste0("Hashtag fit: ", featureName, " (", poolName, ")"), xlab = "log1p(counts)")
+    d <- density(logx, bw = "nrd0")
+    lines(d, col = "purple", lwd = 2)
+    if (!is.na(negMu) && !is.na(negSd)) {
+      curve(dnorm(x, negMu, negSd), add = TRUE, col = "orange", lwd = 2, n = 400)
+      abline(v = negMu, col = "orange", lty = 2)
+      abline(v = negMu + 2 * negSd, col = "orange", lty = 3)
+    }
+    if (!is.na(posMu) && !is.na(posSd)) {
+      curve(dnorm(x, posMu, posSd), add = TRUE, col = "green", lwd = 2, n = 400)
+      abline(v = posMu, col = "green", lty = 2)
+    }
+    if (!is.na(cutoff)) abline(v = cutoff, col = "red", lwd = 2)
+    legend("topright", legend = c("Density", "Neg fit", "Pos fit", "Cutoff"), col = c("purple", "orange", "green", "red"), lty = c(1, 1, 1, 1), lwd = c(2, 2, 2, 2), bty = "n")
+    dev.off()
+  }
+  return(cutoff)
+}
+
+# For each pool, demultiplex using programmatic cutoffs
+htDemuxResults <- list()
+htCutoffList <- list()
+
+# Demultiplexing loop:
+for (i in seq_along(seuratQC.tmp)) {
+  seurat <- seuratQC.tmp[[i]]
+  poolName <- names(seuratQC.tmp)[i]
+  htMat <- GetAssayData(seurat, assay = "HT", slot = "counts") # RAW counts
+  htVars <- rownames(htMat)
+  # log(count + 1) transformation, as in manual code
+  logHtMat <- log(htMat + 1)
+  cutoffs <- setNames(numeric(length(htVars)), htVars)
+  longDiag <- list()
+  fitOverlay <- list()
+  for (j in seq_along(htVars)) {
+    x <- as.numeric(logHtMat[htVars[j], ])
+    xNonzero <- x[!is.na(x) & x > 0]
+    cutoff <- NA
+    gmmOk <- FALSE
+    negMu <- NA
+    negSd <- NA
+    posMu <- NA
+    posSd <- NA
+    densX <- NULL
+    densY <- NULL
+    densY1 <- NULL
+    densY2 <- NULL
+    if (length(xNonzero) < 50) {
+      cutoff <- NA
+    } else {
+      gmm <- try(Mclust(xNonzero, G = 2, modelNames = "V"), silent = TRUE)
+      if (!inherits(gmm, "try-error") && !is.null(gmm$parameters$mean)) {
+        mu <- sort(gmm$parameters$mean)
+        sd <- sqrt(gmm$parameters$variance$sigmasq)
+        if (abs(diff(mu)) > 0.7) {
+          densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
+          densY1 <- gmm$parameters$pro[1] * dnorm(densX, mu[1], sd[1])
+          densY2 <- gmm$parameters$pro[2] * dnorm(densX, mu[2], sd[2])
+          densY <- densY1 + densY2
+          valleyRange <- densX[densX > mu[1] & densX < mu[2]]
+          valleyY <- densY[densX > mu[1] & densX < mu[2]]
+          if (length(valleyRange) > 5) {
+            valley <- valleyRange[which.min(valleyY)]
+            cutoff <- valley
+            gmmOk <- TRUE
+          }
+        }
+        negMu <- mu[1]
+        posMu <- mu[2]
+        negSd <- sd[1]
+        posSd <- sd[2]
+      }
+      # Density minimum fallback if no positive peak
+      if (!gmmOk) {
+        d <- density(xNonzero, bw = "nrd0")
+        peakIdx <- which.max(d$y[d$x < median(xNonzero)])
+        negPeak <- d$x[d$x < median(xNonzero)][peakIdx]
+        rightLimit <- quantile(xNonzero, 0.9995)
+        idx <- which(d$x > negPeak & d$x < rightLimit)
+        valley <- NA
+        if (length(idx) > 5) {
+          minIdx <- idx[which.min(d$y[idx])]
+          valley <- d$x[minIdx]
+        }
+        midpoint <- (negPeak + max(xNonzero)) / 2
+        negVals <- xNonzero[xNonzero < midpoint]
+        q99_5 <- if (length(negVals) > 10) quantile(negVals, 0.99995) else quantile(xNonzero, 0.99995)
+        if (!is.na(valley) && valley > negPeak) {
+          cutoff <- min(q99_5, valley)
+        } else {
+          cutoff <- q99_5
+        }
+        # Always compute negative fit for overlay
+        if (length(negVals) > 10) {
+          negMu <- mean(negVals)
+          negSd <- sd(negVals)
+        } else {
+          negMu <- mean(xNonzero)
+          negSd <- sd(xNonzero)
+        }
+        densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
+        densY1 <- dnorm(densX, negMu, negSd)
+        densY2 <- NA_real_
+        densY <- NA_real_
+        posMu <- NA_real_
+        posSd <- NA_real_
+      }
+    }
+    cutoffs[j] <- cutoff
+    cat(sprintf("[Demux] Pool: %s | Hashtag: %s | Cutoff: %.4f\n", poolName, htVars[j], cutoff))
+    if (length(xNonzero) > 0) {
+      longDiag[[j]] <- tibble::tibble(ht = htVars[j], logx = xNonzero, cutoff = cutoff)
+    }
+    fitOverlay[[j]] <- tibble::tibble(
+      ht = htVars[j],
+      densX = densX,
+      densY = densY,
+      densY1 = densY1,
+      densY2 = densY2,
+      negMu = negMu,
+      negSd = negSd,
+      posMu = posMu,
+      posSd = posSd
+    )
+  }
+  diagDf <- dplyr::bind_rows(longDiag)
+  if (length(fitOverlay) > 0) {
+    overlayDf <- dplyr::bind_rows(fitOverlay)
+  } else {
+    overlayDf <- tibble::tibble(ht = htVars, densX = NA_real_, densY = NA_real_, densY1 = NA_real_, densY2 = NA_real_, negMu = NA_real_, negSd = NA_real_, posMu = NA_real_, posSd = NA_real_)
+  }
+  htCutoffList[[poolName]] <- cutoffs
+  # Assign calls: apply cutoffs to log(count+1) as in manual code
+  htDf <- as.data.frame(t(as.matrix(logHtMat)))
+  colnames(htDf) <- htVars
+  nCells <- rowSums(sweep(htDf, 2, cutoffs, ">"), na.rm = TRUE)
+  call <- rep("Negative", nrow(htDf))
+  call[nCells > 1] <- "Multiplet"
+  for (j in seq_along(htVars)) {
+    idx <- which(call == "Negative" & htDf[[htVars[j]]] > cutoffs[j])
+    call[idx] <- htVars[j]
+  }
+  htDf$demuxCall <- call
+  htDemuxResults[[poolName]] <- htDf
+  # Print summary of demux calls for this pool
+  cat(sprintf("\n[Demux Summary] Pool: %s\n", poolName))
+  callCounts <- table(factor(htDf$demuxCall, levels = c(htVars, "Negative", "Multiplet")))
+  print(as.data.frame(callCounts), row.names = FALSE)
+  # Multi-panel diagnostic plot: all hashtags in one figure per pool
+  cutoffDf <- tibble::tibble(ht = names(cutoffs), cutoff = as.numeric(cutoffs))
+  nrowFacet <- 5
+  ncolFacet <- 3
+  pDiag <- ggplot(diagDf, aes(x = logx)) +
+    geom_histogram(aes(y = ..density..), bins = 80, fill = "grey80") +
+    geom_line(data = overlayDf, aes(x = densX, y = densY), color = "blue", inherit.aes = FALSE, na.rm = TRUE) +
+    geom_line(data = overlayDf, aes(x = densX, y = densY1), color = "orange", linetype = 2, inherit.aes = FALSE, na.rm = TRUE) +
+    geom_line(data = overlayDf, aes(x = densX, y = densY2), color = "green", linetype = 2, inherit.aes = FALSE, na.rm = TRUE) +
+    geom_vline(data = cutoffDf, aes(xintercept = cutoff), color = "red") +
+    facet_wrap(~ht, scales = "freeY", nrow = nrowFacet, ncol = ncolFacet) +
+    labs(title = paste0("Hashtag fits & cutoffs: ", poolName), x = "log1p(counts)", y = "Density")
+  pdf(file.path(plotDir, paste0(filenameSuffix, "_HashtagFits_", poolName, ".pdf")), width = 15, height = 10)
+  print(pDiag)
+  dev.off()
+
+  # Add htDemux to the current seurat object for ridgeplot
+  seurat$htDemux <- call
+
+  # Ridgeplot for each pool (all hashtags, grouped by demux call, one plot per feature, combined)
+  DefaultAssay(seurat) <- "HT"
+  ridgeplotFile <- file.path(plotDir, paste0(filenameSuffix, "_Ridgeplots_HTExpression_", poolName, ".pdf"))
+  pdf(ridgeplotFile, width = 30, height = 20)
+  plots <- list()
+  for (feature in htVars) {
+    p <- RidgePlot(seurat,
+      assay = "HT",
+      features = feature,
+      group.by = "htDemux",
+      slot = "data") +
+      labs(x = "Hashtag expression", y = "Assigned demux group") +
+      scale_x_continuous(limits = c(0, 10), breaks = seq(0, 10, by = 0.5)) +
+      theme(legend.position = "none")
+    plots[[feature]] <- p
+  }
+  combinedPlot <- patchwork::wrap_plots(plots, ncol = 3)
+  print(combinedPlot)
+  dev.off()
+}
+
+
+# Merge demux calls into meta.data for each seurat object
+for (i in seq_along(seuratQC.tmp)) {
+  seurat <- seuratQC.tmp[[i]]
+  poolName <- names(seuratQC.tmp)[i]
+  calls <- htDemuxResults[[poolName]]$demuxCall
+  seurat$htDemux <- calls
+  seuratQC.tmp[[i]] <- seurat
+}
+
+# Merge all pools after demux
+if (length(seuratQC.tmp) > 1) {
+  seuratQCMerged <- merge(
+    seuratQC.tmp[[1]],
+    y = seuratQC.tmp[-1],
+    add.cell.ids = names(seuratQC.tmp),
+    merge.data = TRUE
+  )
+} else {
+  seuratQCMerged <- seuratQC.tmp[[1]]
+}
+
+DefaultAssay(seuratQCMerged) <- "HT"
+
+rmTmp(ask = FALSE)
+gc()
+```

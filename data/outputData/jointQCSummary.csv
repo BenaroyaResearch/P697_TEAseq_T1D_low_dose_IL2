@@ -1,0 +1,17 @@
+"pool","jointQC","n","pct"
+"pool697-1_1","ATAC only",702,5.9
+"pool697-1_1","Both pass",10043,84
+"pool697-1_1","GEX only",1179,9.9
+"pool697-1_1","Neither",36,0.3
+"pool697-1_2","ATAC only",982,7.1
+"pool697-1_2","Both pass",11558,83.3
+"pool697-1_2","GEX only",1158,8.3
+"pool697-1_2","Neither",179,1.3
+"pool697-1_3","ATAC only",485,4.7
+"pool697-1_3","Both pass",8705,84.8
+"pool697-1_3","GEX only",1040,10.1
+"pool697-1_3","Neither",34,0.3
+"pool697-1_4","ATAC only",1345,7.9
+"pool697-1_4","Both pass",13406,78.9
+"pool697-1_4","GEX only",1881,11.1
+"pool697-1_4","Neither",353,2.1
