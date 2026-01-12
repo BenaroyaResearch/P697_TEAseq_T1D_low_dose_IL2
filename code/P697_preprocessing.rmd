@@ -956,7 +956,7 @@ filenameSuffix <- paste0(projNumber, ".", dataDate)
 ## ---------------------------------------------------------------------------
 
 # Base paths for the sequencing run
-P697_runDir <- "/Volumes/bioinformatics-1/pipeline/Illumina/251216_VH00126_442_AACYV5KHV"
+P697_runDir <- "/Volumes/bioinformatics/pipeline/Illumina/251216_VH00126_442_AACYV5KHV"
 P697_processedDir <- "Project_P697-1Processed_bri_251218"
 
 # Define the 4 pools within subproject P697-1
