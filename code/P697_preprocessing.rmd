@@ -101,1024 +101,502 @@ options(stringsAsFactors = FALSE)
 options(future.globals.maxSize = 1591289600)
 ```
 
-```{r setupFunctions}
-
-# scratch for testing
-# hyperParamGridPCA.df <- expand.grid(
-#   findNeighborsDim = c(8, 15), # these values were chosen after examining the elbow plot.
-#   findClustersRes = c(0.05, 0.3) # these values were chosen somewhat arbitrarily
-# )
-
-# # the size of these vectors largely determines the cost of this function in walltime
-# min.dist.vector <- c(0.1, 1) # c(0.1, 0.2)
-# nNeighborsVector <- c(5, 30) # c(5, 20)
-
-# results <- optimizeRNAseqClustering(
-# seuratObject = seuratMergedIntegrated,
-# hyperParamGridPCA.df = hyperParamGridPCA.df,
-# min.dist.vector = min.dist.vector,
-# nNeighborsVector = nNeighborsVector,
-# reduction = "harmony",
-# integrated = TRUE,
-# useParallel = TRUE,
-# computeSilhouette = TRUE,
-# silhouetteSample = NULL
-# )
-
-
-# RNA cluster optimization
-optimizeRNAseqClustering <- function(seuratObject,
-                                     hyperParamGridPCA.df,
-                                     min.dist.vector,
-                                     nNeighborsVector,
-                                     reduction = "pca",
-                                     integrated = FALSE,
-                                     useParallel = FALSE,
-                                     computeSilhouette = TRUE,
-                                     silhouetteSample = NULL,
-                                     maxNClusters = 10,
-                                     minNClusters = 2) {
-  # ------------------------------------------------INPUTS------------------------------------------------
-  # seuratObject is... a Seurat object
-  # hyperParamGridPCA.df is an expanded grid for a full grid search for PCA clustering. type: dataframe
-  # min.dist.vector is a vector of min.dist values to pass to UMAP (via scDEED())
-  # nNeighborsVector is a vector of nNeighbors values to pass to UMAP (via scDEED())
-  # maxNClusters is the maximum number of clusters to be considered (will evaluate 2 through maxNClusters)
-  #-------------------------------------------------------------------------------------------------------
-
-  #----------------------------------------------OUTPUTS--------------------------------------------------
-  # result contains $hyperParamGridOptClusterAndUMAP.df and $hyperParamGridClusterOnly.df
-  #   Extract like:
-  #     hyperParamGridOptClusterAndUMAP.df <- result$hyperParamGridOptClusterAndUMAP.df (smaller output with opt PCA clustering and UMAP embedding params)
-  #     hyperParamGridClusterOnly.df <- result$hyperParamGridClusterOnly.df (larger output with full PCA clustering gridsearch and results)
-  #--------------------------------------------------------------------------------------------------------
-
-  #-----------------------------------------REQUIRED PACKAGES----------------------------------------------
-  # Seurat, parallel, doParallel, foreach, clusterSim, cluster, dplyr, scDEED, stringr, pracma
-  #--------------------------------------------------------------------------------------------------------
-
-  # STEP 1: grid search over FindNeighbors() and FindClusters() hyperparameters to find
-  # the best combinations for each nClusters obtained
-
-  # Extract embedding matrix outside of the loop(s)
-  fullEmbeddingMatrix <- Embeddings(seuratObject, reduction = reduction)
-
-  if (useParallel) {
-    # Existing parallel path (kept for backwards compatibility); note: higher memory footprint
-    nCores <- parallel::detectCores() - 2 # leave 2 cores unused to reduce risk of RAM overuse.
-    myCluster <- parallel::makeCluster(nCores, type = "FORK")
-    doParallel::registerDoParallel(cl = myCluster)
-    clusteringMetrics <- foreach(
-      findNeighborsDim = hyperParamGridPCA.df$findNeighborsDim,
-      findClustersRes = hyperParamGridPCA.df$findClustersRes,
-      .combine = "cbind"
-    ) %dopar% {
-      set.seed(6022)
-      obj <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:findNeighborsDim, verbose = FALSE)
-      obj <- FindClusters(obj, resolution = findClustersRes, verbose = FALSE)
-      metaData.df <- obj@meta.data
-      clusterMat <- fullEmbeddingMatrix[, 1:findNeighborsDim, drop = FALSE]
-      clusterVect <- as.numeric(metaData.df$seuratClusters)
-      nClusters <- dim(table(metaData.df$seuratClusters))
-      daviesBouldinIdx <- index.DB(clusterMat, clusterVect)
-      calinskiHarabasz <- index.G1(clusterMat, clusterVect)
-      medianSilScore <- NaN
-      if (computeSilhouette) {
-        silMat <- clusterMat
-        if (!is.null(silhouetteSample) && silhouetteSample < nrow(silMat)) {
-          sampleIdx <- sample.int(nrow(silMat), silhouetteSample)
-          silMat <- silMat[sampleIdx, , drop = FALSE]
-          silVec <- clusterVect[sampleIdx]
-        } else {
-          silVec <- clusterVect
-        }
-        silScore <- silhouette(silVec, dist(silMat))
-        if (!anyNA(silScore)) {
-          silScoreSummary <- summary(silScore)
-          medianSilScore <- unname(silScoreSummary$si.summary["Median"])
-        }
-      }
-      out <- c(
-        nClusters = nClusters,
-        DBIndex = daviesBouldinIdx$DB,
-        CHMetric = calinskiHarabasz,
-        medianSilScore = medianSilScore
-      )
-      rm(obj, metaData.df, clusterMat, clusterVect)
-      gc(verbose = FALSE)
-      out
-    }
-    clusteringMetrics <- t(clusteringMetrics)
-    hyperParamGridPCA.df$DBIndex <- clusteringMetrics[, "DBIndex"]
-    hyperParamGridPCA.df$CHMetric <- clusteringMetrics[, "CHMetric"]
-    hyperParamGridPCA.df$medianSilScore <- clusteringMetrics[, "medianSilScore"]
-    hyperParamGridPCA.df$nClusters <- clusteringMetrics[, "nClusters"]
-    parallel::stopCluster(cl = myCluster)
-  } else {
-    # Memory-optimized sequential path with neighbor graph reuse
-    nRows <- nrow(hyperParamGridPCA.df)
-    DBIndexVec <- numeric(nRows)
-    CHVec <- numeric(nRows)
-    SilVec <- numeric(nRows)
-    nClusVec <- numeric(nRows)
-    lastDim <- NA_integer_
-    for (rowIdx in seq_len(nRows)) {
-      findNeighborsDim <- hyperParamGridPCA.df$findNeighborsDim[rowIdx]
-      findClustersRes <- hyperParamGridPCA.df$findClustersRes[rowIdx]
-      # Recompute neighbor graph only when dimension changes
-      if (is.na(lastDim) || findNeighborsDim != lastDim) {
-        seuratObject <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:findNeighborsDim, verbose = FALSE)
-        lastDim <- findNeighborsDim
-      }
-      seuratObject <- FindClusters(seuratObject, resolution = findClustersRes, verbose = FALSE)
-      metaData.df <- seuratObject@meta.data
-      clusterMat <- fullEmbeddingMatrix[, 1:findNeighborsDim, drop = FALSE]
-      clusterVect <- as.numeric(metaData.df$seuratClusters)
-      nClusVec[rowIdx] <- dim(table(metaData.df$seuratClusters))
-      daviesBouldinIdx <- index.DB(clusterMat, clusterVect)
-      calinskiHarabasz <- index.G1(clusterMat, clusterVect)
-      DBIndexVec[rowIdx] <- daviesBouldinIdx$DB
-      CHVec[rowIdx] <- calinskiHarabasz
-      SilVec[rowIdx] <- NaN
-      if (computeSilhouette) {
-        silMat <- clusterMat
-        if (!is.null(silhouetteSample) && silhouetteSample < nrow(silMat)) {
-          sampleIdx <- sample.int(nrow(silMat), silhouetteSample)
-          silMat <- silMat[sampleIdx, , drop = FALSE]
-          silVec <- clusterVect[sampleIdx]
-        } else {
-          silVec <- clusterVect
-        }
-        silScore <- silhouette(silVec, dist(silMat))
-        if (!anyNA(silScore)) {
-          silScoreSummary <- summary(silScore)
-          SilVec[rowIdx] <- unname(silScoreSummary$si.summary["Median"])
-        }
-      }
-      gc(verbose = FALSE)
-    }
-    hyperParamGridPCA.df$DBIndex <- DBIndexVec
-    hyperParamGridPCA.df$CHMetric <- CHVec
-    hyperParamGridPCA.df$medianSilScore <- SilVec
-    hyperParamGridPCA.df$nClusters <- nClusVec
-  }
-
-  # scale the clustering metrics to fall between 0 and 1
-  hyperParamGridPCA.df$DBIndex <- (hyperParamGridPCA.df$DBIndex - min(hyperParamGridPCA.df$DBIndex, na.rm = TRUE)) /
-    (max(hyperParamGridPCA.df$DBIndex, na.rm = TRUE) - min(hyperParamGridPCA.df$DBIndex, na.rm = TRUE))
-
-  hyperParamGridPCA.df$CHMetric <- (hyperParamGridPCA.df$CHMetric - min(hyperParamGridPCA.df$CHMetric, na.rm = TRUE)) /
-    (max(hyperParamGridPCA.df$CHMetric, na.rm = TRUE) - min(hyperParamGridPCA.df$CHMetric, na.rm = TRUE))
-
-  hyperParamGridPCA.df$medianSilScore <- (hyperParamGridPCA.df$medianSilScore - min(hyperParamGridPCA.df$medianSilScore, na.rm = TRUE)) /
-    (max(hyperParamGridPCA.df$medianSilScore, na.rm = TRUE) - min(hyperParamGridPCA.df$medianSilScore, na.rm = TRUE))
-
-  # make an inverse DB score so that it is more easily compared to the other two metrics
-  # (small DB is best, but large CH and silscore are best)
-  hyperParamGridPCA.df$DBIndexInverse <- 1 - hyperParamGridPCA.df$DBIndex
-
-  # create hyperParamGridPCA.df$meanEvalMetric, as the mean of $DBIndex, $CHMetric, $medianSilScore
-  hyperParamGridPCA.df$meanEvalMetric <- rowMeans(hyperParamGridPCA.df[, c("DBIndexInverse", "CHMetric", "medianSilScore")], na.rm = TRUE)
-
-  # sort and export (optional) the hyperparamgrid
-  hyperParamGridPCA.df <- hyperParamGridPCA.df %>%
-    arrange(nClusters, desc(meanEvalMetric))
-
-  # create a subset of hyperParamGridPCA.df with the best option for each nClusters
-  hyperParamGridOptSubset.df <- hyperParamGridPCA.df %>%
-    group_by(nClusters) %>%
-    filter(meanEvalMetric == max(meanEvalMetric)) %>%
-    ungroup()
-
-  # Pre-allocate min.dist and nNeighbors columns with NA values
-  hyperParamGridOptSubset.df$min.dist <- NA
-  hyperParamGridOptSubset.df$nNeighbors <- NA
-
-  permutedObject <- NULL
-
-  if (isTRUE(integrated)) {
-    baseEmbedding <- Embeddings(seuratObject, reduction = reduction)
-    if (is.null(baseEmbedding)) {
-      stop(sprintf("Reduction '%s' not found on supplied Seurat object", reduction))
-    }
-
-    permutedEmbedding <- baseEmbedding
-    set.seed(314)
-    for (colIdx in seq_len(ncol(permutedEmbedding))) {
-      rowOrder <- pracma::randperm(nrow(permutedEmbedding))
-      permutedEmbedding[, colIdx] <- baseEmbedding[rowOrder, colIdx]
-    }
-
-    permutedObject <- seuratObject
-    reductionKey <- tryCatch(Seurat::Key(seuratObject[[reduction]]), error = function(...) NULL)
-    if (is.null(reductionKey)) {
-      reductionKey <- paste0(reduction, "_")
-    }
-    permutedObject[[reduction]] <- CreateDimReducObject(
-      embeddings = permutedEmbedding,
-      key = reductionKey,
-      assay = DefaultAssay(permutedObject)
-    )
-  }
-
-  # STEP 2: use scDEED to optimize the UMAP hyperparameters
-  # ---------------------------start of scDEED UMAP opt---------------------------------------
-  # if nrow(hyperParamGridOptSubset.df) is smaller than maxNClusters, then set maxNClusters to nrow(hyperParamGridOptSubset.df)
-  if (nrow(hyperParamGridOptSubset.df) < maxNClusters) {
-    maxNClusters <- nrow(hyperParamGridOptSubset.df)
-  }
-
-  # Loop over the rows of hyperParamGridOptSubset.df, finding the best UMAP embedding for each nClusters
-  for (i in minNClusters:maxNClusters) {
-    # Extract necessary values from hyperParamGridOptSubset.df
-    nClusters <- hyperParamGridOptSubset.df$nClusters[i]
-    numPCs <- hyperParamGridOptSubset.df$findNeighborsDim[i]
-    findClustersRes <- hyperParamGridOptSubset.df$findClustersRes[i]
-
-    set.seed(6022)
-    seuratObject <- FindNeighbors(seuratObject, reduction = reduction, dims = 1:numPCs)
-    seuratObject <- FindClusters(seuratObject, resolution = findClustersRes)
-
-    if (isTRUE(integrated)) {
-      scDEEDResult <- scDEED(seuratObject, # input Seurat object (must have UMAP or t-SNE already run)
-        K = numPCs, # number of PCs
-        reduction.method = "umap", # 'umap' or 'tsne'
-        min.dist =  min.dist.vector, # scDEED default is 0.1 & 0.4; Seurat default is 0.3
-        nNeighbors = nNeighborsVector, # scDEED defaults are c(5, 20, 30, 40, 50). Seurat default is 30.
-        preEmbedding = reduction,
-        permuted = permutedObject,
-        similarityPercent = 0.5, # scDEED default
-        dubiousCutoff = 0.05, # scDEED default
-        trustworthyCutoff = 0.95) # scDEED default
-    } else {
-      scDEEDResult <- scDEED(seuratObject, # input Seurat object (must have UMAP or t-SNE already run)
-        K = numPCs, # number of PCs
-        reduction.method = "umap", # 'umap' or 'tsne'
-        min.dist =  min.dist.vector, # scDEED default is 0.1 & 0.4; Seurat default is 0.3
-        nNeighbors = nNeighborsVector, # scDEED defaults are c(5, 20, 30, 40, 50). Seurat default is 30.
-        similarityPercent = 0.5, # scDEED default
-        dubiousCutoff = 0.05, # scDEED default
-        trustworthyCutoff = 0.95) # scDEED default
-    }
-
-    # Extract optimal UMAP hyperparameters (minimizing number of dubious cells)
-    if (!is.null(scDEEDResult) && !is.null(scDEEDResult$numDubious)) {
-      nd <- scDEEDResult$numDubious
-      if (all(c("numberDubiousCells", "min.dist", "nNeighbors") %in% colnames(nd))) {
-        optIdx <- which(nd$numberDubiousCells == min(nd$numberDubiousCells, na.rm = TRUE))[1]
-        if (!is.na(optIdx)) {
-          hyperParamGridOptSubset.df$min.dist[i] <- nd$min.dist[optIdx]
-          hyperParamGridOptSubset.df$nNeighbors[i] <- nd$nNeighbors[optIdx]
-        }
-      }
-    }
-  }
-
-  # Reorder columns to place min.dist and nNeighbors after findClustersRes
-  hyperParamGridOptSubset.df <- hyperParamGridOptSubset.df %>%
-    dplyr::select(findNeighborsDim, findClustersRes, min.dist, nNeighbors, everything())
-
-  # Return the hyperparam dataframes
-  return(list(hyperParamGridOptClusterAndUMAP.df = hyperParamGridOptSubset.df, hyperParamGridClusterOnly.df = hyperParamGridPCA.df))
-}
-
-# function for saving plots as both pdf and png
-savePlot <- function(
-    plot,
-    plotDir,
-    filename,
-    height,
-    width,
-    units = "in",
-    dpi = 600,
-    formats = c("pdf", "png")
-    ) {
-  # Ensure plotDir exists
-  if (!dir.exists(plotDir)) dir.create(plotDir, recursive = TRUE)
-
-  # Save as PDF
-  if ("pdf" %in% formats) {
-    pdf(file.path(plotDir, paste0(filenameSuffix, "_", filename, ".pdf")), height = height, width = width)
-    print(plot)
-    dev.off()
-  }
-
-  # Save as PNG
-  if ("png" %in% formats) {
-    png(
-      file.path(plotDir, paste0(filenameSuffix, "_", filename, ".png")),
-      height = height,
-      width = width,
-      units = units,
-      res = dpi
-    )
-    print(plot)
-    dev.off()
-  }
-}
-
-# Remove cells with: a) 3+ alphas, b) cells with 2 alphas and 2 betas, and c) 2 betas
-# Remove iNKT and MAIT cells
-callMultiplets <- function(tcrs,
-                           nAlphaCut = 3,
-                           nBetaCut = 2,
-                           alphaAndBetaCut = 2,
-                           callINKT = TRUE,
-                           callMAIT = TRUE) {
-  # Count chains
-  chainCounts <- tcrs %>%
-    dplyr::group_by(barcode) %>%
-    dplyr::summarise(nAlpha = sum(chain ==  "TRA"),
-      nBeta = sum(chain == "TRB"))
-
-  multiplets <- chainCounts %>%
-    dplyr::filter(nAlpha >= nAlphaCut |
-      nBeta >= nBetaCut |
-      (nAlpha >= alphaAndBetaCut & nBeta >= alphaAndBetaCut))
-
-  tcrs$multiplet <- tcrs$barcode %in% multiplets$barcode
-
-  if (callMAIT == TRUE) {
-    tcrs <- tcrs %>%
-      dplyr::mutate(isMAIT = (str_detect(vGene, "TRAV1-2") &
-        str_detect(jGene, "TRAJ(33|12|20)")))
-  }
-
-  if (callINKT == TRUE) {
-    tcrs <- tcrs %>%
-      dplyr::mutate(isINKT = (str_detect(vGene, "TRAV10") &
-        str_detect(jGene, "TRAJ18")))
-  }
-  return(tcrs)
-}
-
-# finds all pairs of alpha/beta TCRs
-# TCRs is a dataframe that has a detected TCR chain for each row (alpha or beta or gamma, etc.) This is the output of mixcr, and maybe something analogous for 10x. But the columns might be named something different for 10x.
-# adapted from A.Hu code
-combinePairs <- function(tcrDf) {
-  a <- tcrDf[tcrDf$chain %in% c("TRA", "a"), ]
-  b <- tcrDf[tcrDf$chain %in% c("TRB", "b"), ]
-  commonbarcodes <- intersect(a$barcode, b$barcode) # get barcodes that have both an alpha or beta chain
-  a <- a[a$barcode %in% commonbarcodes, ]
-  b <- b[b$barcode %in% commonbarcodes, ]
-
-  # Compute how many alpha/beta pairs there should be
-  atab <- table(a$barcode)
-  btab <- table(b$barcode)
-  nPairs <- sum(atab[commonbarcodes] * btab[commonbarcodes])
-
-  # Initialize the pairs data frame
-  pairs <- data.frame(CDR3b = rep("", nPairs),
-    CDR3bnt = rep("", nPairs),
-    TRBV = rep("", nPairs),
-    TRBJ = rep("", nPairs),
-    CDR3a = rep("", nPairs),
-    CDR3ant = rep("", nPairs),
-    TRAV = rep("", nPairs),
-    TRAJ = rep("", nPairs),
-    barcode = rep("", nPairs),
-    fullLengthNTa = rep("", nPairs),
-    fullLengthNTb = rep("", nPairs))
-
-  # Iterate through the TCR alphas and betas and fill out the pair dataframe
-  k <- 1
-  for (barcode in commonbarcodes) {
-    arows <- which(a$barcode == barcode)
-    brows <- which(b$barcode == barcode)
-    for (i in arows) {
-      for (j in brows) {
-        pairs[k, ] <- c(b$cdr3[j],
-          b$cdr3_nt[j],
-          b$vGene[j],
-          b$jGene[j],
-          a$cdr3[i],
-          a$cdr3_nt[i],
-          a$vGene[i],
-          a$jGene[i],
-          barcode,
-          a$fullLengthNT[i],
-          b$fullLengthNT[j])
-        k <- k + 1
-      }
-    }
-  }
-  return(pairs)
-}
-
-# Create Sankey diagram showing hierarchical clustering splits
-# With custom JS for full-lineage highlighting on hover
-createClusteringSankey <- function(clusterTrackingDf, plotTitle = "Hierarchical Clustering",
-                                   plotDir = NULL, filename = NULL,
-                                   height = 8, width = 12) {
-  # clusterTrackingDf should have columns: cellId, and one column per nClusters value
-  # e.g., clusters_n3, clusters_n4, clusters_n5, etc.
-
-  if (!requireNamespace("networkD3", quietly = TRUE)) {
-    warning("networkD3 package not available. Sankey plot will not be created.")
-    return(NULL)
-  }
-  if (!requireNamespace("htmlwidgets", quietly = TRUE)) {
-    warning("htmlwidgets package not available. Sankey plot will not be created.")
-    return(NULL)
-  }
-
-  # Get cluster column names in order
-  clusterCols <- grep("^clusters_n", colnames(clusterTrackingDf), value = TRUE)
-  if (length(clusterCols) < 2) {
-    warning("Need at least 2 clustering levels to create Sankey diagram")
-    return(NULL)
-  }
-
-  # Sort by nClusters value
-  clusterNums <- as.integer(sub("clusters_n", "", clusterCols))
-  clusterCols <- clusterCols[order(clusterNums)]
-
-  # Build links dataframe for Sankey
-  linksList <- list()
-
-  for (i in 1:(length(clusterCols) - 1)) {
-    fromCol <- clusterCols[i]
-    toCol <- clusterCols[i + 1]
-
-    # Create flow table
-    flowDf <- clusterTrackingDf %>%
-      dplyr::group_by(!!rlang::sym(fromCol), !!rlang::sym(toCol)) %>%
-      dplyr::summarise(value = dplyr::n(), .groups = "drop") %>%
-      dplyr::mutate(
-        source = paste0(fromCol, "_", !!rlang::sym(fromCol)),
-        target = paste0(toCol, "_", !!rlang::sym(toCol))
-      )
-
-    linksList[[i]] <- flowDf %>%
-      dplyr::select(source, target, value)
-  }
-
-  # Combine all links
-  links <- dplyr::bind_rows(linksList)
-
-  # Create nodes dataframe
-  nodes <- data.frame(
-    name = unique(c(links$source, links$target)),
-    stringsAsFactors = FALSE
-  )
-
-  # Convert links to use node indices
-  links$IDsource <- match(links$source, nodes$name) - 1
-  links$IDtarget <- match(links$target, nodes$name) - 1
-
-  # Create Sankey diagram
-  sankeyPlot <- networkD3::sankeyNetwork(
-    Links = links,
-    Nodes = nodes,
-    Source = "IDsource",
-    Target = "IDtarget",
-    Value = "value",
-    NodeID = "name",
-    fontSize = 12,
-    nodeWidth = 30,
-    nodePadding = 10
-  )
-
-  # Build cell-level lineage data for JavaScript
-
-  # Each cell has a path through all clustering levels
-  # Convert to JSON format: array of objects, each with the node names at each level
-  cellLineages <- lapply(1:nrow(clusterTrackingDf), function(i) {
-    rowData <- clusterTrackingDf[i, clusterCols, drop = FALSE]
-    nodeNames <- sapply(clusterCols, function(col) {
-      paste0(col, "_", rowData[[col]])
-    })
-    as.list(nodeNames)
-  })
-
-  # Convert to JSON string
-  cellLineages_json <- jsonlite::toJSON(cellLineages, auto_unbox = TRUE)
-
-  # Custom JavaScript for full-lineage highlighting based on CELL-LEVEL data
-  # When hovering over a node, find all cells that pass through that node,
-  # then highlight only the other nodes those same cells pass through
-  # AND rescale link widths to show lineage-specific cell counts
-  fullLineageJs <- sprintf('
-function(el, x) {
-  setTimeout(function() {
-    var svg = d3.select(el).select("svg");
-    var link = svg.selectAll(".link");
-    var node = svg.selectAll(".node");
-
-    // Cell-level lineage data: each element is an object with node names for one cell
-    var cellLineages = %s;
-
-    // Build index: nodeName -> array of cell indices that pass through this node
-    var nodeToCell = {};
-    for (var cellIdx = 0; cellIdx < cellLineages.length; cellIdx++) {
-      var cellPath = cellLineages[cellIdx];
-      for (var key in cellPath) {
-        var nodeName = cellPath[key];
-        if (!nodeToCell[nodeName]) nodeToCell[nodeName] = [];
-        nodeToCell[nodeName].push(cellIdx);
-      }
-    }
-
-    // Store original link stroke-widths for restoration
-    link.each(function(d) {
-      d.originalStrokeWidth = d3.select(this).style("stroke-width");
-      d.originalValue = d.value;
-    });
-
-    // Helper to make a link key from source->target names
-    function linkKey(srcName, tgtName) {
-      return srcName + "|||" + tgtName;
-    }
-
-    // Remove existing handlers and add new ones
-    node.on("mouseover", null).on("mouseout", null);
-
-    node.on("mouseover", function(arg1, arg2) {
-      // D3 v4: function(d, i) - D3 v6: function(event, d)
-      var nodeData;
-      if (arg1 && typeof arg1.name === "string") {
-        nodeData = arg1;
-      } else if (arg2 && typeof arg2.name === "string") {
-        nodeData = arg2;
-      } else {
-        nodeData = d3.select(this).datum();
-      }
-
-      if (!nodeData || !nodeData.name) {
-        return;
-      }
-
-      var nodeName = nodeData.name;
-
-      // Find all cells that pass through this node
-      var cellsInNode = nodeToCell[nodeName] || [];
-      var cellSet = {};
-      for (var i = 0; i < cellsInNode.length; i++) {
-        cellSet[cellsInNode[i]] = true;
-      }
-
-      // Find ALL nodes that these cells pass through AND count lineage-specific flows
-      var lineageNodes = {};
-      var lineageFlows = {};  // linkKey -> count of cells in lineage that use this link
-
-      for (var i = 0; i < cellsInNode.length; i++) {
-        var cellIdx = cellsInNode[i];
-        var cellPath = cellLineages[cellIdx];
-
-        // Sort keys by numeric value (clusters_n3, clusters_n4, ..., clusters_n17)
-        // Extract the number from "clusters_nX" and sort numerically
-        var keys = Object.keys(cellPath).sort(function(a, b) {
-          var numA = parseInt(a.replace("clusters_n", ""), 10);
-          var numB = parseInt(b.replace("clusters_n", ""), 10);
-          return numA - numB;
-        });
-
-        // Mark all nodes in this cells path
-        for (var j = 0; j < keys.length; j++) {
-          lineageNodes[cellPath[keys[j]]] = true;
-        }
-
-        // Count flows between consecutive levels for this cell
-        for (var j = 0; j < keys.length - 1; j++) {
-          var srcNode = cellPath[keys[j]];
-          var tgtNode = cellPath[keys[j + 1]];
-          var lk = linkKey(srcNode, tgtNode);
-          lineageFlows[lk] = (lineageFlows[lk] || 0) + 1;
-        }
-      }
-
-      // Find max lineage flow for scaling
-      var maxLineageFlow = 0;
-      for (var lk in lineageFlows) {
-        if (lineageFlows[lk] > maxLineageFlow) {
-          maxLineageFlow = lineageFlows[lk];
-        }
-      }
-
-      // Dim nodes not in lineage
-      node.style("opacity", function(nd) {
-        return (nd && nd.name && lineageNodes[nd.name]) ? 1.0 : 0.15;
-      });
-
-      // Update links: dim non-lineage links, rescale lineage links
-      link.each(function(ld) {
-        var srcName = ld.source.name;
-        var tgtName = ld.target.name;
-        var lk = linkKey(srcName, tgtName);
-        var lineageCount = lineageFlows[lk] || 0;
-        var inLineage = lineageCount > 0;
-
-        var elem = d3.select(this);
-
-        if (inLineage) {
-          // Rescale stroke-width based on lineage-specific count
-          // Use same scaling as original Sankey but with lineage count
-          var originalWidth = parseFloat(ld.originalStrokeWidth) || ld.dy || 1;
-          var originalValue = ld.originalValue || ld.value || 1;
-
-          // Scale: newWidth = originalWidth * (lineageCount / originalValue)
-          var scaledWidth = Math.max(1, originalWidth * (lineageCount / originalValue));
-
-          elem.style("stroke-width", scaledWidth + "px");
-          elem.style("stroke-opacity", 0.7);
-        } else {
-          elem.style("stroke-opacity", 0.02);
-        }
-      });
-    });
-
-    node.on("mouseout", function() {
-      node.style("opacity", 1.0);
-      // Restore original link widths and opacity
-      link.each(function(ld) {
-        var elem = d3.select(this);
-        elem.style("stroke-width", ld.originalStrokeWidth);
-        elem.style("stroke-opacity", 0.5);
-      });
-    });
-
-  }, 100);
-}
-', cellLineages_json)
-
-  # Attach the custom JS to the widget
-  sankeyPlot <- htmlwidgets::onRender(sankeyPlot, fullLineageJs)
-
-  # Save if directory and filename provided
-  if (!is.null(plotDir) && !is.null(filename)) {
-    htmlFile <- file.path(plotDir, paste0(filename, ".html"))
-    htmlwidgets::saveWidget(sankeyPlot, htmlFile, selfcontained = TRUE)
-    cat("Sankey plot saved to:", htmlFile, "\n")
-  }
-
-  return(sankeyPlot)
-}
-
-# Create static Sankey diagram using ggsankey for clustering hierarchy
-createClusteringSankey_static <- function(clusterTrackingDf, plotTitle = "Hierarchical Clustering",
-                                          plotDir = NULL, filename = NULL,
-                                          height = 8, width = 12) {
-  # clusterTrackingDf should have columns: cellId, and one column per nClusters value
-  # e.g., clusters_n3, clusters_n4, clusters_n5, etc.
-
-  if (!requireNamespace("ggsankey", quietly = TRUE)) {
-    warning("ggsankey package not available. Installing...")
-    if (!requireNamespace("remotes", quietly = TRUE)) {
-      install.packages("remotes")
-    }
-    remotes::install_github("davidsjoberg/ggsankey")
-  }
-  library(ggsankey)
-
-  # Get cluster column names in order
-  clusterCols <- grep("^clusters_n", colnames(clusterTrackingDf), value = TRUE)
-  if (length(clusterCols) < 2) {
-    warning("Need at least 2 clustering levels to create Sankey diagram")
-    return(NULL)
-  }
-
-  # Sort by nClusters value
-  clusterNums <- as.integer(sub("clusters_n", "", clusterCols))
-  clusterCols <- clusterCols[order(clusterNums)]
-
-  # Prepare data for ggsankey - convert to long format
-  sankeyLong <- clusterTrackingDf %>%
-    ggsankey::make_long(!!!rlang::syms(clusterCols))
-
-  # Count cells at each node
-  nodeCounts <- sankeyLong %>%
-    dplyr::filter(!is.na(node)) %>%
-    dplyr::group_by(x, node) %>%
-    dplyr::summarise(count = dplyr::n(), .groups = "drop") %>%
-    dplyr::mutate(
-      label = paste0(node, "\n(n=", format(count, big.mark = ","), ")")
-    )
-
-  # Join counts back to sankey data
-  sankeyLong <- sankeyLong %>%
-    dplyr::left_join(nodeCounts %>% dplyr::select(x, node, label), by = c("x", "node"))
-
-  # Create color palette - use a colorblind-friendly palette
-  uniqueClusters <- unique(sankeyLong$node)
-  nColors <- length(uniqueClusters)
-  clusterColors <- setNames(
-    grDevices::colorRampPalette(RColorBrewer::brewer.pal(min(12, nColors), "Set3"))(nColors),
-    uniqueClusters
-  )
-
-  # Create axis labels from column names
-  axisLabels <- paste0("n=", clusterNums)
-
-  # Create static Sankey plot
-  p <- ggplot(sankeyLong,
-    aes(x = x,
-      nextX = nextX,
-      node = node,
-      nextNode = nextNode,
-      fill = factor(node),
-      label = label)) +
-    geom_sankey(flow.alpha = 0.5, node.color = "black", smooth = 6) +
-    geom_sankey_label(size = 2.5, color = "black", fill = "white", alpha = 0.85) +
-    scale_fill_manual(values = clusterColors, guide = "none") +
-    scale_x_discrete(labels = axisLabels) +
-    labs(title = plotTitle,
-      subtitle = paste0("Showing how clusters split across ", length(clusterCols), " granularity levels"),
-      x = "Clustering Resolution (number of clusters)") +
-    theme_void() +
-    theme(
-      axis.text.x = element_text(size = 12, face = "bold", margin = margin(t = 10)),
-      plot.title = element_text(size = 14, face = "bold", hjust = 0.5, margin = margin(b = 5)),
-      plot.subtitle = element_text(size = 11, hjust = 0.5, margin = margin(b = 15)),
-      plot.margin = margin(10, 10, 10, 10)
-    )
-
-  # Save if directory and filename provided
-  if (!is.null(plotDir) && !is.null(filename)) {
-    tryCatch(
-      {
-        savePlot(
-          plot = p,
-          plotDir = plotDir,
-          filename = filename,
-          height = height,
-          width = width,
-          units = "in",
-          dpi = 600,
-          formats = c("pdf", "png")
-        )
-        cat("Static Sankey plot saved to:", file.path(plotDir, paste0(filename, ".pdf/.png")), "\n")
-      },
-      error = function(e) {
-        warning("Failed to save static Sankey plot: ", e$message)
-      })
-  }
-
-  return(p)
-}
-
-# Extract UMAP coordinates and relevant metadata
-createFacetedUmap <- function(seuratObj,
-                              reduction = "ref.umap_Treg",
-                              group_by = "seuratClusters_Treg",
-                              facetBy = "stimulationFigures",
-                              colorPalette = palRNAClustersTreg,
-                              ptSize = 1,
-                              ptAlpha = 0.8) {
-  # Extract UMAP coordinates
-  umapCoords.tmp <- as.data.frame(Embeddings(seuratObj, reduction = reduction))
-  colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
-
-  # Add cell metadata
-  umapCoords.tmp$cellId <- rownames(umapCoords.tmp)
-  metadata <- seuratObj@meta.data
-  metadata$cellId <- rownames(metadata)
-
-  # Combine coordinates and metadata
-  plotData <- merge(umapCoords.tmp, metadata, by = "cellId")
-
-  # Get the cluster column and convert to factor if needed
-  plotData[[group_by]] <- factor(plotData[[group_by]])
-
-  # Create the plot
-  ggplot(plotData, aes(x = UMAP_1, y = UMAP_2, color = .data[[group_by]])) +
-    geom_point(size = ptSize, alpha = ptAlpha) +
-    scale_color_manual(values = colorPalette) +
-    facet_wrap(reformulate(facetBy)) +
-    labs(x = "UMAP 1", y = "UMAP 2", color = "Cluster", title = "") +
-    theme_minimal() +
-    theme(
-      aspect.ratio = 1,
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.border = element_rect(color = "black", fill = NA, size = 0.5),
-      strip.background = element_rect(fill = "white", color = "black"),
-      strip.text = element_text(size = 8)
-    )
-}
-
-# can be used for faceted expression UMAPs
-createFeatureUmap <- function(seuratObj,
-                              feature,
-                              assay = "RNA", # or "FB"
-                              reduction = "ref.umap",
-                              facetBy = "stimulationFigures",
-                              ptSize = 1,
-                              ptAlpha = 0.8) {
-  # Extract UMAP coordinates
-  umapCoords.tmp <- as.data.frame(Embeddings(seuratObj, reduction = reduction))
-  colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
-  umapCoords.tmp$cellId <- rownames(umapCoords.tmp)
-
-  # Extract feature expression
-  expr <- FetchData(seuratObj, vars = feature, assay = assay)
-  expr$cellId <- rownames(expr)
-
-  # Add metadata
-  metadata <- seuratObj@meta.data
-  metadata$cellId <- rownames(metadata)
-
-  # Combine all
-  plotData <- merge(umapCoords.tmp, metadata, by = "cellId")
-  plotData <- merge(plotData, expr, by = "cellId")
-
-  # Plot
-  ggplot(plotData, aes(x = UMAP_1, y = UMAP_2, color = .data[[feature]])) +
-    geom_point(size = ptSize, alpha = ptAlpha) +
-    scale_color_viridis() +
-    facet_wrap(reformulate(facetBy)) +
-    labs(x = "UMAP 1", y = "UMAP 2", color = feature, title = paste(feature, "expression")) +
-    theme_minimal() +
-    theme(
-      aspect.ratio = 1,
-      panel.grid.major = element_blank(),
-      panel.grid.minor = element_blank(),
-      panel.border = element_rect(color = "black", fill = NA, size = 0.5),
-      strip.background = element_rect(fill = "white", color = "black"),
-      strip.text = element_text(size = 8)
-    )
-}
-```
-
 ```{r setUpDirectories, cache = TRUE}
 projNumber <- "P697"
 baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
 dataInputDir <- file.path(baseDir, "data/inputData")
 plotDir <- file.path(baseDir, "figures")
 dataOutputDir <- file.path(baseDir, "data/outputData")
-dataDate <- "2026-01-06"
+dataDate <- "2026-02-02"
 filenameSuffix <- paste0(projNumber, ".", dataDate)
 
 ## ---------------------------------------------------------------------------
-## Define pools and construct file paths for processed (filtered) & raw h5
-## P697 is a TEAseq project with a single subproject (P697-1) containing 4 pools.
-## Unlike P650 which had 4 separate subprojects, here we have:
-##   pool697-1_1_arc, pool697-1_2_arc, pool697-1_3_arc, pool697-1_4_arc
+## Define pools and construct file paths for both Multi (GEX+HTO) and Arc (ATAC)
+## P697 is a TEAseq project with two subprojects (P697-1 and P697-2), each with 4 pools.
+## Multi flowcells contain GEX + HTO data (cellranger multi)
+## Arc flowcells contain ATAC + GEX data (cellranger arc)
+## Since GEX is identical between runs, we use Multi for GEX+HTO and Arc for ATAC only.
 ## ---------------------------------------------------------------------------
 
-# Base paths for the sequencing run
-P697_runDir <- "/Volumes/bioinformatics/pipeline/Illumina/251216_VH00126_442_AACYV5KHV"
-P697_processedDir <- "Project_P697-1Processed_bri_251218"
+# Base server path
+serverBase <- "/Volumes/bioinformatics/pipeline/Illumina"
 
-# Define the 4 pools within subproject P697-1
-P697_pools <- tibble::tribble(
-  ~pool,           ~poolDir,
-  "pool697-1_1",   "pool697-1_1_arc",
-  "pool697-1_2",   "pool697-1_2_arc",
-  "pool697-1_3",   "pool697-1_3_arc",
-  "pool697-1_4",   "pool697-1_4_arc"
+# Define flowcell paths for each subproject
+flowcells <- list(
+  `P697-1` = list(
+    multi = list(
+      flowcell = "251215_VH01513_82_AACYM3NHV",
+      processed = "Project_P697-1Processed_bri_251218"
+    ),
+    arc = list(
+      flowcell = "251216_VH00126_442_AACYV5KHV",
+      processed = "Project_P697-1Processed_bri_251218"
+    )
+  ),
+  `P697-2` = list(
+    multi = list(
+      flowcell = "260114_VH01513_87_222GFVGNX",
+      processed = "Project_P697-2Processed_bri_260129"
+    ),
+    arc = list(
+      flowcell = "260115_VH00126_446_AACYVCGHV",
+      processed = "Project_P697-2Processed_bri_260129"
+    )
+  )
 )
 
-# Construct file paths for each pool
-# TEAseq/ARC output structure: poolDir/outs/filtered_feature_bc_matrix.h5
-P697_files_df <- P697_pools %>%
-  mutate(
-    filtered_h5 = file.path(P697_runDir, P697_processedDir, poolDir,
-      "outs", "filtered_feature_bc_matrix.h5"),
-    raw_h5 = file.path(P697_runDir, P697_processedDir, poolDir,
-      "outs", "raw_feature_bc_matrix.h5")
-  )
+# Define all 8 pools across both subprojects
+P697_pools <- tibble::tribble(
+  ~subproject, ~pool,         ~multiPoolDir,  ~arcPoolDir,
+  "P697-1",    "pool697-1_1", "pool697-1_1",  "pool697-1_1_arc",
+  "P697-1",    "pool697-1_2", "pool697-1_2",  "pool697-1_2_arc",
+  "P697-1",    "pool697-1_3", "pool697-1_3",  "pool697-1_3_arc",
+  "P697-1",    "pool697-1_4", "pool697-1_4",  "pool697-1_4_arc",
+  "P697-2",    "pool697-2_1", "pool697-2_1",  "pool697-2_1_arc",
+  "P697-2",    "pool697-2_2", "pool697-2_2",  "pool697-2_2_arc",
+  "P697-2",    "pool697-2_3", "pool697-2_3",  "pool697-2_3_arc",
+  "P697-2",    "pool697-2_4", "pool697-2_4",  "pool697-2_4_arc"
+)
 
-# Vectors for downstream compatibility with prior code
+# Construct full file paths for each pool
+P697_files_df <- P697_pools %>%
+  rowwise() %>%
+  mutate(
+    # Multi flowcell paths (GEX + HTO)
+    # NOTE: Cell Ranger Multi outputs h5 matrices but NOT per_barcode_metrics.csv
+    # in the per_sample_outs structure. Per-barcode metrics come from Arc pipeline.
+    multiFlowcellPath = file.path(serverBase,
+      flowcells[[subproject]]$multi$flowcell,
+      flowcells[[subproject]]$multi$processed),
+    multi_filtered_h5 = file.path(multiFlowcellPath, multiPoolDir,
+      "outs", "per_sample_outs", multiPoolDir, "count",
+      "sample_filtered_feature_bc_matrix.h5"),
+    multi_raw_h5 = file.path(multiFlowcellPath,
+      "outs", "multi", "count", "raw_feature_bc_matrix.h5"),
+    featureRefFile = file.path(multiFlowcellPath,
+      paste0(multiPoolDir, "_featureReference.csv")),
+    # Arc flowcell paths (ATAC + GEX metrics)
+    # NOTE: Cell Ranger Arc per_barcode_metrics.csv contains BOTH GEX and ATAC metrics
+    # because Arc is a multiome pipeline processing both modalities together
+    arcFlowcellPath = file.path(serverBase,
+      flowcells[[subproject]]$arc$flowcell,
+      flowcells[[subproject]]$arc$processed),
+    arc_filtered_h5 = file.path(arcFlowcellPath, arcPoolDir,
+      "outs", "filtered_feature_bc_matrix.h5"),
+    arc_fragments = file.path(arcFlowcellPath, arcPoolDir,
+      "outs", "atac_fragments.tsv.gz"),
+    arc_peak_annotation = file.path(arcFlowcellPath, arcPoolDir,
+      "outs", "atac_peak_annotation.tsv"),
+    arc_per_barcode_metrics = file.path(arcFlowcellPath, arcPoolDir,
+      "outs", "per_barcode_metrics.csv")
+  ) %>%
+  ungroup()
+
+# Vectors for downstream compatibility
 P697_samplePools <- P697_files_df$pool
-P697_files <- P697_files_df$filtered_h5
-P697_rawFiles <- P697_files_df$raw_h5
+P697_subprojects <- P697_files_df$subproject
+
+# Print summary of configured pools
+cat("Configured", nrow(P697_files_df), "pools across",
+  length(unique(P697_files_df$subproject)), "subprojects:\n")
+for (sp in unique(P697_files_df$subproject)) {
+  pools <- P697_files_df$pool[P697_files_df$subproject == sp]
+  cat(sprintf("  %s: %s\n", sp, paste(pools, collapse = ", ")))
+}
+```
+
+```{r setupFunctions}
+# Source shared functions from external file
+source(file.path(getwd(), "code/P697_functions.R"))
 ```
 
 ```{r setHashtagNames}
-## Programmatically derive donor hashtag (HT) variable names from featureReference.csv
-## Keep only features whose 'name' contains 'EXTEND' (donor hashtags), ignoring antibody capture, etc.
-## NOTE: For TEAseq, hashtag structure may differ - update pattern as needed
+## Read donor hashtag (HT) variable names from featureReference.csv files
+## These files are located in the Multi flowcell directories and contain
+## hashtag-to-donor mappings with format: id, name, read, pattern, sequence, feature_type
 
-# TODO: Update this function if/when featureReference.csv files are available for P697
-# For now, we'll read hashtag info directly from the h5 files after loading
-getHashtagVars <- function(poolName) {
-  featureFile <- file.path(dataInputDir, paste0("P697-1_", poolName, "_featureReference.csv"))
-  if (!file.exists(featureFile)) {
-    warning(paste("Feature reference file not found:", featureFile))
-    return(character(0))
+# Function to read hashtag info from featureReference.csv
+getHashtagInfo <- function(featureRefPath) {
+  if (!file.exists(featureRefPath)) {
+    warning(paste("Feature reference file not found:", featureRefPath))
+    return(NULL)
   }
-  df <- readr::read_csv(featureFile, show_col_types = FALSE)
-  # Adjust the pattern as needed for P697 hashtag naming convention
-  df %>% dplyr::filter(grepl("EXTEND|HT", name, ignore.case = TRUE)) %>% dplyr::pull(name)
+  df <- readr::read_csv(featureRefPath, show_col_types = FALSE)
+  # Filter for Antibody Capture features (hashtags)
+  df %>%
+    dplyr::filter(feature_type == "Antibody Capture") %>%
+    dplyr::select(id, name, sequence)
 }
 
-# Build a named list of hashtag vectors per pool
-# This will be populated after we know the hashtag naming convention
+# Build hashtag info for all pools
 P697HashtagList <- list()
-# Uncomment and modify once featureReference files are available:
-# P697HashtagList <- setNames(lapply(P697_pools$pool, getHashtagVars),
-#   P697_pools$pool)
+for (i in seq_len(nrow(P697_files_df))) {
+  poolName <- P697_files_df$pool[i]
+  featureFile <- P697_files_df$featureRefFile[i]
+  htInfo <- getHashtagInfo(featureFile)
+  if (!is.null(htInfo)) {
+    P697HashtagList[[poolName]] <- htInfo
+    cat(sprintf("  %s: %d hashtags - %s\n", poolName, nrow(htInfo),
+      paste(htInfo$name, collapse = ", ")))
+  }
+}
+
+cat("\nHashtag info loaded for", length(P697HashtagList), "pools\n")
 ```
 
-```{r read10XGEXDataFromAllFlowcells}
-# Read the filtered feature bc matrices from all 4 pools
-# TEAseq/ARC data may have different structure - Gene Expression and Peaks
-cat("Reading GEX data from", length(P697_files), "pools...\n")
+```{r readGEXHTOFromMultiFlowcells}
+## Read GEX + HTO data from Multi flowcells (cellranger multi output)
+## Multi output structure: poolDir/outs/per_sample_outs/poolName/count/sample_filtered_feature_bc_matrix.h5
+## This h5 contains both "Gene Expression" and "Antibody Capture" (HTO) assays
 
-# Check which files exist before attempting to read
-filesExist <- file.exists(P697_files)
-cat("Files found:", sum(filesExist), "of", length(P697_files), "\n")
-if (any(!filesExist)) {
-  cat("Missing files:\n")
-  cat(paste(P697_files[!filesExist], collapse = "\n"), "\n")
+cat("Reading GEX+HTO data from Multi flowcells...\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+# Check which Multi h5 files exist
+multiFilesExist <- file.exists(P697_files_df$multi_filtered_h5)
+cat("Multi h5 files found:", sum(multiFilesExist), "of", nrow(P697_files_df), "\n\n")
+
+if (any(!multiFilesExist)) {
+  cat("Missing Multi h5 files:\n")
+  for (i in which(!multiFilesExist)) {
+    cat(sprintf("  %s: %s\n", P697_files_df$pool[i], P697_files_df$multi_filtered_h5[i]))
+  }
+  cat("\n")
 }
 
-# Read only existing files
+# Initialize storage
 gexObjects.tmp <- list()
-peakObjects.tmp <- list()  # For ATAC peaks (will be ignored for now)
+htoObjects.tmp <- list()
 
-for (i in seq_along(P697_files)) {
-  if (filesExist[i]) {
-    cat("Reading:", P697_files[i], "\n")
-    h5_data <- Read10X_h5(P697_files[i])
+# Read each pool's Multi h5 file
+for (i in seq_len(nrow(P697_files_df))) {
+  poolName <- P697_files_df$pool[i]
+  subproject <- P697_files_df$subproject[i]
+  h5Path <- P697_files_df$multi_filtered_h5[i]
 
-    # TEAseq/ARC outputs may have different assay names
-    # Common names: "Gene Expression", "Peaks", "Antibody Capture"
+  if (file.exists(h5Path)) {
+    cat(sprintf("Reading %s (%s)...\n", poolName, subproject))
+    cat(sprintf("  Path: %s\n", h5Path))
+
+    h5_data <- Read10X_h5(h5Path)
+
+    # Check available assays
     availableAssays <- names(h5_data)
-    cat("  Available assays:", paste(availableAssays, collapse = ", "), "\n")
+    cat(sprintf("  Available assays: %s\n", paste(availableAssays, collapse = ", ")))
 
-    # Extract Gene Expression data
+    # Extract Gene Expression
     if ("Gene Expression" %in% availableAssays) {
-      gexObjects.tmp[[P697_samplePools[i]]] <- h5_data[["Gene Expression"]]
+      gexObjects.tmp[[poolName]] <- h5_data[["Gene Expression"]]
+      cat(sprintf("  GEX: %d genes x %d cells\n",
+        nrow(h5_data[["Gene Expression"]]), ncol(h5_data[["Gene Expression"]])))
     } else {
-      warning(paste("No Gene Expression assay found in", P697_files[i]))
+      warning(paste("No Gene Expression assay in", h5Path))
     }
 
-    # Extract Peaks data (for future ATAC analysis - storing but not processing)
-    if ("Peaks" %in% availableAssays) {
-      peakObjects.tmp[[P697_samplePools[i]]] <- h5_data[["Peaks"]]
-      cat("  Found", nrow(h5_data[["Peaks"]]), "peaks\n")
+    # Extract Antibody Capture (HTO)
+    if ("Antibody Capture" %in% availableAssays) {
+      htoObjects.tmp[[poolName]] <- h5_data[["Antibody Capture"]]
+      cat(sprintf("  HTO: %d hashtags x %d cells\n",
+        nrow(h5_data[["Antibody Capture"]]), ncol(h5_data[["Antibody Capture"]])))
+      cat(sprintf("  Hashtags: %s\n", paste(rownames(h5_data[["Antibody Capture"]]), collapse = ", ")))
+    } else {
+      warning(paste("No Antibody Capture assay in", h5Path))
     }
+    cat("\n")
   }
 }
 
-cat("\nSuccessfully loaded GEX data from", length(gexObjects.tmp), "pools\n")
+cat(sprintf("Successfully loaded GEX data from %d pools\n", length(gexObjects.tmp)))
+cat(sprintf("Successfully loaded HTO data from %d pools\n", length(htoObjects.tmp)))
 
-# Print summary of cells and genes per pool
-cat("\nSummary of loaded data:\n")
+# Create Seurat objects with GEX data
+cat("\nCreating Seurat objects with GEX data...\n")
+seuratObjects.tmp <- list()
+
 for (poolName in names(gexObjects.tmp)) {
-  gex <- gexObjects.tmp[[poolName]]
-  cat(sprintf("  %s: %d genes x %d cells\n", poolName, nrow(gex), ncol(gex)))
+  gexMat <- gexObjects.tmp[[poolName]]
+  seurat <- CreateSeuratObject(
+    counts = gexMat,
+    min.features = 100,
+    min.cells = 3,
+    project = poolName
+  )
+
+  # Add HTO assay if available
+  if (poolName %in% names(htoObjects.tmp)) {
+    htoMat <- htoObjects.tmp[[poolName]]
+    # Subset HTO matrix to cells in Seurat object
+    commonCells <- intersect(colnames(seurat), colnames(htoMat))
+    if (length(commonCells) > 0) {
+      htoMat <- htoMat[, commonCells, drop = FALSE]
+      seurat <- subset(seurat, cells = commonCells)
+      seurat[["HT"]] <- CreateAssayObject(counts = htoMat)
+      cat(sprintf("  %s: Added HT assay with %d hashtags for %d cells\n",
+        poolName, nrow(htoMat), ncol(htoMat)))
+    }
+  }
+
+  seuratObjects.tmp[[poolName]] <- seurat
 }
 
-# Make a list of Seurat gene expression count objects
-# Set parameters to define cells
-cat("\nCreating Seurat objects...\n")
-seuratObjects.tmp <- lapply(gexObjects.tmp,
-  function(x) CreateSeuratObject(counts = x,
-    min.features = 100,
-    min.cells = 3))
-
-# Print summary of Seurat objects
+# Print summary
 cat("\nSeurat objects created:\n")
 for (poolName in names(seuratObjects.tmp)) {
   seurat <- seuratObjects.tmp[[poolName]]
-  cat(sprintf("  %s: %d genes x %d cells\n", poolName, nrow(seurat), ncol(seurat)))
+  assayNames <- names(seurat@assays)
+  hasHT <- "HT" %in% assayNames
+  cat(sprintf("  %s: %d genes x %d cells, HT assay: %s\n",
+    poolName, nrow(seurat), ncol(seurat), ifelse(hasHT, "yes", "no")))
 }
 ```
 
-```{r addFBData, eval = FALSE}
-# NOTE: This chunk is disabled for TEAseq data.
-# TEAseq typically includes GEX and ATAC data, not antibody capture (FB/ADT).
-# If your TEAseq experiment includes antibody capture, uncomment and adapt this code.
+```{r readATACFromArcFlowcells}
+## Read ATAC data from Arc flowcells (cellranger arc output)
+## Arc output contains Peaks in the h5 file and fragment files for downstream analysis
+## We integrate ATAC as a ChromatinAssay, matching barcodes to GEX cells from Multi
 
-# Create a separate "FB" assay slot within the Seurat object
-# This is preferable over adding the ab data as metadata because
-# it allows for seurat's normalization routine to be run on it.
+cat("Reading ATAC data from Arc flowcells...\n")
+cat("=", rep("=", 60), "\n", sep = "")
 
-# # Separate hashtags into HT assay and surface antibody tags into FB assay, per pool
-# for (i in seq_along(seuratObjects.tmp)) {
-#   seurat.tmp <- seuratObjects.tmp[[i]]
-#   poolName <- names(seuratObjects.tmp)[i]
-#
-#   # Skip if Antibody Capture not available for this pool
-#   # abMat <- abObjects.tmp[[poolName]]
-#   # if (is.null(abMat)) {
-#   #   next
-#   # }
-#
-#   # TODO: Add antibody capture handling if needed
-#   seuratObjects.tmp[[i]] <- seurat.tmp
-# }
+# Check which Arc h5 files exist
+arcFilesExist <- file.exists(P697_files_df$arc_filtered_h5)
+arcFragmentsExist <- file.exists(P697_files_df$arc_fragments)
+cat("Arc h5 files found:", sum(arcFilesExist), "of", nrow(P697_files_df), "\n")
+cat("Arc fragment files found:", sum(arcFragmentsExist), "of", nrow(P697_files_df), "\n\n")
+
+# Initialize storage for ATAC data
+peakObjects.tmp <- list()
+fragmentPaths.tmp <- list()
+barcodeComparison <- list()
+
+# Read ATAC data from each pool
+for (i in seq_len(nrow(P697_files_df))) {
+  poolName <- P697_files_df$pool[i]
+  subproject <- P697_files_df$subproject[i]
+  h5Path <- P697_files_df$arc_filtered_h5[i]
+  fragPath <- P697_files_df$arc_fragments[i]
+
+  if (file.exists(h5Path)) {
+    cat(sprintf("Reading ATAC for %s (%s)...\n", poolName, subproject))
+
+    h5_data <- Read10X_h5(h5Path)
+    availableAssays <- names(h5_data)
+    cat(sprintf("  Available assays: %s\n", paste(availableAssays, collapse = ", ")))
+
+    # Extract Peaks data
+    if ("Peaks" %in% availableAssays) {
+      peakMat <- h5_data[["Peaks"]]
+      peakObjects.tmp[[poolName]] <- peakMat
+      cat(sprintf("  Peaks: %d regions x %d cells\n", nrow(peakMat), ncol(peakMat)))
+
+      # Compare barcodes with GEX from Multi
+      if (poolName %in% names(seuratObjects.tmp)) {
+        gexBarcodes <- colnames(seuratObjects.tmp[[poolName]])
+        arcBarcodes <- colnames(peakMat)
+
+        # Strip suffix for matching (barcodes are like ACGT...-1)
+        gexBase <- sub("-[0-9]+$", "", gexBarcodes)
+        arcBase <- sub("-[0-9]+$", "", arcBarcodes)
+
+        nGEX <- length(gexBarcodes)
+        nArc <- length(arcBarcodes)
+        nShared <- sum(gexBase %in% arcBase)
+        nGEXOnly <- sum(!gexBase %in% arcBase)
+        nArcOnly <- sum(!arcBase %in% gexBase)
+
+        barcodeComparison[[poolName]] <- data.frame(
+          pool = poolName,
+          subproject = subproject,
+          nGEX = nGEX,
+          nArc = nArc,
+          nShared = nShared,
+          nGEXOnly = nGEXOnly,
+          nArcOnly = nArcOnly,
+          pctGEXwithATAC = round(100 * nShared / nGEX, 1),
+          pctArcwithGEX = round(100 * nShared / nArc, 1)
+        )
+
+        cat(sprintf("  Barcode overlap: %d shared (%.1f%% of GEX, %.1f%% of Arc)\n",
+          nShared, 100 * nShared / nGEX, 100 * nShared / nArc))
+      }
+    }
+
+    # Store fragment path
+    if (file.exists(fragPath)) {
+      fragmentPaths.tmp[[poolName]] <- fragPath
+      cat(sprintf("  Fragment file: %s\n", basename(fragPath)))
+    }
+    cat("\n")
+  }
+}
+
+# Summarize barcode comparison
+cat("Barcode comparison summary (Multi GEX vs Arc ATAC):\n")
+barcodeComparisonDf <- do.call(rbind, barcodeComparison)
+print(barcodeComparisonDf, row.names = FALSE)
+
+# Save barcode comparison to Excel
+barcodeCompFile <- file.path(dataOutputDir, paste0(filenameSuffix, "_BarcodeComparison_Multi_vs_Arc.xlsx"))
+writexl::write_xlsx(barcodeComparisonDf, path = barcodeCompFile)
+cat(sprintf("\nSaved barcode comparison table to: %s\n", barcodeCompFile))
+
+cat(sprintf("\nSuccessfully loaded ATAC data from %d pools\n", length(peakObjects.tmp)))
+```
+
+```{r integrateATACAssay}
+## Add ATAC as ChromatinAssay to Seurat objects
+## For cells present in both Multi (GEX) and Arc (ATAC), add the peak counts
+
+cat("Integrating ATAC assay into Seurat objects...\n")
+cat("=", rep("=", 60), "\n", sep = "")
+
+for (poolName in names(seuratObjects.tmp)) {
+  seurat <- seuratObjects.tmp[[poolName]]
+
+  if (!(poolName %in% names(peakObjects.tmp))) {
+    cat(sprintf("  %s: No ATAC data available, skipping\n", poolName))
+    next
+  }
+
+  peakMat <- peakObjects.tmp[[poolName]]
+  fragPath <- fragmentPaths.tmp[[poolName]]
+
+  # Match barcodes (strip suffix for comparison)
+  gexBarcodes <- colnames(seurat)
+  arcBarcodes <- colnames(peakMat)
+  gexBase <- sub("-[0-9]+$", "", gexBarcodes)
+  arcBase <- sub("-[0-9]+$", "", arcBarcodes)
+
+  # Find shared barcodes
+  sharedBase <- intersect(gexBase, arcBase)
+
+  if (length(sharedBase) > 0) {
+    # Map back to original barcodes with suffix
+    gexSharedIdx <- which(gexBase %in% sharedBase)
+    arcSharedIdx <- which(arcBase %in% sharedBase)
+
+    # Subset peak matrix to shared cells, using GEX barcode names
+    # Create mapping from base to full barcode
+    gexMap <- setNames(gexBarcodes[gexSharedIdx], gexBase[gexSharedIdx])
+    arcMap <- setNames(arcBarcodes[arcSharedIdx], arcBase[arcSharedIdx])
+
+    # Reorder arc matrix to match GEX order
+    sharedGEXBarcodes <- gexBarcodes[gexSharedIdx]
+    sharedArcBarcodes <- arcMap[gexBase[gexSharedIdx]]
+
+    peakMatSubset <- peakMat[, sharedArcBarcodes, drop = FALSE]
+    colnames(peakMatSubset) <- sharedGEXBarcodes  # Use GEX barcode names
+
+    # Create ChromatinAssay
+    # Get annotation file path for this pool
+    poolIdx <- which(P697_files_df$pool == poolName)
+    annotationPath <- P697_files_df$arc_peak_annotation[poolIdx]
+
+    if (file.exists(annotationPath)) {
+      peakAnnotation <- read.table(annotationPath, header = TRUE, sep = "\t")
+      cat(sprintf("  %s: Loaded %d peak annotations\n", poolName, nrow(peakAnnotation)))
+    } else {
+      peakAnnotation <- NULL
+    }
+
+    # Create the ChromatinAssay (requires Signac)
+    # Note: Cell Ranger Arc 2.x fragment files have 6 columns (with strand),
+    # which is incompatible with Signac's expected 5-column format.
+    # We create the assay without fragments first, storing the path for later use.
+    chromAssay <- CreateChromatinAssay(
+      counts = peakMatSubset,
+      sep = c(":", "-"),
+      min.cells = 0,
+      min.features = 0
+    )
+
+    # Store fragment path in metadata for later use
+    # (Fragment files can be processed separately if needed for downstream ATAC analysis)
+    cat(sprintf("  %s: ChromatinAssay created (fragment path stored for later: %s)\n",
+      poolName, basename(fragPath)))
+
+    # Add ATAC assay to full Seurat object (cells without ATAC will have NA)
+    # First, expand to all cells
+    allCells <- colnames(seurat)
+    hasATAC <- allCells %in% sharedGEXBarcodes
+
+    # Add metadata flag for ATAC availability and fragment path
+    seurat[["hasATAC"]] <- hasATAC
+    seurat[["atacFragmentPath"]] <- fragPath
+    seurat[["hasGEX"]] <- TRUE  # All cells have GEX by definition
+
+    # For now, we'll subset to cells with both modalities for the ATAC assay
+    # and add a note that full integration may require different approach
+    if (sum(hasATAC) > 0) {
+      # Create a subset with ATAC data
+      seuratWithATAC <- subset(seurat, cells = sharedGEXBarcodes)
+      seuratWithATAC[["ATAC"]] <- chromAssay
+
+      # Store both versions
+      seuratObjects.tmp[[poolName]] <- seurat  # Full GEX object with hasATAC flag
+      cat(sprintf("  %s: Added ATAC for %d/%d cells (%.1f%%)\n",
+        poolName, sum(hasATAC), length(allCells), 100 * sum(hasATAC) / length(allCells)))
+    }
+  } else {
+    seurat[["hasATAC"]] <- FALSE
+    seurat[["hasGEX"]] <- TRUE
+    seuratObjects.tmp[[poolName]] <- seurat
+    cat(sprintf("  %s: No overlapping barcodes with ATAC\n", poolName))
+  }
+}
+
+# Summary
+cat("\nATAC integration summary:\n")
+for (poolName in names(seuratObjects.tmp)) {
+  seurat <- seuratObjects.tmp[[poolName]]
+  nTotal <- ncol(seurat)
+  nWithATAC <- sum(seurat$hasATAC)
+  cat(sprintf("  %s: %d cells total, %d with ATAC (%.1f%%)\n",
+    poolName, nTotal, nWithATAC, 100 * nWithATAC / nTotal))
+}
 ```
 
 ```{r loadGeneLists}
-# load the gene lists (for later when the PI specifies genes of interest)
+# TCR/VDJ genes
+tcrGenePath <- file.path(dataInputDir, "TCR_genes.txt")
+tcrGeneTable <- readr::read_delim(
+  file = tcrGenePath,
+  delim = "\t",
+  comment = "#",
+  trim_ws = TRUE,
+  progress = FALSE,
+  col_types = readr::cols(.default = readr::col_character())
+)
+
+tcrGeneTable <- tibble::as_tibble(tcrGeneTable)
+
+tcrGeneList <- tcrGeneTable[["Approved symbol"]]
 ```
 
 ```{r addQCMetricsAnno}
 ## Add QC metrics: percent mito, ribo, hemoglobin, complexity, and pool/project info
-## Also check for Cell Ranger per_barcode_metrics.csv if available
+## Load Cell Ranger per_barcode_metrics.csv from Arc pipeline
+##
+## Cell Ranger Arc per_barcode_metrics.csv contains BOTH GEX and ATAC metrics
+## because Arc is a multiome pipeline. Column names include both:
+##   - GEX metrics: gex_umis_count, gex_genes_count, gex_conf_exonic_reads, etc.
+##   - ATAC metrics: atac_fragments, atac_TSS_fragments, atac_peak_region_fragments, etc.
+##
+## Cell Ranger Multi does NOT produce per_barcode_metrics.csv in the per_sample_outs
+## structure (only h5 matrices), so all metrics come from the Arc pipeline.
 
 for (i in seq_along(seuratObjects.tmp)) {
   seurat <- seuratObjects.tmp[[i]]
   poolName <- names(seuratObjects.tmp)[i]
 
+  # Get subproject for this pool
+  poolIdx <- which(P697_files_df$pool == poolName)
+  subproject <- P697_files_df$subproject[poolIdx]
+
   # ----- Standard computed QC metrics -----
 
   # Percent mitochondrial genes (MT-)
   seurat[["percentMt"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
-
 
   # Percent ribosomal genes (RPS and RPL)
   seurat[["percentRibo"]] <- PercentageFeatureSet(seurat, pattern = "^RP[SL]")
@@ -1140,34 +618,58 @@ for (i in seq_along(seuratObjects.tmp)) {
   # ----- Pool/project identifiers -----
   seurat[["pool"]] <- poolName
   seurat[["poolNum"]] <- i
-  # add explicit project label for downstream per-project demux
-  seurat[["project"]] <- "P697-1"  # All pools belong to P697-1
+  seurat[["subproject"]] <- subproject
 
-  # ----- Check for Cell Ranger per_barcode_metrics.csv -----
-  # This file contains additional QC metrics from the Cell Ranger pipeline
-  poolDir <- P697_files_df$poolDir[i]
-  metricsFile <- file.path(P697_runDir, P697_processedDir, poolDir, "outs", "per_barcode_metrics.csv")
+  # ----- Load Cell Ranger metrics from Arc output (BOTH GEX and ATAC metrics) -----
+  arcMetricsFile <- P697_files_df$arc_per_barcode_metrics[poolIdx]
 
-  if (file.exists(metricsFile)) {
-    cat(sprintf("  Reading per_barcode_metrics.csv for %s...\n", poolName))
-    metricsDf <- read.csv(metricsFile, row.names = 1)
+  if (file.exists(arcMetricsFile)) {
+    cat(sprintf("  Reading Arc per_barcode_metrics.csv for %s...\n", poolName))
+    metricsDf <- read.csv(arcMetricsFile, row.names = 1)
 
-    # Filter to cells in our Seurat object
-    commonCells <- intersect(colnames(seurat), rownames(metricsDf))
+    # Filter to cells in our Seurat object (match by barcode prefix)
+    gexBarcodes <- colnames(seurat)
+    gexBase <- sub("-[0-9]+$", "", gexBarcodes)
+    metricsBase <- sub("-[0-9]+$", "", rownames(metricsDf))
 
-    if (length(commonCells) > 0) {
-      metricsDf <- metricsDf[commonCells, , drop = FALSE]
+    # Create mapping
+    baseToGEX <- setNames(gexBarcodes, gexBase)
+    baseToMetrics <- setNames(rownames(metricsDf), metricsBase)
 
-      # Add each metric column to metadata (prefix with "cr_" for Cell Ranger)
-      for (col in colnames(metricsDf)) {
-        # Skip if column is all NA or already exists
-        if (!all(is.na(metricsDf[[col]])) && !(col %in% colnames(seurat@meta.data))) {
-          seurat[[paste0("cr_", col)]] <- metricsDf[[col]]
+    sharedBase <- intersect(gexBase, metricsBase)
+
+    if (length(sharedBase) > 0) {
+      # Subset metrics to shared cells
+      metricsSubset <- metricsDf[baseToMetrics[sharedBase], , drop = FALSE]
+      rownames(metricsSubset) <- baseToGEX[sharedBase]
+
+      # Add metrics with prefixes to distinguish GEX vs ATAC modality
+      # cr_arc_gex_* = GEX metrics from Arc pipeline
+      # cr_arc_atac_* = ATAC metrics from Arc pipeline
+      for (col in colnames(metricsSubset)) {
+        if (!all(is.na(metricsSubset[[col]]))) {
+          # Determine if this is a GEX or ATAC metric based on column name
+          if (grepl("^gex_", col)) {
+            colName <- paste0("cr_arc_gex_", sub("^gex_", "", col))
+          } else if (grepl("^atac_", col)) {
+            colName <- paste0("cr_arc_atac_", sub("^atac_", "", col))
+          } else {
+            # Non-modality-specific columns (barcode, is_cell, excluded_reason)
+            colName <- paste0("cr_arc_", col)
+          }
+
+          # Create a vector for all cells, fill with NA, then assign matching values
+          metricVec <- rep(NA, ncol(seurat))
+          names(metricVec) <- colnames(seurat)
+          metricVec[rownames(metricsSubset)] <- metricsSubset[[col]]
+          seurat[[colName]] <- metricVec
         }
       }
-      cat(sprintf("    Added %d Cell Ranger metrics for %d cells\n",
-        ncol(metricsDf), length(commonCells)))
+      cat(sprintf("    Added %d Arc metrics (GEX + ATAC) for %d cells\n",
+        ncol(metricsSubset), length(sharedBase)))
     }
+  } else {
+    warning(sprintf("Arc per_barcode_metrics.csv not found for %s", poolName))
   }
 
   seuratObjects.tmp[[i]] <- seurat
@@ -1179,29 +681,77 @@ qcCols <- grep("percent|complexity|pct|cr_", colnames(seuratObjects.tmp[[1]]@met
 cat("  Computed metrics:", paste(qcCols[!grepl("^cr_", qcCols)], collapse = ", "), "\n")
 crCols <- qcCols[grepl("^cr_", qcCols)]
 if (length(crCols) > 0) {
-  cat("  Cell Ranger metrics:", paste(crCols, collapse = ", "), "\n")
+  # Separate by modality
+  gexCols <- crCols[grepl("^cr_arc_gex_", crCols)]
+  atacCols <- crCols[grepl("^cr_arc_atac_", crCols)]
+  otherCols <- crCols[!grepl("^cr_arc_(gex|atac)_", crCols)]
+
+  cat("\n  Cell Ranger Arc metrics loaded:\n")
+  if (length(gexCols) > 0) {
+    cat(sprintf("    GEX metrics (%d): %s\n", length(gexCols),
+      paste(head(sub("^cr_arc_gex_", "", gexCols), 10), collapse = ", ")))
+    if (length(gexCols) > 10) cat(sprintf("      ... and %d more\n", length(gexCols) - 10))
+  }
+  if (length(atacCols) > 0) {
+    cat(sprintf("    ATAC metrics (%d): %s\n", length(atacCols),
+      paste(head(sub("^cr_arc_atac_", "", atacCols), 10), collapse = ", ")))
+    if (length(atacCols) > 10) cat(sprintf("      ... and %d more\n", length(atacCols) - 10))
+  }
+  if (length(otherCols) > 0) {
+    cat(sprintf("    Other metrics (%d): %s\n", length(otherCols),
+      paste(head(sub("^cr_arc_", "", otherCols), 5), collapse = ", ")))
+  }
+} else {
+  cat("  No Cell Ranger metrics found - check file paths!\n")
+}
+
+# Check which Arc metrics files were found
+cat("\nArc per_barcode_metrics files:\n")
+for (i in seq_len(nrow(P697_files_df))) {
+  f <- P697_files_df$arc_per_barcode_metrics[i]
+  exists <- file.exists(f)
+  cat(sprintf("  %s: %s %s\n",   # <-- change from 4 spaces to 2
+    P697_files_df$pool[i],
+    ifelse(exists, "✓", "✗"),
+    ifelse(exists, "", paste0("(not found: ", basename(f), ")"))))
+}
+
+# Summary by subproject
+cat("\nCells per subproject:\n")
+for (sp in unique(P697_files_df$subproject)) {
+  poolsInSP <- P697_files_df$pool[P697_files_df$subproject == sp]
+  nCells <- sum(sapply(poolsInSP, function(p) {
+    if (p %in% names(seuratObjects.tmp)) ncol(seuratObjects.tmp[[p]]) else 0
+  }))
+  cat(sprintf("  %s: %d cells\n", sp, nCells))
 }
 ```
 
-```{r plotNFeatures, fig.height = 3, fig.width=3}
+```{r plotNFeatures, fig.height = 6, fig.width=12}
 # Select QC cutoffs
 nFeatureLow <- 500
 nFeatureHigh <- 4000
 pctMt <- 15
 
 # Look at distributions of quality features using ggplot
+# With 8 pools (4 per subproject), use 4 columns x 2 rows layout
 nf <- length(seuratObjects.tmp)
-ncol <- ceiling(sqrt(nf))
-nrow <- ceiling(nf / ncol)
+ncol <- 4  # 4 pools per row (one per subproject)
+nrow <- 2  # 2 subprojects
 
-nfeaturePlots.tmp <- lapply(names(seuratObjects.tmp), function(nm) {
+# Order pools by subproject for consistent layout
+poolOrder <- P697_files_df$pool[order(P697_files_df$subproject, P697_files_df$pool)]
+poolOrder <- poolOrder[poolOrder %in% names(seuratObjects.tmp)]
+
+nfeaturePlots.tmp <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(nFeature_RNA = x$nFeature_RNA)
   ggplot(df, aes(x = nFeature_RNA)) +
     geom_histogram(bins = 50) +
     coord_cartesian(xlim = c(0, 6000)) +
     geom_vline(xintercept = c(nFeatureLow, nFeatureHigh), linetype = "dashed") +
-    labs(title = nm, x = "nFeature RNA", y = "Count") +
+    labs(title = paste0(nm, " (", subproj, ")"), x = "nFeature RNA", y = "Count") +
     theme_bw()
 })
 
@@ -1211,42 +761,44 @@ savePlot(
   plot = nfeatureArranged.tmp,
   plotDir = plotDir,
   filename = "NFeatureHistograms",
-  height = 5.5,
-  width = 12,
+  height = 6,
+  width = 14,
   formats = c("pdf", "png")
 )
 ```
 
-```{r plotPctMito, fig.height = 3, fig.width=3}
-mitoPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+```{r plotPctMito, fig.height = 6, fig.width=14}
+mitoPlots <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(percentMt = x$percentMt)
   ggplot(df, aes(x = percentMt)) +
     geom_histogram(bins = 100) +
     coord_cartesian(xlim = c(0, 25)) +
     geom_vline(xintercept = pctMt, linetype = "dashed") +
-    labs(title = nm, x = "% mitochondrial reads", y = "Count") +
+    labs(title = paste0(nm, " (", subproj, ")"), x = "% mitochondrial reads", y = "Count") +
     theme_bw()
 })
 
-mitoArranged <- ggpubr::ggarrange(plotlist = mitoPlots, ncol = ncol, nrow = nrow)
+mitoArranged <- ggpubr::ggarrange(plotlist = mitoPlots, ncol = 4, nrow = 2)
 
 savePlot(
   plot = mitoArranged,
   plotDir = plotDir,
   filename = "PctMitoHistograms",
-  height = 5.5,
-  width = 12,
+  height = 6,
+  width = 14,
   formats = c("pdf", "png")
 )
 ```
 
-```{r inspectQCCutoffs, fig.width=10, fig.height=6}
+```{r inspectQCCutoffs, fig.width=14, fig.height=8}
 # Density scatter plots for QC cutoff inspection
 library(ggpointdensity)
 
-featureDensityPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+featureDensityPlots <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(
     nFeature_RNA = x$nFeature_RNA,
     percentMt = x$percentMt
@@ -1260,119 +812,119 @@ featureDensityPlots <- lapply(names(seuratObjects.tmp), function(nm) {
     geom_hline(yintercept = pctMt, linetype = "dashed", color = "red") +
     labs(x = "Number of genes",
       y = "% mito reads",
-      title = nm) +
+      title = paste0(nm, " (", subproj, ")")) +
     xlim(c(0, 7000)) +
     ylim(c(0, 50)) +
     theme_bw() +
     theme(legend.position = "none")
 })
 
-nf <- length(featureDensityPlots)
-ncol <- ceiling(sqrt(nf))
-nrow <- ceiling(nf / ncol)
-
-arranged <- ggpubr::ggarrange(plotlist = featureDensityPlots, ncol = ncol, nrow = nrow)
+arranged <- ggpubr::ggarrange(plotlist = featureDensityPlots, ncol = 4, nrow = 2)
 
 savePlot(
   plot = arranged,
   plotDir = plotDir,
   filename = "QCdensityPlots",
   height = 8,
-  width = 10,
+  width = 14,
   formats = c("pdf", "png")
 )
 ```
 
-```{r plotPctRibo, fig.height = 3, fig.width = 3}
+```{r plotPctRibo, fig.height = 6, fig.width = 14}
 # Ribosomal gene percentage
 pctRibo <- 15  # QC cutoff for ribosomal percentage
 
-riboPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+riboPlots <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(percentRibo = x$percentRibo)
   ggplot(df, aes(x = percentRibo)) +
     geom_histogram(bins = 50) +
     geom_vline(xintercept = pctRibo, linetype = "dashed", color = "red") +
     coord_cartesian(xlim = c(0, 60)) +
-    labs(title = nm, x = "% ribosomal reads", y = "Count") +
+    labs(title = paste0(nm, " (", subproj, ")"), x = "% ribosomal reads", y = "Count") +
     theme_bw()
 })
 
-riboArranged <- ggpubr::ggarrange(plotlist = riboPlots, ncol = ncol, nrow = nrow)
+riboArranged <- ggpubr::ggarrange(plotlist = riboPlots, ncol = 4, nrow = 2)
 
 savePlot(
   plot = riboArranged,
   plotDir = plotDir,
   filename = "PctRiboHistograms",
-  height = 5.5,
-  width = 12,
+  height = 6,
+  width = 14,
   formats = c("pdf", "png")
 )
 ```
 
-```{r plotPctHb, fig.height = 3, fig.width = 3}
+```{r plotPctHb, fig.height = 6, fig.width = 14}
 # Hemoglobin gene percentage (blood contamination indicator)
-hbPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+hbPlots <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(percentHb = x$percentHb)
   ggplot(df, aes(x = percentHb)) +
     geom_histogram(bins = 50) +
     coord_cartesian(xlim = c(0, 5)) +
-    labs(title = nm, x = "% hemoglobin reads", y = "Count") +
+    labs(title = paste0(nm, " (", subproj, ")"), x = "% hemoglobin reads", y = "Count") +
     theme_bw()
 })
 
-hbArranged <- ggpubr::ggarrange(plotlist = hbPlots, ncol = ncol, nrow = nrow)
+hbArranged <- ggpubr::ggarrange(plotlist = hbPlots, ncol = 4, nrow = 2)
 
 savePlot(
   plot = hbArranged,
   plotDir = plotDir,
   filename = "PctHemoglobinHistograms",
-  height = 5.5,
-  width = 12,
+  height = 6,
+  width = 14,
   formats = c("pdf", "png")
 )
 ```
 
-```{r plotComplexity, fig.height = 3, fig.width = 3}
+```{r plotComplexity, fig.height = 6, fig.width = 14}
 # Library complexity: log10(genes) / log10(UMIs)
 # Values typically range 0.7-0.95; low values may indicate damaged/low-quality cells
-complexityPlots <- lapply(names(seuratObjects.tmp), function(nm) {
+complexityPlots <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(complexity = x$complexity)
   ggplot(df, aes(x = complexity)) +
     geom_histogram(bins = 50) +
     coord_cartesian(xlim = c(0.6, 1.0)) +
     geom_vline(xintercept = 0.8, linetype = "dashed", color = "red") +
-    labs(title = nm, x = "Library complexity (log10 genes / log10 UMIs)", y = "Count") +
+    labs(title = paste0(nm, " (", subproj, ")"), x = "Library complexity (log10 genes / log10 UMIs)", y = "Count") +
     theme_bw()
 })
 
-complexityArranged <- ggpubr::ggarrange(plotlist = complexityPlots, ncol = ncol, nrow = nrow)
+complexityArranged <- ggpubr::ggarrange(plotlist = complexityPlots, ncol = 4, nrow = 2)
 
 savePlot(
   plot = complexityArranged,
   plotDir = plotDir,
   filename = "ComplexityHistograms",
-  height = 5.5,
-  width = 12,
+  height = 6,
+  width = 14,
   formats = c("pdf", "png")
 )
 ```
 
-```{r plotTop20Genes, fig.height = 3, fig.width = 3}
+```{r plotTop20Genes, fig.height = 6, fig.width = 14}
 # Percent counts in top 20 genes (high values may indicate ambient RNA or low diversity)
-top20_plots <- lapply(names(seuratObjects.tmp), function(nm) {
+top20_plots <- lapply(poolOrder, function(nm) {
   x <- seuratObjects.tmp[[nm]]
+  subproj <- x$subproject[1]
   df <- data.frame(pctTop20 = x$pctCountsInTop20Genes)
   ggplot(df, aes(x = pctTop20)) +
     geom_histogram(bins = 50) +
     coord_cartesian(xlim = c(0, 80)) +
-    labs(title = nm, x = "% counts in top 20 genes", y = "Count") +
+    labs(title = paste0(nm, " (", subproj, ")"), x = "% counts in top 20 genes", y = "Count") +
     theme_bw()
 })
 
-top20_arranged <- ggpubr::ggarrange(plotlist = top20_plots, ncol = ncol, nrow = nrow)
+top20_arranged <- ggpubr::ggarrange(plotlist = top20_plots, ncol = 4, nrow = 2)
 
 savePlot(
   plot = top20_arranged,
@@ -1517,23 +1069,27 @@ savePlot(
 ```
 
 ```{r plotCellRangerGEXMetrics, fig.height = 6, fig.width = 10}
-# Visualize key Cell Ranger GEX metrics if available
+# Visualize key Cell Ranger GEX metrics from Arc pipeline
+# Note: Arc per_barcode_metrics.csv contains both GEX and ATAC metrics
 # Check if CR metrics exist in the first pool
-hasCRMetrics <- any(grepl("^cr_", colnames(seuratObjects.tmp[[1]]@meta.data)))
+hasCRMetrics <- any(grepl("^cr_arc_", colnames(seuratObjects.tmp[[1]]@meta.data)))
 
 if (hasCRMetrics) {
-  cat("Plotting Cell Ranger GEX metrics...\n")
+  cat("Plotting Cell Ranger GEX metrics (from Arc pipeline)...\n")
+
+  # Store plots for combined display
+  gexPlotList <- list()
 
   # Exonic vs Intronic ratio - useful for distinguishing nuclei from whole cells
   # Nuclei tend to have higher intronic reads due to unspliced transcripts
-  if (all(c("cr_gex_conf_exonic_reads", "cr_gex_conf_intronic_reads") %in%
+  if (all(c("cr_arc_gex_conf_exonic_reads", "cr_arc_gex_conf_intronic_reads") %in%
     colnames(combinedMeta))) {
 
-    combinedMeta$exonicIntronicRatio <- combinedMeta$cr_gex_conf_exonic_reads /
-      (combinedMeta$cr_gex_conf_intronic_reads + 1)  # +1 to avoid div by zero
+    combinedMeta$exonicIntronicRatio <- combinedMeta$cr_arc_gex_conf_exonic_reads /
+      (combinedMeta$cr_arc_gex_conf_intronic_reads + 1)  # +1 to avoid div by zero
 
-    combinedMeta$pctIntronic <- combinedMeta$cr_gex_conf_intronic_reads /
-      (combinedMeta$cr_gex_conf_exonic_reads + combinedMeta$cr_gex_conf_intronic_reads) * 100
+    combinedMeta$pctIntronic <- combinedMeta$cr_arc_gex_conf_intronic_reads /
+      (combinedMeta$cr_arc_gex_conf_exonic_reads + combinedMeta$cr_arc_gex_conf_intronic_reads) * 100
 
     pIntronic <- ggplot(combinedMeta, aes(x = pool, y = pctIntronic, fill = pool)) +
       geom_violin(scale = "width") +
@@ -1543,19 +1099,12 @@ if (hasCRMetrics) {
       theme_bw() +
       theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
 
-    savePlot(
-      plot = pIntronic,
-      plotDir = plotDir,
-      filename = "CR_PctIntronicReads",
-      height = 5,
-      width = 8,
-      formats = c("pdf", "png")
-    )
+    gexPlotList[["intronic"]] <- pIntronic
   }
 
   # Mapped reads distribution
-  if ("cr_gex_mapped_reads" %in% colnames(combinedMeta)) {
-    pMapped <- ggplot(combinedMeta, aes(x = pool, y = cr_gex_mapped_reads, fill = pool)) +
+  if ("cr_arc_gex_mapped_reads" %in% colnames(combinedMeta)) {
+    pMapped <- ggplot(combinedMeta, aes(x = pool, y = cr_arc_gex_mapped_reads, fill = pool)) +
       geom_violin(scale = "width") +
       geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
       scale_y_log10() +
@@ -1563,22 +1112,15 @@ if (hasCRMetrics) {
       theme_bw() +
       theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
 
-    savePlot(
-      plot = pMapped,
-      plotDir = plotDir,
-      filename = "CR_GEXMappedReads",
-      height = 5,
-      width = 8,
-      formats = c("pdf", "png")
-    )
+    gexPlotList[["mapped"]] <- pMapped
   }
 
   # Duplication rate - high duplication can indicate over-sequencing or low complexity
-  if (all(c("cr_gex_conf_exonic_dup_reads", "cr_gex_conf_exonic_unique_reads") %in%
+  if (all(c("cr_arc_gex_conf_exonic_dup_reads", "cr_arc_gex_conf_exonic_unique_reads") %in%
     colnames(combinedMeta))) {
 
-    combinedMeta$gexDupRate <- combinedMeta$cr_gex_conf_exonic_dup_reads /
-      (combinedMeta$cr_gex_conf_exonic_dup_reads + combinedMeta$cr_gex_conf_exonic_unique_reads) * 100
+    combinedMeta$gexDupRate <- combinedMeta$cr_arc_gex_conf_exonic_dup_reads /
+      (combinedMeta$cr_arc_gex_conf_exonic_dup_reads + combinedMeta$cr_arc_gex_conf_exonic_unique_reads) * 100
 
     pDup <- ggplot(combinedMeta, aes(x = pool, y = gexDupRate, fill = pool)) +
       geom_violin(scale = "width") +
@@ -1587,12 +1129,28 @@ if (hasCRMetrics) {
       theme_bw() +
       theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
 
+    gexPlotList[["duplication"]] <- pDup
+  }
+
+  # Display combined plots
+  if (length(gexPlotList) > 0) {
+    if (length(gexPlotList) == 1) {
+      combinedPlot <- gexPlotList[[1]]
+    } else if (length(gexPlotList) == 2) {
+      combinedPlot <- gexPlotList[[1]] | gexPlotList[[2]]
+    } else {
+      combinedPlot <- (gexPlotList[[1]] | gexPlotList[[2]]) / gexPlotList[[3]]
+    }
+
+    print(combinedPlot)
+
+    # Save combined plot
     savePlot(
-      plot = pDup,
+      plot = combinedPlot,
       plotDir = plotDir,
-      filename = "CR_GEXDuplicationRate",
-      height = 5,
-      width = 8,
+      filename = "CR_GEXmetrics_combined",
+      height = 8,
+      width = 12,
       formats = c("pdf", "png")
     )
   }
@@ -1603,11 +1161,12 @@ if (hasCRMetrics) {
 
 ```{r plotCellRangerATACMetrics, fig.height = 8, fig.width = 12}
 # Visualize key Cell Ranger ATAC metrics - critical for TEAseq QC
-if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
-  cat("Plotting Cell Ranger ATAC metrics...\n")
+# Note: These metrics come from Arc per_barcode_metrics.csv
+if (hasCRMetrics && "cr_arc_atac_fragments" %in% colnames(combinedMeta)) {
+  cat("Plotting Cell Ranger ATAC metrics (from Arc pipeline)...\n")
 
   # ATAC fragments per cell - key metric for ATAC quality
-  pATACFrags <- ggplot(combinedMeta, aes(x = pool, y = cr_atac_fragments, fill = pool)) +
+  pATACFrags <- ggplot(combinedMeta, aes(x = pool, y = cr_arc_atac_fragments, fill = pool)) +
     geom_violin(scale = "width") +
     geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.5) +
     scale_y_log10() +
@@ -1617,9 +1176,9 @@ if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
 
   # TSS enrichment score - fragments at TSS / expected
   # Higher is better; typically want > 4-5
-  if ("cr_atac_TSS_fragments" %in% colnames(combinedMeta)) {
-    combinedMeta$tssEnrichment <- combinedMeta$cr_atac_TSS_fragments /
-      (combinedMeta$cr_atac_fragments + 1) * 100
+  if ("cr_arc_atac_TSS_fragments" %in% colnames(combinedMeta)) {
+    combinedMeta$tssEnrichment <- combinedMeta$cr_arc_atac_TSS_fragments /
+      (combinedMeta$cr_arc_atac_fragments + 1) * 100
 
     pTSS <- ggplot(combinedMeta, aes(x = pool, y = tssEnrichment, fill = pool)) +
       geom_violin(scale = "width") +
@@ -1631,9 +1190,10 @@ if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
 
   # Fraction of reads in peaks (FRiP) - key ATAC quality metric
   # Higher is better; typically want > 20-30%
-  if ("cr_atac_peak_region_fragments" %in% colnames(combinedMeta)) {
-    combinedMeta$frip <- combinedMeta$cr_atac_peak_region_fragments /
-      (combinedMeta$cr_atac_fragments + 1) * 100
+  if ("cr_arc_atac_peak_region_fragments" %in% colnames(combinedMeta)) {
+    combinedMeta$frip <- combinedMeta$cr_arc_atac_peak_region_fragments /
+      (combinedMeta$cr_arc_atac_fragments + 1) * 100
+    (combinedMeta$cr_atac_fragments + 1) * 100
 
     pFRiP <- ggplot(combinedMeta, aes(x = pool, y = frip, fill = pool)) +
       geom_violin(scale = "width") +
@@ -1646,9 +1206,10 @@ if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
   }
 
   # ATAC mitochondrial reads - should be low for good quality
-  if ("cr_atac_mitochondrial_reads" %in% colnames(combinedMeta)) {
-    combinedMeta$atacMitoPct <- combinedMeta$cr_atac_mitochondrial_reads /
-      (combinedMeta$cr_atac_raw_reads + 1) * 100
+  if ("cr_arc_atac_mitochondrial_reads" %in% colnames(combinedMeta)) {
+    combinedMeta$atacMitoPct <- combinedMeta$cr_arc_atac_mitochondrial_reads /
+      (combinedMeta$cr_arc_atac_fragments + 1) * 100
+    (combinedMeta$cr_atac_raw_reads + 1) * 100
 
     pATACMito <- ggplot(combinedMeta, aes(x = pool, y = atacMitoPct, fill = pool)) +
       geom_violin(scale = "width") +
@@ -1687,7 +1248,7 @@ if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
 }
 ```
 
-```{r plotInsertSizeDistributions, fig.height = 6, fig.width = 10, message = FALSE}
+<!-- ```{r plotInsertSizeDistributions, fig.height = 6, fig.width = 10, message = FALSE}
 # Insert size distribution from BAM files
 # For ATAC-seq, this should show nucleosomal periodicity:
 #   - Peak ~100bp: nucleosome-free regions
@@ -1696,99 +1257,104 @@ if (hasCRMetrics && "cr_atac_fragments" %in% colnames(combinedMeta)) {
 #   - Peak ~600bp: tri-nucleosome
 # For GEX, the distribution depends on library prep method
 
-# Find BAM files for each pool
+# Find BAM files for each pool from Arc flowcells
 # TEAseq/ARC has separate GEX and ATAC BAM files
 insertSizePlots <- list()
 
-for (i in seq_along(P697_pools$poolDir)) {
-  poolName <- P697_pools$pool[i]
-  poolDir <- P697_pools$poolDir[i]
-  outsDir <- file.path(P697_runDir, P697_processedDir, poolDir, "outs")
+for (i in seq_len(nrow(P697_files_df))) {
+  poolName <- P697_files_df$pool[i]
+  subproject <- P697_files_df$subproject[i]
+
+  # Construct path to Arc flowcell outs directory
+  arcPoolDir <- P697_files_df$arcPoolDir[i]
+  arcFlowcellPath <- P697_files_df$arcFlowcellPath[i]
+  outsDir <- file.path(arcFlowcellPath, arcPoolDir, "outs")
 
   # Look for ATAC BAM file (most informative for insert size in TEAseq)
-  atacBAM <- file.path(outsDir, "atacPossortedBam.bam")
-  gexBAM <- file.path(outsDir, "gexPossortedBam.bam")
+  atacBAM <- file.path(outsDir, "atac_possorted_bam.bam")
 
-  # Process ATAC BAM if available (prioritize this for TEAseq)
-  if (file.exists(atacBAM)) {
-    cat(sprintf("Processing ATAC BAM for %s...\n", poolName))
-
-    # Sample reads for efficiency (full BAM can be huge)
-    # Read a subset of alignments
-    tryCatch(
-      {
-        param <- ScanBamParam(what = c("isize"),
-          flag = scanBamFlag(isPaired = TRUE, isProperPair = TRUE))
-
-        # Sample from BAM file - read first N records for speed
-        # For production, you might want to sample across the whole file
-        aln <- readGAlignments(atacBAM, param = param,
-          use.names = FALSE)
-
-        # Limit to first 1M reads for speed if file is large
-        if (length(aln) > 1000000) {
-          set.seed(42)
-          aln <- aln[sample(length(aln), 1000000)]
-        }
-
-        isizes <- abs(mcols(aln)$isize)
-        isizes <- isizes[isizes > 0 & isizes < 1000 & !is.na(isizes)]
-
-        if (length(isizes) > 1000) {
-          # Create histogram data
-          dfATAC <- data.frame(
-            insertSize = isizes,
-            pool = poolName,
-            assay = "ATAC"
-          )
-
-          # Linear scale plot - better for seeing nucleosomal pattern
-          pLinear <- ggplot(dfATAC, aes(x = insertSize)) +
-            geom_histogram(aes(y = ..density..), bins = 200, fill = "steelblue", alpha = 0.7) +
-            geom_density(color = "red", linewidth = 0.8) +
-            geom_vline(xintercept = c(100, 200, 400, 600),
-              linetype = "dashed", color = "darkgrey", alpha = 0.7) +
-            annotate("text", x = c(100, 200, 400, 600), y = Inf,
-              label = c("NFR", "mono", "di", "tri"),
-              vjust = 2, size = 3, color = "darkgrey") +
-            coord_cartesian(xlim = c(0, 800)) +
-            labs(title = paste0("ATAC Insert Size: ", poolName),
-              x = "Insert Size (bp)", y = "Density") +
-            theme_bw()
-
-          # Log scale plot - better for seeing overall distribution
-          pLog <- ggplot(dfATAC, aes(x = insertSize)) +
-            geom_histogram(aes(y = ..density..), bins = 100, fill = "steelblue", alpha = 0.7) +
-            geom_density(color = "red", linewidth = 0.8) +
-            scale_x_log10() +
-            labs(title = paste0("ATAC Insert Size (log10): ", poolName),
-              x = "Insert Size (bp, log10)", y = "Density") +
-            theme_bw()
-
-          insertSizePlots[[paste0(poolName, "_ATAC")]] <- list(
-            linear = pLinear,
-            log = pLog,
-            data = dfATAC
-          )
-
-          # Save individual plot
-          savePlot(
-            plot = pLinear,
-            plotDir = plotDir,
-            filename = paste0("InsertSize_ATAC_", poolName),
-            height = 5,
-            width = 8,
-            formats = c("pdf", "png")
-          )
-        }
-      },
-      error = function(e) {
-        cat(sprintf("  Error reading ATAC BAM for %s: %s\n", poolName, e$message))
-      })
-  } else {
-    cat(sprintf("  ATAC BAM not found for %s\n", poolName))
+  # Check if file exists
+  if (!file.exists(atacBAM)) {
+    cat(sprintf("  ATAC BAM not found for %s at: %s\n", poolName, atacBAM))
+    next
   }
+
+  cat(sprintf("Processing ATAC BAM for %s (%s)...\n", poolName, subproject))
+
+  # Sample reads for efficiency (full BAM can be huge)
+  # Read a subset of alignments
+  tryCatch(
+    {
+      param <- ScanBamParam(what = c("isize"),
+        flag = scanBamFlag(isPaired = TRUE, isProperPair = TRUE))
+
+      # Sample from BAM file - read first N records for speed
+      # For production, you might want to sample across the whole file
+      aln <- readGAlignments(atacBAM, param = param,
+        use.names = FALSE)
+
+      # Limit to first 1M reads for speed if file is large
+      if (length(aln) > 1000000) {
+        set.seed(42)
+        aln <- aln[sample(length(aln), 1000000)]
+      }
+
+      isizes <- abs(mcols(aln)$isize)
+      isizes <- isizes[isizes > 0 & isizes < 1000 & !is.na(isizes)]
+
+      if (length(isizes) > 1000) {
+        # Create histogram data
+        dfATAC <- data.frame(
+          insertSize = isizes,
+          pool = poolName,
+          assay = "ATAC"
+        )
+
+        # Linear scale plot - better for seeing nucleosomal pattern
+        pLinear <- ggplot(dfATAC, aes(x = insertSize)) +
+          geom_histogram(aes(y = ..density..), bins = 200, fill = "steelblue", alpha = 0.7) +
+          geom_density(color = "red", linewidth = 0.8) +
+          geom_vline(xintercept = c(100, 200, 400, 600),
+            linetype = "dashed", color = "darkgrey", alpha = 0.7) +
+          annotate("text", x = c(100, 200, 400, 600), y = Inf,
+            label = c("NFR", "mono", "di", "tri"),
+            vjust = 2, size = 3, color = "darkgrey") +
+          coord_cartesian(xlim = c(0, 800)) +
+          labs(title = paste0("ATAC Insert Size: ", poolName),
+            x = "Insert Size (bp)", y = "Density") +
+          theme_bw()
+
+        # Log scale plot - better for seeing overall distribution
+        pLog <- ggplot(dfATAC, aes(x = insertSize)) +
+          geom_histogram(aes(y = ..density..), bins = 100, fill = "steelblue", alpha = 0.7) +
+          geom_density(color = "red", linewidth = 0.8) +
+          scale_x_log10() +
+          labs(title = paste0("ATAC Insert Size (log10): ", poolName),
+            x = "Insert Size (bp, log10)", y = "Density") +
+          theme_bw()
+
+        insertSizePlots[[paste0(poolName, "_ATAC")]] <- list(
+          linear = pLinear,
+          log = pLog,
+          data = dfATAC
+        )
+
+        # Save individual plot
+        savePlot(
+          plot = pLinear,
+          plotDir = plotDir,
+          filename = paste0("InsertSize_ATAC_", poolName),
+          height = 5,
+          width = 8,
+          formats = c("pdf", "png")
+        )
+      }
+    },
+    error = function(e) {
+      cat(sprintf("  Error reading ATAC BAM for %s: %s\n", poolName, e$message))
+    })
 }
+
 
 # Combine all ATAC insert size distributions in one plot
 if (length(insertSizePlots) > 0) {
@@ -1802,7 +1368,7 @@ if (length(insertSizePlots) > 0) {
     geom_vline(xintercept = c(100, 200, 400, 600),
       linetype = "dashed", color = "darkgrey", alpha = 0.7) +
     coord_cartesian(xlim = c(0, 800)) +
-    facet_wrap(~pool, ncol = 2, scales = "freeY") +
+    facet_wrap(~pool, ncol = 2, scales = "free_y") +
     labs(title = "ATAC Insert Size Distributions",
       subtitle = "Vertical lines: NFR (~100bp), mono- (~200bp), di- (~400bp), tri-nucleosome (~600bp)",
       x = "Insert Size (bp)", y = "Density") +
@@ -1840,7 +1406,7 @@ if (length(insertSizePlots) > 0) {
 } else {
   cat("No ATAC BAM files were successfully processed for insert size analysis\n")
 }
-```
+``` -->
 
 ```{r atacNucleosomeSignal, fig.height = 8, fig.width = 12, message = FALSE}
 # Compute nucleosome signal per cell from fragment files
@@ -1887,11 +1453,9 @@ computeNucleosomeSignalFromFrags <- function(fragFile, validBarcodes, nSample = 
 # Process each pool
 nsResults <- list()
 
-for (i in seq_along(P697_pools$poolDir)) {
-  poolName <- P697_pools$pool[i]
-  poolDir <- P697_pools$poolDir[i]
-  outsDir <- file.path(P697_runDir, P697_processedDir, poolDir, "outs")
-  fragmentsFile <- file.path(outsDir, "atac_fragments.tsv.gz")
+for (i in seq_len(nrow(P697_files_df))) {
+  poolName <- P697_files_df$pool[i]
+  fragmentsFile <- P697_files_df$arc_fragments[i]
 
   if (!file.exists(fragmentsFile)) {
     cat(sprintf("Fragments file not found for %s, skipping\n", poolName))
@@ -2048,7 +1612,7 @@ if (length(nsResults) > 0) {
 # These are key Signac-style ATAC QC visualizations
 
 # Load gene annotations from Cell Ranger reference GTF for TSS positions
-cellRangerArcRef <- "/Volumes/bioinformatics-1/pipeline/annotation/pipeline/10x/refdata-cellranger-arc-GRCh38-2024-A"
+cellRangerArcRef <- "/Volumes/bioinformatics/pipeline/annotation/pipeline/10x/refdata-cellranger-arc-GRCh38-2024-A"
 gtfFile <- file.path(cellRangerArcRef, "genes", "genes.gtf.gz")
 
 if (file.exists(gtfFile)) {
@@ -2214,15 +1778,15 @@ combinedMetaATAC <- do.call(rbind, lapply(names(seuratObjects.tmp), function(nm)
 }))
 
 # Check if we have the required Cell Ranger ATAC metrics
-hasATACMetrics <- all(c("cr_atac_peak_region_fragments", "cr_atac_TSS_fragments") %in%
+hasATACMetrics <- all(c("cr_arc_atac_peak_region_fragments", "cr_arc_atac_TSS_fragments") %in%
   colnames(combinedMetaATAC))
 
 if (hasATACMetrics) {
   cat("Creating density scatter plots using Cell Ranger ATAC metrics...\n")
 
   # Calculate TSS enrichment as % of fragments at TSS
-  combinedMetaATAC$tssEnrichmentPct <- combinedMetaATAC$cr_atac_TSS_fragments /
-    (combinedMetaATAC$cr_atac_fragments + 1) * 100
+  combinedMetaATAC$tssEnrichmentPct <- combinedMetaATAC$cr_arc_atac_TSS_fragments /
+    (combinedMetaATAC$cr_arc_atac_fragments + 1) * 100
 
   # Per-pool density scatter plots
   for (poolName in unique(combinedMetaATAC$pool)) {
@@ -2230,9 +1794,9 @@ if (hasATACMetrics) {
 
     # Filter out zeros/NAs for log scale
     poolData <- poolData %>%
-      filter(cr_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
+      filter(cr_arc_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
 
-    pDensity <- ggplot(poolData, aes(x = cr_atac_peak_region_fragments, y = tssEnrichmentPct)) +
+    pDensity <- ggplot(poolData, aes(x = cr_arc_atac_peak_region_fragments, y = tssEnrichmentPct)) +
       geom_pointdensity(size = 0.5) +
       scale_color_viridis_c() +
       scale_x_log10(labels = scales::comma) +
@@ -2259,10 +1823,10 @@ if (hasATACMetrics) {
 
   # Combined faceted density scatter
   combinedMetaATACFiltered <- combinedMetaATAC %>%
-    filter(cr_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
+    filter(cr_arc_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
 
   pDensityAll <- ggplot(combinedMetaATACFiltered,
-    aes(x = cr_atac_peak_region_fragments, y = tssEnrichmentPct)) +
+    aes(x = cr_arc_atac_peak_region_fragments, y = tssEnrichmentPct)) +
     geom_pointdensity(size = 0.3) +
     scale_color_viridis_c() +
     scale_x_log10(labels = scales::comma) +
@@ -2334,11 +1898,11 @@ atacFragmentsMin <- 1000   # Minimum total ATAC fragments per cell
 # tssEnrichmentMin defined in atacDensityScatter chunk
 fripMin <- 20              # Minimum fraction of reads in peaks (%)
 
-if (hasCRMetrics && all(c("cr_atac_fragments", "cr_gex_umis_count") %in% colnames(combinedMeta))) {
+if (hasCRMetrics && all(c("cr_arc_atac_fragments", "cr_arc_gex_umis_count") %in% colnames(combinedMeta))) {
   cat("Plotting GEX-ATAC correlation metrics...\n")
 
   # GEX UMIs vs ATAC fragments - should be correlated for good multiome cells
-  pGEXATAC <- ggplot(combinedMeta, aes(x = cr_gex_umis_count, y = cr_atac_fragments, color = pool)) +
+  pGEXATAC <- ggplot(combinedMeta, aes(x = cr_arc_gex_umis_count, y = cr_arc_atac_fragments, color = pool)) +
     geom_point(size = 0.3, alpha = 0.3) +
     scale_x_log10() +
     scale_y_log10() +
@@ -2367,10 +1931,10 @@ if (hasCRMetrics && all(c("cr_atac_fragments", "cr_gex_umis_count") %in% colname
 
   # ATAC pass criteria: sufficient fragments and FRiP (if available)
   if ("frip" %in% colnames(combinedMeta)) {
-    combinedMeta$atacPass <- combinedMeta$cr_atac_fragments > atacFragmentsMin &
+    combinedMeta$atacPass <- combinedMeta$cr_arc_atac_fragments > atacFragmentsMin &
       combinedMeta$frip > fripMin
   } else {
-    combinedMeta$atacPass <- combinedMeta$cr_atac_fragments > atacFragmentsMin
+    combinedMeta$atacPass <- combinedMeta$cr_arc_atac_fragments > atacFragmentsMin
   }
 
   combinedMeta$jointQC <- case_when(
@@ -2380,7 +1944,7 @@ if (hasCRMetrics && all(c("cr_atac_fragments", "cr_gex_umis_count") %in% colname
     TRUE ~ "Neither"
   )
 
-  pJointQC <- ggplot(combinedMeta, aes(x = cr_gex_umis_count, y = cr_atac_fragments,
+  pJointQC <- ggplot(combinedMeta, aes(x = cr_arc_gex_umis_count, y = cr_arc_atac_fragments,
     color = jointQC)) +
     geom_point(size = 0.5, alpha = 0.5) +
     scale_x_log10() +
@@ -2442,13 +2006,118 @@ if (hasCRMetrics && all(c("cr_atac_fragments", "cr_gex_umis_count") %in% colname
 ```
 
 ```{r addAnno}
-# note: colnames cleaned up manually because doing it programmatically was going to be essentially manual, anyway.
-annoP697 <- read_excel(file.path(dataInputDir, "LabDB _ P697-1_ TEAseq studies on samples from a low dose IL-2 trial in T1D.xlsx"))
+## Load annotation files for both subprojects
+## Both P697-1 and P697-2 now use LabDB format (single sheet)
+
+cat("Loading annotation files...\n")
+
+# Function to clean column names to camelCase format
+cleanColumnNames <- function(colNames) {
+  colNames <- gsub("\\s+", " ", colNames)  # Normalize whitespace
+  colNames <- gsub("#", "Num", colNames)  # Hash/pound to Num
+  colNames <- gsub("%", "Percent", colNames)  # Percent sign
+  colNames <- gsub("/", "Per", colNames)  # Forward slash to Per
+  colNames <- gsub("[()\\._-]", " ", colNames)  # Remove parens, periods, underscores, dashes
+  colNames <- gsub("\\\\", "", colNames)  # Remove backslashes
+  colNames <- gsub("\\s+", " ", colNames)  # Clean up extra spaces again
+  colNames <- trimws(colNames)  # Trim leading/trailing spaces
+
+  # Convert to camelCase while preserving all-caps acronyms
+  result <- sapply(colNames, function(name) {
+    words <- strsplit(name, "\\s+")[[1]]
+    # Keep all-caps words (DNA, ID, etc.) as-is, capitalize first letter of others
+    words <- sapply(seq_along(words), function(i) {
+      word <- words[i]
+      # If word is all caps and length > 1, keep it (DNA, ID, PCR, etc.)
+      if (nchar(word) > 1 && word == toupper(word)) {
+        return(word)
+      }
+      # First word: lowercase first letter unless it's an acronym
+      if (i == 1) {
+        return(paste0(tolower(substr(word, 1, 1)), substr(word, 2, nchar(word))))
+      }
+      # Subsequent words: capitalize first letter
+      return(paste0(toupper(substr(word, 1, 1)), substr(word, 2, nchar(word))))
+    })
+    paste(words, collapse = "")
+  }, USE.NAMES = FALSE)
+
+  # Fix common acronym patterns that got mangled (dNA -> DNA, cDNA -> cDNA, rNA -> RNA)
+  result <- gsub("^dNA", "DNA", result)  # dNASampleId -> DNASampleId
+  result <- gsub("^cDNA", "cDNA", result)  # Keep cDNA as is (common notation)
+  result <- gsub("^rNA", "RNA", result)  # rNASampleId -> RNASampleId
+
+  return(result)
+}
+
+# ----- P697-1: LabDB format -----
+annoP697_1_file <- file.path(dataInputDir,
+  "LabDB _ P697-1_ TEAseq studies on samples from a low dose IL-2 trial in T1D.xlsx")
+
+if (file.exists(annoP697_1_file)) {
+  annoP697_1 <- read_excel(annoP697_1_file)
+  colnames(annoP697_1) <- cleanColumnNames(colnames(annoP697_1))
+  annoP697_1$subproject <- "P697-1"
+  cat(sprintf("  P697-1: Loaded %d rows from LabDB file\n", nrow(annoP697_1)))
+  cat(sprintf("    Cleaned columns: %s\n", paste(colnames(annoP697_1)[1:min(10, ncol(annoP697_1))], collapse = ", ")))
+} else {
+  warning("P697-1 annotation file not found!")
+  annoP697_1 <- NULL
+}
+
+# ----- P697-2: LabDB format -----
+annoP697_2_file <- file.path(dataInputDir,
+  "LabDB _ P697-2_ TEAseq studies on samples from a low dose IL-2 trial in T1D.xlsx")
+
+if (file.exists(annoP697_2_file)) {
+  annoP697_2 <- read_excel(annoP697_2_file)
+  colnames(annoP697_2) <- cleanColumnNames(colnames(annoP697_2))
+  annoP697_2$subproject <- "P697-2"
+  cat(sprintf("  P697-2: Loaded %d rows from LabDB file\n", nrow(annoP697_2)))
+  cat(sprintf("    Cleaned columns: %s\n", paste(colnames(annoP697_2)[1:min(10, ncol(annoP697_2))], collapse = ", ")))
+} else {
+  warning("P697-2 annotation file not found!")
+  annoP697_2 <- NULL
+}
+
+# ----- Combine annotations -----
+# Select common columns that exist in both
+if (!is.null(annoP697_1) && !is.null(annoP697_2)) {
+  # Identify common columns (after harmonization)
+  commonCols <- intersect(colnames(annoP697_1), colnames(annoP697_2))
+  cat(sprintf("\n  Common columns (%d): %s\n", length(commonCols),
+    paste(head(commonCols, 15), collapse = ", ")))
+  if (length(commonCols) > 15) cat(sprintf("    ... and %d more\n", length(commonCols) - 15))
+
+  # Combine using all common columns
+  annoP697 <- bind_rows(
+    annoP697_1 %>% select(all_of(commonCols)),
+    annoP697_2 %>% select(all_of(commonCols))
+  )
+
+  # set visit as a character
+  annoP697$visitNum <- as.character(annoP697$visitNum)
+
+  cat(sprintf("\nCombined annotation: %d rows, %d columns\n", nrow(annoP697), ncol(annoP697)))
+  if ("donorID" %in% colnames(annoP697) && "subproject" %in% colnames(annoP697)) {
+    cat("Donors per subproject:\n")
+    print(table(annoP697$subproject, annoP697$donorID))
+  }
+} else if (!is.null(annoP697_1)) {
+  annoP697 <- annoP697_1
+  cat("\nUsing P697-1 annotation only\n")
+} else if (!is.null(annoP697_2)) {
+  annoP697 <- annoP697_2
+  cat("\nUsing P697-2 annotation only\n")
+} else {
+  stop("No annotation files found!")
+}
 ```
 
 ```{r setupPalettes}
-# Extract unique donor IDs
+# Extract unique donor IDs from combined annotation
 uniqueDonorIDs <- unique(annoP697$donorID)
+cat("Unique donors:", paste(uniqueDonorIDs, collapse = ", "), "\n")
 
 # Ensure the number of colors matches the number of unique donor IDs
 colors <- as.character(paletteer::paletteer_d("Polychrome::palette36", n = length(uniqueDonorIDs)))
@@ -2456,11 +2125,24 @@ colors <- as.character(paletteer::paletteer_d("Polychrome::palette36", n = lengt
 # Create named vector
 palDonorId <- setNames(colors, uniqueDonorIDs)
 
-# create project number color palette
-palProject <- c("P697-1" = "blue",
-  "P697-2" = "red",
-  "P697-3" = "darkred",
-  "P697-4" = "lightcoral")
+# Create subproject color palette
+palSubproject <- c(
+  "P697-1" = "#1f77b4",  # blue
+
+  "P697-2" = "#ff7f0e"   # orange
+)
+
+# Legacy project palette (for backward compatibility)
+palProject <- c(
+  "P697-1" = "#1f77b4",
+  "P697-2" = "#ff7f0e",
+  "P697-3" = "#2ca02c",
+  "P697-4" = "#d62728"
+)
+
+cat("Palettes created:\n")
+cat(sprintf("  Donors: %d colors\n", length(palDonorId)))
+cat(sprintf("  Subprojects: %d colors\n", length(palSubproject)))
 ```
 
 ```{r checkForTCRGenesPreQC}
@@ -2471,25 +2153,30 @@ palProject <- c("P697-1" = "blue",
 # Initialize cell tracking dataframe
 # Get all starting barcodes before QC cuts
 startingBarcodesList <- list()
+subprojectList <- list()
 for (i in seq_along(seuratObjects.tmp)) {
-  projectName <- names(seuratObjects.tmp)[i]
+  poolName <- names(seuratObjects.tmp)[i]
   barcodesRaw <- colnames(seuratObjects.tmp[[i]])
-  # Add project prefix to match post-merge barcodes
-  barcodesPrefixed <- paste0(projectName, "_", barcodesRaw)
-  startingBarcodesList[[projectName]] <- barcodesPrefixed
+  # Add pool prefix to match post-merge barcodes
+  barcodesPrefixed <- paste0(poolName, "_", barcodesRaw)
+  startingBarcodesList[[poolName]] <- barcodesPrefixed
+  # Get subproject for this pool
+  subprojectList[[poolName]] <- rep(seuratObjects.tmp[[i]]$subproject[1], length(barcodesPrefixed))
 }
 allStartingBarcodes <- unlist(startingBarcodesList)
+allSubprojects <- unlist(subprojectList)
 
-# Create tracking dataframe
-cellFateTrackingDF <- data.frame(
+# Create tracking dataframe with pool and subproject info
+cellFateTracking.df <- data.frame(
   barcode = allStartingBarcodes,
-  project = rep(names(startingBarcodesList),
+  pool = rep(names(startingBarcodesList),
     sapply(startingBarcodesList, length)),
+  subproject = allSubprojects,
   stage_0_initial = 1,
   stage_1_pass_QC = 0,
   stage_2_pass_HT = 0,
-  stage_3_pass_TCR = 0,
-  stage_4_pass_BCell = 0,
+  stage_3_pass_BCell = 0,
+  stage_4_compartmentSplit = 0,
   finalCompartment = NA_character_,
   removedAtStage = NA_character_,
   removalReason = NA_character_,
@@ -2497,6 +2184,8 @@ cellFateTrackingDF <- data.frame(
 )
 
 cat("Initialized cell fate tracking for", length(allStartingBarcodes), "cells\n")
+cat("  By subproject:\n")
+print(table(cellFateTracking.df$subproject))
 
 seuratQC.tmp <- vector("list", length(seuratObjects.tmp))
 names(seuratQC.tmp) <- names(seuratObjects.tmp)
@@ -2510,50 +2199,52 @@ for (i in seq_along(seuratObjects.tmp)) {
 }
 
 # Tally how many cells pass QC by pool
-projIds <- names(seuratObjects.tmp)
-projAnno <- data.frame(
-  project = projIds,
+poolIds <- names(seuratObjects.tmp)
+poolAnno <- data.frame(
+  pool = poolIds,
+  subproject = sapply(poolIds, function(p) P697_files_df$subproject[P697_files_df$pool == p]),
   nCells = NA_integer_,
   nCellsQC = NA_integer_,
   stringsAsFactors = FALSE
 )
 
 for (i in seq_along(seuratObjects.tmp)) {
-  projAnno$nCells[i] <- ncol(seuratObjects.tmp[[i]])
-  projAnno$nCellsQC[i] <- ncol(seuratQC.tmp[[i]])
+  poolAnno$nCells[i] <- ncol(seuratObjects.tmp[[i]])
+  poolAnno$nCellsQC[i] <- ncol(seuratQC.tmp[[i]])
 }
 
-projAnno$pctPass <- round(projAnno$nCellsQC / projAnno$nCells * 100, 2)
+poolAnno$pctPass <- round(poolAnno$nCellsQC / poolAnno$nCells * 100, 2)
 
 # Update cell fate tracking for QC step
 qcPassedBarcodesList <- list()
 for (i in seq_along(seuratQC.tmp)) {
-  projectName <- names(seuratQC.tmp)[i]
+  poolName <- names(seuratQC.tmp)[i]
   barcodesRaw <- colnames(seuratQC.tmp[[i]])
-  barcodesPrefixed <- paste0(projectName, "_", barcodesRaw)
-  qcPassedBarcodesList[[projectName]] <- barcodesPrefixed
+  barcodesPrefixed <- paste0(poolName, "_", barcodesRaw)
+  qcPassedBarcodesList[[poolName]] <- barcodesPrefixed
 }
 qcPassedBarcodes <- unlist(qcPassedBarcodesList)
 
-cellFateTrackingDF$stage_1_pass_QC[cellFateTrackingDF$barcode %in% qcPassedBarcodes] <- 1
-cellFateTrackingDF$removedAtStage[cellFateTrackingDF$stage_1_pass_QC == 0] <- "Stage_1_QC"
-cellFateTrackingDF$removalReason[cellFateTrackingDF$stage_1_pass_QC == 0] <- "nFeature or pctMT"
+cellFateTracking.df$stage_1_pass_QC[cellFateTracking.df$barcode %in% qcPassedBarcodes] <- 1
+cellFateTracking.df$removedAtStage[cellFateTracking.df$stage_1_pass_QC == 0] <- "Stage_1_QC"
+cellFateTracking.df$removalReason[cellFateTracking.df$stage_1_pass_QC == 0] <- "nFeature or pctMT"
 
 cat("\nCell fate after QC filtering:\n")
-cat("  Passed QC:", sum(cellFateTrackingDF$stage_1_pass_QC), "\n")
-cat("  Removed at QC:", sum(cellFateTrackingDF$stage_1_pass_QC == 0), "\n")
+cat("  Passed QC:", sum(cellFateTracking.df$stage_1_pass_QC), "\n")
+cat("  Removed at QC:", sum(cellFateTracking.df$stage_1_pass_QC == 0), "\n")
+cat("\n  By subproject:\n")
+print(table(cellFateTracking.df$subproject[cellFateTracking.df$stage_1_pass_QC == 1]))
 
-projAnno$pctPass <- round(projAnno$nCellsQC / projAnno$nCells * 100, 2)
-
-projAnno %>%
-  dplyr::select(project, nCells, nCellsQC, pctPass) %>%
+poolAnno %>%
+  dplyr::select(pool, subproject, nCells, nCellsQC, pctPass) %>%
   dplyr::rename(
-    Project = project,
+    Pool = pool,
+    Subproject = subproject,
     `Number of cells` = nCells,
     `Number of high quality cells` = nCellsQC,
     `Percent of cells that pass QC` = pctPass
   ) %>%
-  kable(row.names = FALSE, caption = "Quality analysis summary") %>%
+  kable(row.names = FALSE, caption = "Quality analysis summary by pool") %>%
   kable_styling(full_width = FALSE, position = "left")
 ```
 
@@ -2578,7 +2269,8 @@ findHashtagCutoff <- function(x, featureName = NULL, poolName = NULL, plotDir = 
     if (!inherits(gmm, "try-error") && !is.null(gmm$parameters$mean)) {
       mu <- sort(gmm$parameters$mean)
       sd <- sqrt(gmm$parameters$variance$sigmasq)
-      if (abs(diff(mu)) > 0.7) {
+      # Lower threshold to 0.5 to allow GMM fitting for closer peaks
+      if (abs(diff(mu)) > 0.5) {
         densX <- seq(min(logx), max(logx), length.out = 400)
         densY1 <- gmm$parameters$pro[1] * dnorm(densX, mu[1], sd[1])
         densY2 <- gmm$parameters$pro[2] * dnorm(densX, mu[2], sd[2])
@@ -2674,59 +2366,195 @@ for (i in seq_along(seuratQC.tmp)) {
     densY2 <- NULL
     if (length(xNonzero) < 50) {
       cutoff <- NA
+      cat(sprintf("  [Debug] %s: Too few nonzero values (%d)\n", htVars[j], length(xNonzero)))
     } else {
-      gmm <- try(Mclust(xNonzero, G = 2, modelNames = "V"), silent = TRUE)
-      if (!inherits(gmm, "try-error") && !is.null(gmm$parameters$mean)) {
-        mu <- sort(gmm$parameters$mean)
-        sd <- sqrt(gmm$parameters$variance$sigmasq)
-        if (abs(diff(mu)) > 0.7) {
-          densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
-          densY1 <- gmm$parameters$pro[1] * dnorm(densX, mu[1], sd[1])
-          densY2 <- gmm$parameters$pro[2] * dnorm(densX, mu[2], sd[2])
-          densY <- densY1 + densY2
-          valleyRange <- densX[densX > mu[1] & densX < mu[2]]
-          valleyY <- densY[densX > mu[1] & densX < mu[2]]
-          if (length(valleyRange) > 5) {
-            valley <- valleyRange[which.min(valleyY)]
-            cutoff <- valley
-            gmmOk <- TRUE
+      # Strategy: Use density peak detection first, then GMM with initialization
+      # Use slightly wider bandwidth to smooth out single-count spikes
+      d <- density(xNonzero, bw = "nrd0", adjust = 1.5)
+
+      # Find local maxima in density with minimum height threshold
+      findLocalMaxima <- function(y, minHeight = 0.05) {
+        n <- length(y)
+        maxima <- c()
+        threshold <- max(y) * minHeight  # Peak must be at least 5% of max height
+        for (i in 2:(n - 1)) {
+          if (y[i] > y[i - 1] && y[i] > y[i + 1] && y[i] > threshold) {
+            maxima <- c(maxima, i)
           }
         }
-        negMu <- mu[1]
-        posMu <- mu[2]
-        negSd <- sd[1]
-        posSd <- sd[2]
+        return(maxima)
       }
-      # Density minimum fallback if no positive peak
+
+      peakIdx <- findLocalMaxima(d$y, minHeight = 0.1)  # Require 10% of max height
+      peaks <- d$x[peakIdx]
+      peakHeights <- d$y[peakIdx]
+
+      # Find the dominant (negative) peak - usually the tallest on the left
+      # But also ensure it's a substantial peak, not a spike
+      leftPeaks <- peaks[peaks < median(xNonzero)]
+      leftPeakHeights <- peakHeights[peaks < median(xNonzero)]
+      if (length(leftPeaks) > 0) {
+        # Pick the tallest left peak
+        negPeakPos <- leftPeaks[which.max(leftPeakHeights)]
+        negPeakHeight <- max(leftPeakHeights)
+      } else {
+        negPeakPos <- peaks[which.max(peakHeights)]
+        negPeakHeight <- max(peakHeights)
+      }
+
+      # Look for a secondary peak to the right of the negative peak
+      # Require at least 1.0 log unit separation for clear bimodality
+      rightPeaks <- peaks[peaks > negPeakPos + 1.0]
+      hasSecondPeak <- length(rightPeaks) > 0
+
+      cat(sprintf("  [Debug] %s: Found %d peaks (filtered), negPeak=%.2f (height=%.2f), rightPeaks=%d\n",
+        htVars[j], length(peaks), negPeakPos, negPeakHeight, length(rightPeaks)))
+
+      # Try GMM with G=1:2 to let it choose, or initialize with peak positions
+      if (hasSecondPeak) {
+        # Use the strongest right peak as positive peak estimate
+        posPeakPos <- rightPeaks[which.max(d$y[d$x %in% rightPeaks])]
+
+        # Try GMM with initialization based on detected peaks
+        initMeans <- c(negPeakPos, posPeakPos)
+        gmm <- try(Mclust(xNonzero, G = 2, modelNames = "V",
+          initialization = list(subset = sample(length(xNonzero),
+            min(length(xNonzero), 2000)))), silent = TRUE)
+
+        if (!inherits(gmm, "try-error") && !is.null(gmm$parameters$mean)) {
+          mu <- sort(gmm$parameters$mean)
+          sd <- sqrt(gmm$parameters$variance$sigmasq)
+          pro <- gmm$parameters$pro[order(gmm$parameters$mean)]
+          cat(sprintf("  [Debug] %s: GMM fit mu1=%.2f (%.1f%%), mu2=%.2f (%.1f%%), sep=%.2f\n",
+            htVars[j], mu[1], pro[1] * 100, mu[2], pro[2] * 100, abs(diff(mu))))
+
+          if (abs(diff(mu)) > 0.5) {
+            densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
+            densY1 <- pro[1] * dnorm(densX, mu[1], sd[1])
+            densY2 <- pro[2] * dnorm(densX, mu[2], sd[2])
+            densY <- densY1 + densY2
+            valleyRange <- densX[densX > mu[1] & densX < mu[2]]
+            valleyY <- densY[densX > mu[1] & densX < mu[2]]
+            if (length(valleyRange) > 5) {
+              valley <- valleyRange[which.min(valleyY)]
+              cutoff <- valley
+              gmmOk <- TRUE
+              negMu <- mu[1]
+              posMu <- mu[2]
+              negSd <- sd[1]
+              posSd <- sd[2]
+            }
+          }
+        }
+
+        # If GMM failed but we detected peaks, use density minimum between them
+        # But ensure the valley is at least 1.5 log units from negative peak
+        if (!gmmOk) {
+          cat(sprintf("  [Debug] %s: Trying density valley between peaks (neg=%.2f, pos=%.2f)\n",
+            htVars[j], negPeakPos, posPeakPos))
+          # Only look for valley at least 1.0 log unit from negative peak
+          valleySearchStart <- negPeakPos + 1.0
+          valleyIdx <- which(d$x > valleySearchStart & d$x < posPeakPos)
+          if (length(valleyIdx) > 3) {
+            minIdx <- valleyIdx[which.min(d$y[valleyIdx])]
+            cutoff <- d$x[minIdx]
+            cat(sprintf("  [Debug] %s: Found valley at %.2f\n", htVars[j], cutoff))
+            gmmOk <- TRUE  # Mark as successful to skip quantile fallback
+            # Estimate parameters from data split at valley
+            negVals <- xNonzero[xNonzero < cutoff]
+            posVals <- xNonzero[xNonzero >= cutoff]
+            if (length(negVals) > 5) {
+              negMu <- mean(negVals)
+              negSd <- sd(negVals)
+            }
+            if (length(posVals) > 5) {
+              posMu <- mean(posVals)
+              posSd <- sd(posVals)
+            }
+            densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
+            if (!is.na(negMu) && !is.na(negSd)) {
+              densY1 <- dnorm(densX, negMu, negSd) * length(negVals) / length(xNonzero)
+            }
+            if (!is.na(posMu) && !is.na(posSd)) {
+              densY2 <- dnorm(densX, posMu, posSd) * length(posVals) / length(xNonzero)
+            }
+            if (!is.null(densY1) && !is.null(densY2)) densY <- densY1 + densY2
+          } else {
+            cat(sprintf("  [Debug] %s: Valley search range too narrow, skipping\n", htVars[j]))
+          }
+        }
+      }
+
+      # Fallback: look for density minimum even without clear secondary peak
       if (!gmmOk) {
-        d <- density(xNonzero, bw = "nrd0")
-        peakIdx <- which.max(d$y[d$x < median(xNonzero)])
-        negPeak <- d$x[d$x < median(xNonzero)][peakIdx]
-        rightLimit <- quantile(xNonzero, 0.9995)
-        idx <- which(d$x > negPeak & d$x < rightLimit)
-        valley <- NA
-        if (length(idx) > 5) {
-          minIdx <- idx[which.min(d$y[idx])]
-          valley <- d$x[minIdx]
+        # Check if there are cells in the right tail that might be positive
+        # Even if not enough to form a peak, find where density drops to minimum
+        # Search starting at least 1.5 log units from negative peak
+        rightOfPeak <- d$x > negPeakPos + 1.5
+        if (sum(rightOfPeak) > 10) {
+          # Find the global minimum in density to the right of negative peak
+          minIdx <- which(rightOfPeak)[which.min(d$y[rightOfPeak])]
+          densityMin <- d$x[minIdx]
+
+          # Check if there are cells beyond this minimum (indicating positive population)
+          cellsBeyondMin <- sum(xNonzero > densityMin)
+          cellsBeforeMin <- sum(xNonzero <= densityMin)
+
+          cat(sprintf("  [Debug] %s: Density min at %.2f, cells before=%d, after=%d\n",
+            htVars[j], densityMin, cellsBeforeMin, cellsBeyondMin))
+
+          # If at least 5% of cells are beyond the minimum, use it as cutoff
+          if (cellsBeyondMin > length(xNonzero) * 0.05 && cellsBeyondMin > 20) {
+            cutoff <- densityMin
+            gmmOk <- TRUE
+            cat(sprintf("  [Debug] %s: Using density minimum as cutoff\n", htVars[j]))
+
+            # Estimate parameters
+            negVals <- xNonzero[xNonzero < cutoff]
+            posVals <- xNonzero[xNonzero >= cutoff]
+            if (length(negVals) > 5) {
+              negMu <- mean(negVals)
+              negSd <- sd(negVals)
+            }
+            if (length(posVals) > 5) {
+              posMu <- mean(posVals)
+              posSd <- sd(posVals)
+            }
+            densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
+            if (!is.na(negMu) && !is.na(negSd)) {
+              densY1 <- dnorm(densX, negMu, negSd) * length(negVals) / length(xNonzero)
+            }
+            if (!is.na(posMu) && !is.na(posSd)) {
+              densY2 <- dnorm(densX, posMu, posSd) * length(posVals) / length(xNonzero)
+            }
+            if (!is.null(densY1) && !is.null(densY2)) densY <- densY1 + densY2
+          }
         }
-        midpoint <- (negPeak + max(xNonzero)) / 2
+      }
+
+      # Final fallback: use quantile of negative population
+      if (!gmmOk) {
+        cat(sprintf("  [Debug] %s: Using quantile fallback\n", htVars[j]))
+        # Fit to left side of distribution (negative population)
+        midpoint <- negPeakPos + 1.5  # Assume positive starts ~1.5 log units from neg peak
         negVals <- xNonzero[xNonzero < midpoint]
-        q99_5 <- if (length(negVals) > 10) quantile(negVals, 0.99995) else quantile(xNonzero, 0.99995)
-        if (!is.na(valley) && valley > negPeak) {
-          cutoff <- min(q99_5, valley)
-        } else {
-          cutoff <- q99_5
-        }
-        # Always compute negative fit for overlay
+
         if (length(negVals) > 10) {
           negMu <- mean(negVals)
           negSd <- sd(negVals)
+          # Cutoff at mean + 4*SD of negative population, or 99.9th percentile
+          # Use higher multiplier to clear the tail of sharp-peaked distributions
+          cutoff <- max(negMu + 4 * negSd, quantile(negVals, 0.999))
+          cat(sprintf("  [Debug] %s: Fallback cutoff: negMu=%.2f, negSd=%.2f, cutoff=%.2f\n",
+            htVars[j], negMu, negSd, cutoff))
         } else {
-          negMu <- mean(xNonzero)
-          negSd <- sd(xNonzero)
+          cutoff <- quantile(xNonzero, 0.999)
         }
+
         densX <- seq(min(xNonzero), max(xNonzero), length.out = 400)
-        densY1 <- dnorm(densX, negMu, negSd)
+        if (!is.na(negMu) && !is.na(negSd)) {
+          densY1 <- dnorm(densX, negMu, negSd)
+        }
         densY2 <- NA_real_
         densY <- NA_real_
         posMu <- NA_real_
@@ -2783,19 +2611,23 @@ for (i in seq_along(seuratQC.tmp)) {
     geom_line(data = overlayDf, aes(x = densX, y = densY1), color = "orange", linetype = 2, inherit.aes = FALSE, na.rm = TRUE) +
     geom_line(data = overlayDf, aes(x = densX, y = densY2), color = "green", linetype = 2, inherit.aes = FALSE, na.rm = TRUE) +
     geom_vline(data = cutoffDf, aes(xintercept = cutoff), color = "red") +
-    facet_wrap(~ht, scales = "freeY", nrow = nrowFacet, ncol = ncolFacet) +
+    facet_wrap(~ht, scales = "free_y", nrow = nrowFacet, ncol = ncolFacet) +
     labs(title = paste0("Hashtag fits & cutoffs: ", poolName), x = "log1p(counts)", y = "Density")
-  pdf(file.path(plotDir, paste0(filenameSuffix, "_HashtagFits_", poolName, ".pdf")), width = 15, height = 10)
-  print(pDiag)
-  dev.off()
+
+  savePlot(
+    plot = pDiag,
+    plotDir = plotDir,
+    filename = paste0("HashtagFits_", poolName),
+    height = 10,
+    width = 15,
+    formats = c("pdf", "png")
+  )
 
   # Add htDemux to the current seurat object for ridgeplot
   seurat$htDemux <- call
 
   # Ridgeplot for each pool (all hashtags, grouped by demux call, one plot per feature, combined)
   DefaultAssay(seurat) <- "HT"
-  ridgeplotFile <- file.path(plotDir, paste0(filenameSuffix, "_Ridgeplots_HTExpression_", poolName, ".pdf"))
-  pdf(ridgeplotFile, width = 30, height = 20)
   plots <- list()
   for (feature in htVars) {
     p <- RidgePlot(seurat,
@@ -2809,8 +2641,15 @@ for (i in seq_along(seuratQC.tmp)) {
     plots[[feature]] <- p
   }
   combinedPlot <- patchwork::wrap_plots(plots, ncol = 3)
-  print(combinedPlot)
-  dev.off()
+
+  savePlot(
+    plot = combinedPlot,
+    plotDir = plotDir,
+    filename = paste0("Ridgeplots_HTExpression_", poolName),
+    height = 20,
+    width = 30,
+    formats = c("pdf", "png")
+  )
 }
 
 
@@ -2823,7 +2662,8 @@ for (i in seq_along(seuratQC.tmp)) {
   seuratQC.tmp[[i]] <- seurat
 }
 
-# Merge all pools after demux
+# Merge all pools after demux (both subprojects)
+cat("\nMerging all pools from both subprojects...\n")
 if (length(seuratQC.tmp) > 1) {
   seuratQCMerged <- merge(
     seuratQC.tmp[[1]],
@@ -2837,6 +2677,1455 @@ if (length(seuratQC.tmp) > 1) {
 
 DefaultAssay(seuratQCMerged) <- "HT"
 
-rmTmp(ask = FALSE)
+# Print final summary
+cat("\nFinal merged object summary:\n")
+cat(sprintf("  Total cells: %d\n", ncol(seuratQCMerged)))
+cat(sprintf("  Total features: %d\n", nrow(seuratQCMerged)))
+cat("\n  Cells by subproject:\n")
+print(table(seuratQCMerged$subproject))
+cat("\n  Cells by pool:\n")
+print(table(seuratQCMerged$pool))
+cat("\n  HTO demux summary:\n")
+print(table(seuratQCMerged$htDemux))
+
+# Check for ATAC availability
+if ("hasATAC" %in% colnames(seuratQCMerged@meta.data)) {
+  cat("\n  ATAC availability:\n")
+  print(table(seuratQCMerged$subproject, seuratQCMerged$hasATAC))
+}
+
+# rm_tmp(ask = FALSE)
 gc()
+```
+
+```{r hashtagUMAP}
+# visualize the HT expression on a UMAP plot
+
+# set default assay to HT (will reset to RNA later)
+DefaultAssay(seuratQCMerged) <- "HT"
+
+# Get the names of the hashtags
+htVariables <- rownames(seuratQCMerged)
+seuratQCMerged <- ScaleData(seuratQCMerged, features = rownames(htVariables),
+  verbose = FALSE)
+seuratQCMerged <- RunPCA(seuratQCMerged, features = htVariables, approx = FALSE)
+
+# look at an elbow plot to determine the number of dims to use for findneighbors and runumap
+# looks like 12 is good
+p.tmp <- ElbowPlot(seuratQCMerged)
+print(p.tmp)
+
+# Find neighbors and clusters
+seuratQCMerged <- FindNeighbors(seuratQCMerged, dims = 1:12)
+clusterResolution <- c("HT" = 0.3, "RNA" = 0.3)
+seuratQCMerged <- FindClusters(seuratQCMerged, resolution = clusterResolution["HT"])
+
+seuratQCMerged <- RunUMAP(seuratQCMerged, dims = 1:12)
+
+# store cluster info in seurat object metadata
+# Initialize clusterName and clusterMarkers
+clusterName <- character()
+clusterMarkers <- list()
+
+clusterName[["HT"]] <-
+  paste0("seurat_clusters_RNA_", str_replace(clusterResolution[["HT"]], "\\.", "p"))
+seuratQCMerged <- seuratQCMerged %>%
+  Seurat::AddMetaData(Idents(seuratQCMerged), col.name = clusterName[["HT"]])
+
+Idents(seuratQCMerged) <- seuratQCMerged@meta.data[[clusterName[["HT"]]]]
+clusterMarkers[[paste0("HT_", clusterName[["HT"]])]] <-
+  FindAllMarkers(seuratQCMerged, assay = "HT")
+
+pdf(file.path(plotDir,
+  paste0(filenameSuffix, "_UMAP_HT_labels.pdf")),
+height = 5,
+width = 12)
+umap_plot <- DimPlot(seuratQCMerged,
+  label = TRUE,
+  repel = TRUE,
+  group.by = "htDemux")
+
+print(umap_plot)
+
+invisible(dev.off())
+
+DefaultAssay(seuratQCMerged) <- "RNA"
+
+rm_tmp(ask = FALSE)
+```
+
+```{r addAnnoToSeurat}
+# Now that we've demultiplexed by hashtag, we can add annotation metadata to the Seurat object
+# htDemux values have format like "Subject-001-5" or "Subject 006-0" (inconsistent spacing/dashes)
+# Need to extract donorID (middle number, removing leading zeros) and visitNum (last number)
+
+# Extract Seurat metadata
+metadata.tmp <- seuratQCMerged@meta.data
+
+# Parse htDemux to extract donorID and visitNum
+# Handle both "Subject-NNN-V" and "Subject NNN-V" formats
+metadata.tmp$donorID <- NA_character_
+metadata.tmp$visitNum <- NA_character_
+
+# Extract for non-Negative/Multiplet cells
+validCells <- !metadata.tmp$htDemux %in% c("Negative", "Multiplet")
+if (sum(validCells) > 0) {
+  # Remove spaces and standardize to dash-separated format
+  htClean <- gsub("\\s+", "-", metadata.tmp$htDemux[validCells])
+
+  # Extract the last two numeric components (subject ID and visit number)
+  # Pattern: Subject-NNN-V where NNN is donor (with leading zeros) and V is visit
+  parts <- str_match(htClean, "Subject-?(\\d+)-(\\d+)$")
+
+  # parts[,2] is the donor ID (may have leading zeros), parts[,3] is visit number
+  # Convert through integer to remove leading zeros, then back to character
+  metadata.tmp$donorID[validCells] <- as.character(as.integer(parts[, 2]))
+  metadata.tmp$visitNum[validCells] <- as.character(as.integer(parts[, 3]))
+}
+
+cat("Parsed htDemux values:\n")
+cat(sprintf("  Unique donorIDs: %s\n", paste(sort(unique(metadata.tmp$donorID[!is.na(metadata.tmp$donorID)])), collapse = ", ")))
+cat(sprintf("  Unique visitNums: %s\n", paste(sort(unique(metadata.tmp$visitNum[!is.na(metadata.tmp$visitNum)])), collapse = ", ")))
+
+# Prepare annotation data for joining - ensure type compatibility
+annoP697.tmp <- annoP697 %>%
+  mutate(
+    donorID = as.character(as.integer(donorID)),  # Remove leading zeros, keep as character
+    visitNum = as.character(as.integer(visitNum))
+  ) %>%
+  dplyr::distinct(donorID, visitNum, .keep_all = TRUE)
+
+cat(sprintf("\nAnnotation data: %d unique donorID-visitNum combinations\n", nrow(annoP697.tmp)))
+cat(sprintf("  Annotation donorID type: %s\n", class(annoP697.tmp$donorID)))
+cat(sprintf("  Annotation visitNum type: %s\n", class(annoP697.tmp$visitNum)))
+
+# Join metadata with annotation based on donorID and visitNum
+metaJoined.tmp <- dplyr::left_join(
+  metadata.tmp,
+  annoP697.tmp,
+  by = c("donorID", "visitNum"),
+  suffix = c("", "_anno")
+)
+rownames(metaJoined.tmp) <- rownames(metadata.tmp)
+
+# Check join success
+nJoined <- sum(!is.na(metaJoined.tmp$donorID) & !metaJoined.tmp$htDemux %in% c("Negative", "Multiplet"))
+cat(sprintf("Successfully joined annotation for %d / %d cells with hashtag assignments\n",
+  nJoined, sum(validCells)))
+
+# Overwrite meta.data
+seuratQCMerged@meta.data <- metaJoined.tmp
+
+rm_tmp(ask = FALSE)
+gc()
+```
+
+```{r outputDemultiplexCountsSummary}
+# Generate simple count tables of htDemux for each project
+# Each table will have htDemux values and their counts
+
+# Get unique projects
+unique_projects <- sort(unique(seuratQCMerged@meta.data$subproject))
+
+# Loop through each project to create and save count tables
+for (proj in unique_projects) {
+  # Filter data for current project
+  project_data <- seuratQCMerged@meta.data[seuratQCMerged@meta.data$subproject == proj, ]
+
+  # Create simple count table of htDemux
+  count_table <- table(project_data$htDemux)
+
+  # Convert to data frame
+  count_df <- data.frame(
+    htDemux = names(count_table),
+    count = as.numeric(count_table),
+    stringsAsFactors = FALSE
+  )
+
+  # Create filename
+  filename <- paste0("htDemux_counts_", proj, ".csv")
+  filepath <- file.path(dataOutputDir, filename)
+
+  # Save to CSV
+  write.csv(count_df, filepath, row.names = FALSE)
+
+  cat("Saved count table for", proj, "to:", filename, "\n")
+  cat("Total cells:", sum(count_df$count), "| Unique htDemux values:", nrow(count_df), "\n")
+
+  # Print the table for inspection
+  cat("\nCount table for", proj, ":\n")
+  print(count_df)
+  cat("\n", rep("=", 50), "\n\n")
+}
+
+# Create a summary table across all projects
+cat("Creating summary table across all projects...\n")
+summary_table <- table(seuratQCMerged@meta.data$htDemux, seuratQCMerged@meta.data$subproject)
+
+# Convert to data frame in long format
+summary_df <- as.data.frame(summary_table)
+colnames(summary_df) <- c("htDemux", "project", "count")
+
+# Save summary table
+summary_filename <- "htDemux_counts_summary_all_projects.csv"
+summary_filepath <- file.path(dataOutputDir, summary_filename)
+write.csv(summary_df, summary_filepath, row.names = FALSE)
+
+cat("Saved summary table to:", summary_filename, "\n")
+cat("Summary table has", nrow(summary_df), "rows\n")
+
+# Print overall summary
+cat("\nOverall htDemux counts across all projects:\n")
+overall_counts <- table(seuratQCMerged@meta.data$htDemux)
+print(overall_counts)
+```
+
+```{r removeHTMultipletsAndNegatives}
+# subset seuratQCMerged to remove $htDemux %in% c("multiplet", "negative")
+seuratQCMergedCleaned <- subset(seuratQCMerged, subset = !(htDemux %in% c("Multiplet", "Negative")))
+
+# removed 13792 cells (6248 Multiplets and 7544 Negatives)
+dim(seuratQCMerged) # 27715 81923
+dim(seuratQCMergedCleaned) # 21372 68131
+
+# Update cell fate tracking for hashtag demux step
+# Mark cells that passed HT demux (in seuratQCMergedCleaned)
+ht_passed_barcodes <- colnames(seuratQCMergedCleaned)
+cellFateTracking.df$stage_2_pass_HT[cellFateTracking.df$barcode %in% ht_passed_barcodes] <- 1
+
+# Find cells removed by HT demux: passed QC but not in cleaned object
+merged_barcodes <- colnames(seuratQCMerged)
+ht_removed <- cellFateTracking.df$stage_1_pass_QC == 1 &
+  cellFateTracking.df$barcode %in% merged_barcodes &
+  !cellFateTracking.df$barcode %in% ht_passed_barcodes
+
+# Identify specific HT removal reason from metadata
+if (any(ht_removed)) {
+  ht_meta <- seuratQCMerged@meta.data
+  ht_meta$barcode <- rownames(ht_meta)
+  ht_removed_barcodes <- cellFateTracking.df$barcode[ht_removed]
+
+  for (bc in ht_removed_barcodes) {
+    if (bc %in% ht_meta$barcode) {
+      ht_call <- ht_meta$htDemux[ht_meta$barcode == bc]
+      cellFateTracking.df$removed_at_stage[cellFateTracking.df$barcode == bc] <- "Stage_2_HT_demux"
+      cellFateTracking.df$removal_reason[cellFateTracking.df$barcode == bc] <-
+        paste0("HT_", ht_call)
+    }
+  }
+}
+
+cat("\nCell fate after hashtag demux:\n")
+cat("  Passed HT demux:", sum(cellFateTracking.df$stage_2_pass_HT), "\n")
+cat("  Removed at HT demux:", sum(ht_removed), "\n")
+cat("    Multiplets:", sum(grepl("Multiplet", cellFateTracking.df$removal_reason,
+  ignore.case = TRUE), na.rm = TRUE), "\n")
+cat("    Negatives:", sum(grepl("Negative", cellFateTracking.df$removal_reason,
+  ignore.case = TRUE), na.rm = TRUE), "\n")
+
+# remove seuratQCMerged--we don't need it anymore
+rm(seuratQCMerged)
+```
+
+```{r visualizeCellCounts}
+# Create visit number palette based on actual visit numbers in the data
+uniqueVisits <- sort(unique(seuratQCMergedCleaned@meta.data$visitNum[!is.na(seuratQCMergedCleaned@meta.data$visitNum)]))
+palVisit <- setNames(
+  paletteer::paletteer_d("ggprism::plasma", n = length(uniqueVisits)),
+  as.character(uniqueVisits)
+)
+
+# Count cells per donor per visitNum, and add subproject info
+count_table <- seuratQCMergedCleaned@meta.data %>%
+  dplyr::count(donorID, visitNum, subproject) %>%
+  dplyr::rename(cell_count = n)
+
+# Export this table to .csv in dataOutputDir
+write.csv(count_table, file.path(dataOutputDir, "cell_counts_per_donor_per_visit.csv"), row.names = FALSE)
+
+# Create condensed table with donors as rows and visitNums as columns
+count_table_wide <- count_table %>%
+  dplyr::select(donorID, visitNum, cell_count, subproject) %>%
+  tidyr::pivot_wider(names_from = visitNum, values_from = cell_count, values_fill = 0) %>%
+  dplyr::arrange(subproject, donorID)
+
+# Export the condensed table
+write.csv(count_table_wide, file.path(dataOutputDir, "cell_counts_per_donor_condensed.csv"), row.names = FALSE)
+
+cat("Created condensed count table with", nrow(count_table_wide), "donors and visitNum columns\n")
+print(count_table_wide)
+
+# Order donors by subproject and donorID for x-axis
+count_table <- count_table %>%
+  dplyr::mutate(donorID = factor(donorID, levels = unique(donorID[order(subproject, donorID)])),
+    subproject = factor(subproject, levels = unique(subproject)))
+
+# Create a combined x-axis label: paste subproject and donorID
+count_table <- count_table %>%
+  dplyr::mutate(x_label = paste0(subproject, "\n", donorID))
+
+# Dot plot: donor on x, cell count on y, color by visitNum, group by subproject
+plot.tmp <- ggplot(count_table, aes(x = x_label, y = cell_count, color = visitNum)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = palVisit) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey40") +
+  labs(x = "subproject\nDonor", y = "Cell count", color = "visitNum") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = "_cellCountsByDonorAndVisit",
+  height = 5.5,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png") # or "pdf", "png", or c("pdf", "png")
+)
+
+# Dot plot: donor on x, cell count on y, color by visitNum, group by subproject (log-scale)
+plot.tmp <- ggplot(count_table, aes(x = x_label, y = cell_count, color = visitNum)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = palVisit) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000), labels = c("1", "10", "100", "1000")) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey40") +
+  labs(x = "subproject\nDonor", y = "Cell count (log scale)", color = "visitNum") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = "_cellCountsByDonorAndVisitLog10Scale",
+  height = 5.5,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png") # or "pdf", "png", or c("pdf", "png")
+)
+
+rm_tmp(ask = FALSE)
+```
+
+```{r reProcessCleanedData}
+# Re-run normalization, clustering, UMAP, etc on this subset
+seuratQCMergedCleaned <- JoinLayers(seuratQCMergedCleaned, assay = "RNA")
+
+DefaultAssay(seuratQCMergedCleaned) <- "RNA"
+seuratQCMergedCleaned <- NormalizeData(object = seuratQCMergedCleaned, verbose = FALSE, assay = "RNA")
+
+seuratQCMergedCleaned <- NormalizeData(object = seuratQCMergedCleaned,
+  verbose = FALSE,
+  normalization.method = "CLR",
+  margin = 2,
+  assay = "HT")
+
+seuratQCMergedCleaned <- FindVariableFeatures(object = seuratQCMergedCleaned,
+  selection.method = "vst",
+  nfeatures = 2001, # we normally use 2000, but we're dropping the TCR genes in the next step, and there was 1 TCR genes in the variable features, so we're now asking for 2111
+  verbose = FALSE)
+
+VariableFeatures(seuratQCMergedCleaned) <- setdiff(
+  VariableFeatures(seuratQCMergedCleaned),
+  tcrGeneList %>% stats::na.omit() %>% unique()
+)
+
+seuratQCMergedCleaned <- ScaleData(
+  object = seuratQCMergedCleaned,
+  verbose = FALSE,
+  features = VariableFeatures(seuratQCMergedCleaned)
+)
+seuratQCMergedCleaned <- RunPCA(object = seuratQCMergedCleaned, npcs = 30, verbose = FALSE)
+
+# Elbow plot
+elbowPlot.tmp <- ElbowPlot(seuratQCMergedCleaned)
+
+pdf(file.path(plotDir,
+  paste0(filenameSuffix, "_elbowPlotUMAP.pdf")),
+height = 5,
+width = 6)
+
+print(elbowPlot.tmp)
+
+dev.off()
+rm_tmp(ask = FALSE)
+
+seuratQCMergedCleaned <- FindNeighbors(seuratQCMergedCleaned, dims = 1:11)
+seuratQCMergedCleaned <- FindClusters(seuratQCMergedCleaned, resolution = 0.3)
+
+set.seed(6022)
+seuratQCMergedCleaned <- RunUMAP(object = seuratQCMergedCleaned, reduction = "pca",
+  dims = 1:11,
+  n.neighbors = 30,
+  min.dist = 0.3,
+  return.model = TRUE)
+
+# store cluster info in seurat object metadata
+# Initialize clusterName and clusterMarkers
+clusterName <- character()
+clusterMarkers <- list()
+
+# Create the cluster name for RNA
+clusterName[["RNA"]] <- paste0("seurat_clusters_RNA_", str_replace(clusterResolution[["RNA"]], "\\.", "p"))
+
+# Add metadata to the Seurat object
+seuratQCMergedCleaned <- seuratQCMergedCleaned %>%
+  Seurat::AddMetaData(Idents(seuratQCMergedCleaned), col.name = clusterName[["RNA"]])
+
+# Set the identifiers
+Idents(seuratQCMergedCleaned) <- seuratQCMergedCleaned@meta.data[[clusterName[["RNA"]]]]
+
+# Join the data layers in the RNA assay if not already joined
+if (!"RNA" %in% names(seuratQCMergedCleaned@assays)) {
+  seuratQCMergedCleaned <- JoinLayers(seuratQCMergedCleaned, layers = c("RNA"))
+}
+
+# Perform the FindAllMarkers function and store the results in clusterMarkers
+clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]] <-
+  FindAllMarkers(seuratQCMergedCleaned, assay = "RNA")
+
+# Print top 15 cluster markers for each cluster
+cat("Top 15 cluster markers found:\n")
+markers_df <- clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]]
+
+# Get unique clusters and print top 15 markers for each
+unique_clusters <- sort(unique(markers_df$cluster))
+for (cluster_id in unique_clusters) {
+  cat("\n=== Cluster", cluster_id, "===\n")
+  cluster_markers <- markers_df %>%
+    dplyr::filter(cluster == cluster_id) %>%
+    dplyr::arrange(desc(avg_log2FC)) %>%
+    dplyr::slice_head(n = 15) %>%
+    dplyr::select(gene, avg_log2FC, p_val_adj)
+
+  print(cluster_markers)
+}
+
+palRNAClusters <-
+  big_colorblind_pal(
+    n_distinct(seuratQCMergedCleaned@meta.data[[clusterName[["RNA"]]]]),
+    shuffle_colors = TRUE,
+    drop_yellow = TRUE, drop_black = TRUE) %>%
+  setNames(sort(unique(seuratQCMergedCleaned@meta.data[[clusterName[["RNA"]]]])))
+
+# Get the number of distinct RNA clusters
+num_clusters <- n_distinct(seuratQCMergedCleaned@meta.data[[clusterName[["RNA"]]]])
+
+# Get the "ggsci::uniform_startrek" palette and adjust it
+palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
+  sample() %>%  # Shuffle colors
+  .[!grepl("yellow|black", .)] %>%  # Drop yellow and black colors
+  setNames(sort(unique(seuratQCMergedCleaned@meta.data[[clusterName[["RNA"]]]])))
+```
+
+```{r saveSeuratToH5ADForCellTypist}
+# save seuratQCMergedCleaned to h5ad (for CellTypist)
+
+# Convert to V3 object
+seuratQCMergedCleanedV3.tmp <- seuratQCMergedCleaned
+seuratQCMergedCleanedV3.tmp[["RNA"]] <- as(object = seuratQCMergedCleanedV3.tmp[["RNA"]], Class = "Assay")
+library(SeuratDisk)
+SaveH5Seurat(
+  seuratQCMergedCleanedV3.tmp,
+  filename =
+    file.path(dataOutputDir, "seuratP697AllCells.h5Seurat"),
+  overwrite = TRUE)
+Convert(
+  source = file.path(dataOutputDir, "seuratP697AllCells.h5Seurat"),
+  dest = "h5ad",
+  assay = "RNA",
+  overwrite = TRUE)
+
+rm_tmp(ask = FALSE)
+```
+
+```{r loadCellTypistResultsAndAddToSeurat}
+# Load CellTypist predictions for all levels (L1, L2, L3) using a loop
+cellTypist_levels <- c("L1", "L2", "L3")
+
+# TODO move this further up
+seuratQCMergedCleaned@meta.data$barcode <- rownames(seuratQCMergedCleaned@meta.data)
+
+# Get Seurat barcodes once
+seuratBarcodes <- seuratQCMergedCleaned@meta.data$barcode
+
+for (level in cellTypist_levels) {
+  # Construct filename for current level
+  filename <- paste0("20260204_P697_celltypist_", level, "_predictions.csv")
+  filepath <- file.path(dataOutputDir, filename)
+
+  # Check if file exists before trying to load it
+  if (file.exists(filepath)) {
+    cat("Loading CellTypist", level, "predictions...\n")
+
+    # Load the cellTypist output
+    cellTypist.df <- read.csv(filepath) %>% data.frame()
+
+    # Extract barcodes from cellTypist.df
+    cellTypistBarcodes <- cellTypist.df$X
+
+    # Match barcodes and create a named vector for majority_voting
+    matchingIndices <- match(seuratBarcodes, cellTypistBarcodes)
+    cellTypistCalling <- cellTypist.df$majority_voting[matchingIndices]
+
+    # Create column name
+    colName <- paste0("cellTypistCalling", level)
+
+    # Add cellTypistCalling to seuratQCMergedCleaned metadata
+    seuratQCMergedCleaned <- Seurat::AddMetaData(
+      object = seuratQCMergedCleaned,
+      metadata = cellTypistCalling,
+      col.name = colName
+    )
+
+    # Replace NA values with "Other"
+    seuratQCMergedCleaned@meta.data[[colName]][is.na(seuratQCMergedCleaned@meta.data[[colName]])] <- "Other"
+
+    # Create color palette for this level
+    unique_cell_types <- sort(unique(seuratQCMergedCleaned@meta.data[[colName]]))
+    n_colors <- length(unique_cell_types)
+
+    # Generate colorblind-friendly palette
+    palette_colors <- big_colorblind_pal(n_colors = n_colors)
+
+    # Create named palette
+    palette_name <- paste0("palCellTypist", level)
+    assign(palette_name, setNames(palette_colors, unique_cell_types))
+
+    cat("Successfully added", colName, "to Seurat object\n")
+    cat("Created color palette", palette_name, "with", n_colors, "colors\n")
+  } else {
+    cat("Warning: File", filepath, "not found. Skipping", level, "predictions.\n")
+  }
+}
+```
+
+```{r identifyPotentialBCells}
+# palDonorID TODO move this up
+# Create visit number palette based on actual visit numbers in the data
+uniqueDonors <- sort(unique(seuratQCMergedCleaned@meta.data$donorID[!is.na(seuratQCMergedCleaned@meta.data$donorID)]))
+palDonorID <- setNames(
+  paletteer::paletteer_d("khroma::okabeito", n = length(uniqueDonors)),
+  as.character(uniqueDonors)
+)
+
+# clusters
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratQCMergedCleaned,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  shuffle = TRUE,
+  cols = palRNAClusters,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "RNA Clusters", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_clusters"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# donor
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratQCMergedCleaned,
+  reduction = "umap",
+  group.by = "donorID",
+  cols = palDonorID,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "Donor", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_donorID"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# visit
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratQCMergedCleaned,
+  reduction = "umap",
+  group.by = "visitNum",
+  shuffle = TRUE,
+  cols = palVisit,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "Visit", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_visit"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+
+# Plot UMAP feature plots for all genes of interest
+genesOfInterest <- c("CD19", "CD4", "CD8A", "CD8B", "CD3D", "CD3E", "CD3G")
+
+for (gene in genesOfInterest) {
+  set.seed(6022)
+  plot.tmp <- FeaturePlot(
+    object = seuratQCMergedCleaned,
+    reduction = "umap",
+    features = gene,
+    shuffle = TRUE,
+    alpha = 0.6,
+    pt.size = 1
+  ) +
+    scale_color_viridis() +
+    labs(x = "UMAP 1", y = "UMAP 2", color = gene, title = "") +
+    theme(aspect.ratio = 1)
+  savePlot(
+    plot = plot.tmp,
+    plotDir = plotDir,
+    filename = paste0("_UMAP_RNA_", gene),
+    height = 6,
+    width = 10,
+    units = "in",
+    dpi = 600,
+    formats = c("pdf", "png")
+  )
+}
+
+# cellTypist predictions
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratQCMergedCleaned,
+  reduction = "umap",
+  group.by = "cellTypistCallingL1",
+  cols = palCellTypistL1,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CellTypist", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_cellTypistL1"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratQCMergedCleaned,
+  reduction = "umap",
+  group.by = "cellTypistCallingL2",
+  cols = palCellTypistL2,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CellTypist", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_cellTypistL2"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratQCMergedCleaned,
+  reduction = "umap",
+  group.by = "cellTypistCallingL3",
+  cols = palCellTypistL3,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CellTypist", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_cellTypistL3"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# It looks like we can exclude cells with UMAP 2 greater than 6.
+# Let's find those barcodes, determine which donor/stim they are all from, and then remove them from
+# the Seurat object
+
+# Identify and remove cells with UMAP_2 > 6
+umapCoords.tmp <- as.data.frame(Embeddings(seuratQCMergedCleaned, reduction = "umap"))
+colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
+umapCoords.tmp$barcode <- rownames(umapCoords.tmp)
+
+# Find barcodes to exclude
+excludeBarcodes.tmp <- umapCoords.tmp %>%
+  dplyr::filter(UMAP_2 > 6) %>%
+  dplyr::pull(barcode)
+length(excludeBarcodes.tmp) # 227
+
+# save excluded barcodes
+write.csv(excludeBarcodes.tmp, file.path(dataOutputDir, "barcodesSuspectedBCellsOrDCsToExclude.csv"), row.names = FALSE)
+
+# Report donorID and visitNum for these barcodes
+metaExclude.tmp <- seuratQCMergedCleaned@meta.data[excludeBarcodes.tmp, c("donorID", "visitNum"), drop = FALSE]
+cat("Barcodes to exclude (UMAP_1 < -7 | UMAP_2 > 10):\n")
+print(data.frame(barcode = excludeBarcodes.tmp, metaExclude.tmp))
+# Print summary table: counts per donor split by visit
+cat("\nSummary of excluded cells (counts per donor x visit):\n")
+excludeCountsTable.tmp <- table(metaExclude.tmp$donorID, metaExclude.tmp$visitNum)
+print(excludeCountsTable.tmp)
+
+# save excluded counts table
+write.csv(excludeCountsTable.tmp, file.path(dataOutputDir, "countsSuspectedBCellsOrDCsToExclude.csv"), row.names = FALSE)
+
+# Remove these cells from the Seurat object
+seuratQCMergedCleaned <- subset(seuratQCMergedCleaned, cells = excludeBarcodes.tmp, invert = TRUE)
+
+# Update cell fate tracking for B cell removal step
+bcell_passed_barcodes <- colnames(seuratQCMergedCleaned)
+cellFateTracking.df$stage_3_pass_BCell[cellFateTracking.df$barcode %in% bcell_passed_barcodes] <- 1
+
+# Mark cells removed by B cell filtering
+bcell_removed <- cellFateTracking.df$stage_2_pass_HT == 1 &
+  cellFateTracking.df$stage_3_pass_BCell == 0
+
+cellFateTracking.df$removed_at_stage[bcell_removed] <- "Stage_3_BCell_removal"
+cellFateTracking.df$removal_reason[bcell_removed] <- "Suspected_BCell_or_DC"
+
+cat("\nCell fate after B cell removal:\n")
+cat("  Passed B cell filter:", sum(cellFateTracking.df$stage_3_pass_BCell), "\n")
+cat("  Removed as B cells/DCs:", sum(bcell_removed), "\n")
+
+# Remove these cells from the Seurat object
+seuratQCMergedCleaned <- subset(seuratQCMergedCleaned, cells = excludeBarcodes.tmp, invert = TRUE)
+
+
+rm_tmp(ask = FALSE)
+```
+
+```{r visualizeCellCountsNoBCells}
+# Count cells per donor per visit, and add subproject info
+count_table <- seuratQCMergedCleaned@meta.data %>%
+  dplyr::count(donorID, visitNum, subproject) %>%
+  dplyr::rename(cell_count = n)
+
+# Export this table to .csv in dataOutputDir
+write.csv(count_table, file.path(dataOutputDir, "cell_counts_per_donor_per_visit_noBCells.csv"), row.names = FALSE)
+
+# Create condensed table with donors as rows and visits as columns
+count_table_wide <- count_table %>%
+  dplyr::select(donorID, visitNum, cell_count, subproject) %>%
+  tidyr::pivot_wider(names_from = visitNum, values_from = cell_count, values_fill = 0) %>%
+  dplyr::arrange(subproject, donorID)
+
+# Export the condensed table
+write.csv(count_table_wide, file.path(dataOutputDir, "cell_counts_per_donor_condensed_noBCells.csv"), row.names = FALSE)
+
+cat("Created condensed count table with", nrow(count_table_wide), "donors and visit columns\n")
+print(count_table_wide)
+
+# Order donors by subproject and donorID for x-axis
+count_table <- count_table %>%
+  dplyr::mutate(donorID = factor(donorID, levels = unique(donorID[order(subproject, donorID)])),
+    subproject = factor(subproject, levels = unique(subproject)))
+
+# Create a combined x-axis label: paste subproject and donorID
+count_table <- count_table %>%
+  dplyr::mutate(x_label = paste0(subproject, "\n", donorID))
+
+# Dot plot: donor on x, cell count on y, color by visit, group by subproject
+plot.tmp <- ggplot(count_table, aes(x = x_label, y = cell_count, color = visitNum)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = palVisit) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey40") +
+  labs(x = "Project\nDonor", y = "Cell count", color = "visit") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = "_cellCountsByDonorAndVisit_noBCells",
+  height = 5.5,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png") # or "pdf", "png", or c("pdf", "png")
+)
+
+# Dot plot: donor on x, cell count on y, color by visit, group by subproject (log-scale)
+plot.tmp <- ggplot(count_table, aes(x = x_label, y = cell_count, color = visitNum)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = palVisit) +
+  scale_y_log10(breaks = c(1, 10, 100, 1000), labels = c("1", "10", "100", "1000")) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "grey40") +
+  labs(x = "Project\nDonor", y = "Cell count (log scale)", color = "visit") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = "_cellCountsByDonorAndVisitLog10Scale_noBCells",
+  height = 5.5,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png") # or "pdf", "png", or c("pdf", "png")
+)
+
+rm_tmp(ask = FALSE)
+```
+
+```{r integrateByDonor}
+################################################## PCA/clustering
+# This will split the data by DonorID
+seuratQCSplitCleaned <- split(seuratQCMergedCleaned, f = seuratQCMergedCleaned$donorID)
+
+# Normalize and PCA
+seuratQCSplitCleaned <- NormalizeData(seuratQCSplitCleaned, normalization.method = "LogNormalize", assay = "RNA")
+VariableFeatures(seuratQCMergedCleaned) <- setdiff(
+  VariableFeatures(seuratQCMergedCleaned),
+  tcrGeneList %>% stats::na.omit() %>% unique()
+)
+
+seuratQCSplitCleaned <- ScaleData(seuratQCSplitCleaned, assay = "RNA")
+seuratQCSplitCleaned <- RunPCA(seuratQCSplitCleaned, assay = "RNA", npcs = 30)
+
+################################################## PCA/clustering
+# Integration by CCA/MNN
+seuratSplitIntegrated <- IntegrateLayers(object = seuratQCSplitCleaned, method = HarmonyIntegration, assay = "RNA",
+  orig.reduction = "pca", new.reduction = "harmony", verbose = T)
+seuratMergedIntegrated <- JoinLayers(seuratSplitIntegrated)
+```
+
+```{r reprocessCleanedIntegratedTCellData}
+# set up HT as names
+# Fetch the data from the "HT" assay
+ht_data <- seuratMergedIntegrated[["HT"]]@data
+
+# Get the names of the HT assay for each cell
+ht_names <- colnames(ht_data)
+
+# Add the HT names to the metadata
+seuratMergedIntegrated[["HT_names"]] <- ht_names
+
+# Re-run normalization, clustering, UMAP, etc on this subset
+DefaultAssay(seuratMergedIntegrated) <- "RNA"
+seuratMergedIntegrated <- JoinLayers(seuratMergedIntegrated, layers = c("RNA"))
+seuratQCSplitCleaned <- NormalizeData(seuratQCSplitCleaned, normalization.method = "LogNormalize", assay = "RNA")
+
+seuratMergedIntegrated <- NormalizeData(object = seuratMergedIntegrated,
+  verbose = FALSE,
+  normalization.method = "LogNormalize",
+  margin = 2,
+  assay = "HT")
+
+VariableFeatures(seuratQCMergedCleaned) <- setdiff(
+  VariableFeatures(seuratQCMergedCleaned),
+  tcrGeneList %>% stats::na.omit() %>% unique()
+)
+
+seuratMergedIntegrated <- ScaleData(object = seuratMergedIntegrated, verbose = FALSE)
+seuratMergedIntegrated <- RunPCA(object = seuratMergedIntegrated, npcs = 30, verbose = FALSE)
+
+# Elbow plot
+elbowPlot.tmp <- ElbowPlot(seuratMergedIntegrated, reduction = "pca")
+
+pdf(file.path(plotDir,
+  paste0(filenameSuffix, "_elbowPlotUMAP.pdf")),
+height = 5,
+width = 6)
+
+print(elbowPlot.tmp)
+
+dev.off()
+rm_tmp(ask = FALSE)
+
+# # Here, we should test if the opt param file exists and if not, default to seurat param defaults...
+# nClusters <- 7
+
+# # load the optimal hyperparameters for nClusters from the cluster optimization run
+# # User-provided path to the saved optimization results (copy/paste as needed)
+# optParamFile <- file.path(dataOutputDir, "20251024_allCellsClusterAndProjectionOptHyperparameters.csv")
+
+# # Read and select parameters for the requested nClusters
+# optParams.df <- read.csv(optParamFile, stringsAsFactors = FALSE)
+# optRow <- optParams.df[optParams.df$nClusters == nClusters, , drop = FALSE]
+# optRow <- optRow[1, , drop = FALSE]
+
+# # Extract hyperparameters
+# findNeighborsDim <- as.integer(optRow$findNeighborsDim[[1]])
+# findClustersRes <- as.numeric(optRow$findClustersRes[[1]])
+# min.dist <- as.numeric(optRow$min.dist[[1]])
+# n_neighbors <- as.integer(optRow$n_neighbors[[1]])
+
+# tmp until we optimize
+findNeighborsDim <- 18
+findClustersRes <- 0.3
+n_neighbors <- 30
+min.dist <- 0.3
+
+# These are the hyperparameters for the 'optimal' clustering with nClusters clusters
+set.seed(6022)
+seuratMergedIntegrated <- FindNeighbors(seuratMergedIntegrated, dims = 1:findNeighborsDim, reduction = "harmony")
+seuratMergedIntegrated <- FindClusters(seuratMergedIntegrated, resolution = findClustersRes, reduction = "harmony")
+
+set.seed(6022)
+seuratMergedIntegrated <- RunUMAP(object = seuratMergedIntegrated,
+  reduction = "harmony",
+  return.model = TRUE,
+  dims = 1:findNeighborsDim,
+  n.neighbors = n_neighbors,
+  min.dist = min.dist)
+
+# store cluster info in seurat object metadata
+# Initialize clusterName and clusterMarkers
+clusterName <- character()
+clusterMarkers <- list()
+
+# Create the cluster name for RNA
+clusterName[["RNA"]] <- paste0("seurat_clusters_RNA_", str_replace(clusterResolution[["RNA"]], "\\.", "p"))
+
+# Add metadata to the Seurat object
+seuratMergedIntegrated <- seuratMergedIntegrated %>%
+  Seurat::AddMetaData(Idents(seuratMergedIntegrated), col.name = clusterName[["RNA"]])
+
+# Set the identifiers
+Idents(seuratMergedIntegrated) <- seuratMergedIntegrated@meta.data[[clusterName[["RNA"]]]]
+
+# Ensure data layers are joined
+seuratMergedIntegrated <- JoinLayers(seuratMergedIntegrated)
+
+# Perform the FindAllMarkers function and store the results in clusterMarkers
+clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]] <-
+  FindAllMarkers(seuratMergedIntegrated, assay = "RNA")
+
+# Print cluster markers
+print("Cluster markers found:")
+print(clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]])
+
+palRNAClusters <-
+  big_colorblind_pal(
+    n_distinct(seuratMergedIntegrated@meta.data[[clusterName[["RNA"]]]]),
+    shuffle_colors = TRUE,
+    drop_yellow = TRUE, drop_black = TRUE) %>%
+  setNames(sort(unique(seuratMergedIntegrated@meta.data[[clusterName[["RNA"]]]])))
+
+# Get the number of distinct RNA clusters
+num_clusters <- n_distinct(seuratMergedIntegrated@meta.data[[clusterName[["RNA"]]]])
+
+# Get the "ggsci::uniform_startrek" palette and adjust it
+palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
+  sample() %>%  # Shuffle colors
+  .[!grepl("yellow|black", .)] %>%  # Drop yellow and black colors
+  setNames(sort(unique(seuratMergedIntegrated@meta.data[[clusterName[["RNA"]]]])))
+```
+
+```{r separateTregFromNKCells}
+# clusters
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratMergedIntegrated,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  shuffle = TRUE,
+  cols = palRNAClusters,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "RNA Clusters", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_clustersIntegrated"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# donor
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratMergedIntegrated,
+  reduction = "umap",
+  group.by = "donorID",
+  cols = palDonorID,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "Donor", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_donorIDIntegrated"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# visit
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratMergedIntegrated,
+  reduction = "umap",
+  group.by = "visitNum",
+  shuffle = TRUE,
+  cols = palVisit,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "Visit", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_visitIntegrated"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# cellTypist predictions
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratMergedIntegrated,
+  reduction = "umap",
+  group.by = "cellTypistCallingL1",
+  cols = palCellTypistL1,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CellTypist", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_cellTypistL1Integrated"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratMergedIntegrated,
+  reduction = "umap",
+  group.by = "cellTypistCallingL2",
+  cols = palCellTypistL2,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CellTypist", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_cellTypistL2Integrated"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+set.seed(6022)
+plot.tmp <- DimPlot(
+  object = seuratMergedIntegrated,
+  reduction = "umap",
+  group.by = "cellTypistCallingL3",
+  cols = palCellTypistL3,
+  shuffle = TRUE,
+  pt.size = 1
+) +
+  labs(x = "UMAP 1", y = "UMAP 2", color = "CellTypist", title = "") +
+  theme(aspect.ratio = 1)
+savePlot(
+  plot = plot.tmp,
+  plotDir = plotDir,
+  filename = paste0("UMAP_RNA_cellTypistL3Integrated"),
+  height = 6,
+  width = 10,
+  units = "in",
+  dpi = 600,
+  formats = c("pdf", "png")
+)
+
+# Split into Treg and NK compartments based on UMAP_1 coordinate
+# Treg cells: UMAP_1 > 0
+# NK cells: UMAP_1 < 0
+
+# Get UMAP coordinates
+umapCoords.tmp <- as.data.frame(Embeddings(seuratMergedIntegrated, reduction = "umap"))
+colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
+umapCoords.tmp$barcode <- rownames(umapCoords.tmp)
+
+# Identify Treg barcodes (UMAP_1 > 0)
+tregBarcodes.tmp <- umapCoords.tmp %>%
+  dplyr::filter(UMAP_1 > 0) %>%
+  dplyr::pull(barcode)
+length(tregBarcodes.tmp)
+
+# Identify NK barcodes (UMAP_1 < 0)
+nkBarcodes.tmp <- umapCoords.tmp %>%
+  dplyr::filter(UMAP_1 < 0) %>%
+  dplyr::pull(barcode)
+length(nkBarcodes.tmp)
+
+# Save compartment barcodes
+write.csv(tregBarcodes.tmp, file.path(dataOutputDir, "barcodesTregCompartment.csv"), row.names = FALSE)
+write.csv(nkBarcodes.tmp, file.path(dataOutputDir, "barcodesNKCompartment.csv"), row.names = FALSE)
+
+# Report donorID and visitNum for Treg cells
+metaTreg.tmp <- seuratMergedIntegrated@meta.data[tregBarcodes.tmp, c("donorID", "visitNum"), drop = FALSE]
+cat("Treg compartment (UMAP_1 > 0):\n")
+cat("Total Treg cells:", length(tregBarcodes.tmp), "\n")
+cat("\nSummary of Treg cells (counts per donor x visit):\n")
+tregCountsTable.tmp <- table(metaTreg.tmp$donorID, metaTreg.tmp$visitNum)
+print(tregCountsTable.tmp)
+write.csv(tregCountsTable.tmp, file.path(dataOutputDir, "countsTregCompartment.csv"), row.names = FALSE)
+
+# Report donorID and visitNum for NK cells
+metaNK.tmp <- seuratMergedIntegrated@meta.data[nkBarcodes.tmp, c("donorID", "visitNum"), drop = FALSE]
+cat("\nNK compartment (UMAP_1 < 0):\n")
+cat("Total NK cells:", length(nkBarcodes.tmp), "\n")
+cat("\nSummary of NK cells (counts per donor x visit):\n")
+nkCountsTable.tmp <- table(metaNK.tmp$donorID, metaNK.tmp$visitNum)
+print(nkCountsTable.tmp)
+write.csv(nkCountsTable.tmp, file.path(dataOutputDir, "countsNKCompartment.csv"), row.names = FALSE)
+
+# Create separate Seurat objects for Treg and NK compartments
+seuratTreg <- subset(seuratMergedIntegrated, cells = tregBarcodes.tmp)
+seuratNK <- subset(seuratMergedIntegrated, cells = nkBarcodes.tmp)
+
+# Update cell fate tracking for compartment split (stage 4)
+# Mark all cells that passed B cell filter as reaching stage 4
+cellFateTracking.df$stage_4_compartmentSplit <- 0
+all_compartment_barcodes <- c(tregBarcodes.tmp, nkBarcodes.tmp)
+cellFateTracking.df$stage_4_compartmentSplit[cellFateTracking.df$barcode %in% all_compartment_barcodes] <- 1
+
+# Assign finalCompartment for cells that made it to this stage
+cellFateTracking.df$finalCompartment[cellFateTracking.df$barcode %in% tregBarcodes.tmp] <- "Treg"
+cellFateTracking.df$finalCompartment[cellFateTracking.df$barcode %in% nkBarcodes.tmp] <- "NK"
+
+cat("\nCell fate after compartment split:\n")
+cat("  Assigned to Treg compartment:", sum(cellFateTracking.df$finalCompartment == "Treg", na.rm = TRUE), "\n")
+cat("  Assigned to NK compartment:", sum(cellFateTracking.df$finalCompartment == "NK", na.rm = TRUE), "\n")
+
+# Summary of cells in each object
+cat("\nFinal Seurat object sizes:\n")
+cat("  seuratTreg:", ncol(seuratTreg), "cells\n")
+cat("  seuratNK:", ncol(seuratNK), "cells\n")
+
+
+rm_tmp(ask = FALSE)
+```
+
+```{r subClusterTregs}
+# Re-run normalization, clustering, UMAP, etc on this subset
+DefaultAssay(seuratTreg) <- "RNA"
+seuratTreg <- JoinLayers(seuratTreg, layers = c("RNA"))
+seuratQCSplitCleaned <- NormalizeData(seuratQCSplitCleaned, normalization.method = "LogNormalize", assay = "RNA")
+
+seuratTreg <- NormalizeData(object = seuratTreg,
+  verbose = FALSE,
+  normalization.method = "LogNormalize",
+  margin = 2,
+  assay = "HT")
+
+VariableFeatures(seuratQCMergedCleaned) <- setdiff(
+  VariableFeatures(seuratQCMergedCleaned),
+  tcrGeneList %>% stats::na.omit() %>% unique()
+)
+
+seuratTreg <- ScaleData(object = seuratTreg, verbose = FALSE)
+seuratTreg <- RunPCA(object = seuratTreg, npcs = 30, verbose = FALSE)
+
+# Elbow plot
+elbowPlot.tmp <- ElbowPlot(seuratTreg, reduction = "pca")
+
+pdf(file.path(plotDir,
+  paste0(filenameSuffix, "_elbowPlotUMAP.pdf")),
+height = 5,
+width = 6)
+
+print(elbowPlot.tmp)
+
+dev.off()
+rm_tmp(ask = FALSE)
+
+# # Here, we should test if the opt param file exists and if not, default to seurat param defaults...
+# nClusters <- 7
+
+# # load the optimal hyperparameters for nClusters from the cluster optimization run
+# # User-provided path to the saved optimization results (copy/paste as needed)
+# optParamFile <- file.path(dataOutputDir, "20251024_allCellsClusterAndProjectionOptHyperparameters.csv")
+
+# # Read and select parameters for the requested nClusters
+# optParams.df <- read.csv(optParamFile, stringsAsFactors = FALSE)
+# optRow <- optParams.df[optParams.df$nClusters == nClusters, , drop = FALSE]
+# optRow <- optRow[1, , drop = FALSE]
+
+# # Extract hyperparameters
+# findNeighborsDim <- as.integer(optRow$findNeighborsDim[[1]])
+# findClustersRes <- as.numeric(optRow$findClustersRes[[1]])
+# min.dist <- as.numeric(optRow$min.dist[[1]])
+# n_neighbors <- as.integer(optRow$n_neighbors[[1]])
+
+# tmp until we optimize
+findNeighborsDim <- 18
+findClustersRes <- 0.3
+n_neighbors <- 30
+min.dist <- 0.3
+
+# These are the hyperparameters for the 'optimal' clustering with nClusters clusters
+set.seed(6022)
+seuratTreg <- FindNeighbors(seuratTreg, dims = 1:findNeighborsDim, reduction = "harmony")
+seuratTreg <- FindClusters(seuratTreg, resolution = findClustersRes, reduction = "harmony")
+
+set.seed(6022)
+seuratTreg <- RunUMAP(object = seuratTreg,
+  reduction = "harmony",
+  return.model = TRUE,
+  dims = 1:findNeighborsDim,
+  n.neighbors = n_neighbors,
+  min.dist = min.dist)
+
+# store cluster info in seurat object metadata
+# Initialize clusterName and clusterMarkers
+clusterName <- character()
+clusterMarkers <- list()
+
+# Create the cluster name for RNA
+clusterName[["RNA"]] <- paste0("seurat_clusters_RNA_", str_replace(clusterResolution[["RNA"]], "\\.", "p"))
+
+# Add metadata to the Seurat object
+seuratTreg <- seuratTreg %>%
+  Seurat::AddMetaData(Idents(seuratTreg), col.name = clusterName[["RNA"]])
+
+# Set the identifiers
+Idents(seuratTreg) <- seuratTreg@meta.data[[clusterName[["RNA"]]]]
+
+# Ensure data layers are joined
+seuratTreg <- JoinLayers(seuratTreg)
+
+# Perform the FindAllMarkers function and store the results in clusterMarkers
+clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]] <-
+  FindAllMarkers(seuratTreg, assay = "RNA")
+
+# Print cluster markers
+print("Cluster markers found:")
+print(clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]])
+
+palRNAClusters <-
+  big_colorblind_pal(
+    n_distinct(seuratTreg@meta.data[[clusterName[["RNA"]]]]),
+    shuffle_colors = TRUE,
+    drop_yellow = TRUE, drop_black = TRUE) %>%
+  setNames(sort(unique(seuratTreg@meta.data[[clusterName[["RNA"]]]])))
+
+# Get the number of distinct RNA clusters
+num_clusters <- n_distinct(seuratTreg@meta.data[[clusterName[["RNA"]]]])
+
+# Get the "ggsci::uniform_startrek" palette and adjust it
+palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
+  sample() %>%  # Shuffle colors
+  .[!grepl("yellow|black", .)] %>%  # Drop yellow and black colors
+  setNames(sort(unique(seuratTreg@meta.data[[clusterName[["RNA"]]]])))
+```
+
+```{r subClusterNK}
+# Re-run normalization, clustering, UMAP, etc on this subset
+DefaultAssay(seuratNK) <- "RNA"
+seuratNK <- JoinLayers(seuratNK, layers = c("RNA"))
+seuratQCSplitCleaned <- NormalizeData(seuratQCSplitCleaned, normalization.method = "LogNormalize", assay = "RNA")
+
+seuratNK <- NormalizeData(object = seuratNK,
+  verbose = FALSE,
+  normalization.method = "LogNormalize",
+  margin = 2,
+  assay = "HT")
+
+VariableFeatures(seuratQCMergedCleaned) <- setdiff(
+  VariableFeatures(seuratQCMergedCleaned),
+  tcrGeneList %>% stats::na.omit() %>% unique()
+)
+
+seuratNK <- ScaleData(object = seuratNK, verbose = FALSE)
+seuratNK <- RunPCA(object = seuratNK, npcs = 30, verbose = FALSE)
+
+# Elbow plot
+elbowPlot.tmp <- ElbowPlot(seuratNK, reduction = "pca")
+
+pdf(file.path(plotDir,
+  paste0(filenameSuffix, "_elbowPlotUMAP.pdf")),
+height = 5,
+width = 6)
+
+print(elbowPlot.tmp)
+
+dev.off()
+rm_tmp(ask = FALSE)
+
+# # Here, we should test if the opt param file exists and if not, default to seurat param defaults...
+# nClusters <- 7
+
+# # load the optimal hyperparameters for nClusters from the cluster optimization run
+# # User-provided path to the saved optimization results (copy/paste as needed)
+# optParamFile <- file.path(dataOutputDir, "20251024_allCellsClusterAndProjectionOptHyperparameters.csv")
+
+# # Read and select parameters for the requested nClusters
+# optParams.df <- read.csv(optParamFile, stringsAsFactors = FALSE)
+# optRow <- optParams.df[optParams.df$nClusters == nClusters, , drop = FALSE]
+# optRow <- optRow[1, , drop = FALSE]
+
+# # Extract hyperparameters
+# findNeighborsDim <- as.integer(optRow$findNeighborsDim[[1]])
+# findClustersRes <- as.numeric(optRow$findClustersRes[[1]])
+# min.dist <- as.numeric(optRow$min.dist[[1]])
+# n_neighbors <- as.integer(optRow$n_neighbors[[1]])
+
+# tmp until we optimize
+findNeighborsDim <- 18
+findClustersRes <- 0.3
+n_neighbors <- 30
+min.dist <- 0.3
+
+# These are the hyperparameters for the 'optimal' clustering with nClusters clusters
+set.seed(6022)
+seuratNK <- FindNeighbors(seuratNK, dims = 1:findNeighborsDim, reduction = "harmony")
+seuratNK <- FindClusters(seuratNK, resolution = findClustersRes, reduction = "harmony")
+
+set.seed(6022)
+seuratNK <- RunUMAP(object = seuratNK,
+  reduction = "harmony",
+  return.model = TRUE,
+  dims = 1:findNeighborsDim,
+  n.neighbors = n_neighbors,
+  min.dist = min.dist)
+
+# store cluster info in seurat object metadata
+# Initialize clusterName and clusterMarkers
+clusterName <- character()
+clusterMarkers <- list()
+
+# Create the cluster name for RNA
+clusterName[["RNA"]] <- paste0("seurat_clusters_RNA_", str_replace(clusterResolution[["RNA"]], "\\.", "p"))
+
+# Add metadata to the Seurat object
+seuratNK <- seuratNK %>%
+  Seurat::AddMetaData(Idents(seuratNK), col.name = clusterName[["RNA"]])
+
+# Set the identifiers
+Idents(seuratNK) <- seuratNK@meta.data[[clusterName[["RNA"]]]]
+
+# Ensure data layers are joined
+seuratNK <- JoinLayers(seuratNK)
+
+# Perform the FindAllMarkers function and store the results in clusterMarkers
+clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]] <-
+  FindAllMarkers(seuratNK, assay = "RNA")
+
+# Print cluster markers
+print("Cluster markers found:")
+print(clusterMarkers[[paste0("RNA_", clusterName[["RNA"]])]])
+
+palRNAClusters <-
+  big_colorblind_pal(
+    n_distinct(seuratNK@meta.data[[clusterName[["RNA"]]]]),
+    shuffle_colors = TRUE,
+    drop_yellow = TRUE, drop_black = TRUE) %>%
+  setNames(sort(unique(seuratNK@meta.data[[clusterName[["RNA"]]]])))
+
+# Get the number of distinct RNA clusters
+num_clusters <- n_distinct(seuratNK@meta.data[[clusterName[["RNA"]]]])
+
+# Get the "ggsci::uniform_startrek" palette and adjust it
+palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
+  sample() %>%  # Shuffle colors
+  .[!grepl("yellow|black", .)] %>%  # Drop yellow and black colors
+  setNames(sort(unique(seuratNK@meta.data[[clusterName[["RNA"]]]])))
+```
+
+```{r outputSeuratObjAndTCRs}
+# ==============================================================================
+# Bundle 1: Preprocessing Bundle
+# Output from: P650_preprocessing.rmd
+# Input to: P650_cellCompartmentDetermination.rmd
+# ==============================================================================
+
+bundle1_path <- file.path(dataOutputDir, paste0(filenameSuffix, "_preprocessingBundle.rds"))
+
+preprocessingBundle <- list(
+  # Core Seurat object (merged, integrated, QC-filtered, with CellTypist predictions)
+  # seuratMergedIntegrated = seuratMergedIntegrated,
+  seuratTreg = seuratTreg,
+  seuratNK = seuratNK,
+
+  # Cell fate tracking
+  # cellFateTracking.df = cellFateTracking.df,
+
+  # Gene lists for downstream analysis
+  # geneListTconvCurated = geneListTconvCurated,
+  # geneListTregCurated = geneListTregCurated,
+  # geneListCD4Curated = geneListCD4Curated,
+  # geneListCD8Curated = geneListCD8Curated,
+  tcrGeneList = tcrGeneList,
+
+  # Color palettes
+  palDonorId = palDonorId,
+  palVisit = palVisit,
+  palSubproject = palSubproject,
+  palCellTypistL1 = palCellTypistL1,
+  palCellTypistL2 = palCellTypistL2,
+  palCellTypistL3 = palCellTypistL3,
+
+  # Metadata
+  dataDate = dataDate,
+  bundle_created = Sys.time(),
+  source_script = "P697_preprocessing_split.rmd"
+)
+
+saveRDS(preprocessingBundle, file = bundle1_path)
+cat("Bundle 1 (Preprocessing) saved to:", bundle1_path, "\n")
+cat("Bundle contains:", paste(names(preprocessingBundle), collapse = ", "), "\n")
 ```

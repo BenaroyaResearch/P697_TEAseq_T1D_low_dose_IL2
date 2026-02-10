@@ -1,17 +1,33 @@
 "pool","jointQC","n","pct"
-"pool697-1_1","ATAC only",702,5.9
-"pool697-1_1","Both pass",10043,84
-"pool697-1_1","GEX only",1179,9.9
-"pool697-1_1","Neither",36,0.3
-"pool697-1_2","ATAC only",982,7.1
-"pool697-1_2","Both pass",11558,83.3
-"pool697-1_2","GEX only",1158,8.3
-"pool697-1_2","Neither",179,1.3
-"pool697-1_3","ATAC only",485,4.7
-"pool697-1_3","Both pass",8705,84.8
-"pool697-1_3","GEX only",1040,10.1
-"pool697-1_3","Neither",34,0.3
-"pool697-1_4","ATAC only",1345,7.9
-"pool697-1_4","Both pass",13406,78.9
-"pool697-1_4","GEX only",1881,11.1
-"pool697-1_4","Neither",353,2.1
+"pool697-1_1","ATAC only",264,2.2
+"pool697-1_1","Both pass",10114,85
+"pool697-1_1","GEX only",1314,11
+"pool697-1_1","Neither",208,1.7
+"pool697-1_2","ATAC only",551,4
+"pool697-1_2","Both pass",11527,83.6
+"pool697-1_2","GEX only",1444,10.5
+"pool697-1_2","Neither",265,1.9
+"pool697-1_3","ATAC only",193,1.9
+"pool697-1_3","Both pass",8705,86
+"pool697-1_3","GEX only",1112,11
+"pool697-1_3","Neither",117,1.2
+"pool697-1_4","ATAC only",532,3.2
+"pool697-1_4","Both pass",13378,81.4
+"pool697-1_4","GEX only",2277,13.9
+"pool697-1_4","Neither",252,1.5
+"pool697-2_1","ATAC only",111,1.8
+"pool697-2_1","Both pass",5434,87.5
+"pool697-2_1","GEX only",605,9.7
+"pool697-2_1","Neither",61,1
+"pool697-2_2","ATAC only",23,0.9
+"pool697-2_2","Both pass",2090,80.9
+"pool697-2_2","GEX only",425,16.4
+"pool697-2_2","Neither",47,1.8
+"pool697-2_3","ATAC only",194,1.7
+"pool697-2_3","Both pass",9787,84.4
+"pool697-2_3","GEX only",1489,12.8
+"pool697-2_3","Neither",126,1.1
+"pool697-2_4","ATAC only",506,4
+"pool697-2_4","Both pass",10433,81.7
+"pool697-2_4","GEX only",1563,12.2
+"pool697-2_4","Neither",274,2.1
