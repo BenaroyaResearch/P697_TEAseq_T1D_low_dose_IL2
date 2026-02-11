@@ -33,3 +33,7 @@ documents/notes/
 # renv infrastructure (keep lockfile + activate.R tracked, ignore libs)
 renv/library/
 renv/staging/
+*.gz
+*.tbi
+*.sorted
+data/.DS_Store

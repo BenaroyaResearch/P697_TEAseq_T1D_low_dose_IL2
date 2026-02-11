@@ -92,7 +92,10 @@ library(htmlwidgets) # for html sankey diagram
 library(jsonlite) # for html sankey diagram
 library(Rsamtools)
 library(GenomicAlignments)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
 library(Signac)
+library(biovizBase)
 opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE, warning = FALSE, message = FALSE, cache.lazy = FALSE, results = "hide")
 opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
 
@@ -107,7 +110,7 @@ baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
 dataInputDir <- file.path(baseDir, "data/inputData")
 plotDir <- file.path(baseDir, "figures")
 dataOutputDir <- file.path(baseDir, "data/outputData")
-dataDate <- "2026-02-02"
+dataDate <- "2026-02-10"
 filenameSuffix <- paste0(projNumber, ".", dataDate)
 
 ## ---------------------------------------------------------------------------
@@ -208,6 +211,82 @@ for (sp in unique(P697_files_df$subproject)) {
 ```{r setupFunctions}
 # Source shared functions from external file
 source(file.path(getwd(), "code/P697_functions.R"))
+```
+
+```{r fragmentConversionUtility}
+# Utility function to convert Cell Ranger Arc 2.x fragment files (6-column with strand)
+# to Signac-compatible 5-column format (without strand) and index with tabix
+# Required for full Signac functionality: TSS enrichment, footprinting, etc.
+# IMPORTANT: Writes to project output directory, never modifies pipeline files
+
+convertFragments6to5Column <- function(inputPath, outputPath) {
+  # Convert Arc 2.x 6-column fragment files to Signac-compatible 5-column format.
+  # Uses a streaming shell pipeline (zcat | cut | bgzip) to avoid loading the
+  # entire fragment file into R memory. Fragment files can be 2-10+ GB; fread()
+  # would require ~3x that in RAM for read + write + compression.
+  # Cell Ranger output is already coordinate-sorted, so no re-sort is needed.
+
+  cat(sprintf("Converting fragment file: %s\n", basename(inputPath)))
+  cat(sprintf("  Output: %s\n", outputPath))
+
+  indexPath <- paste0(outputPath, ".tbi")
+
+  # Check if output and index already exist
+  if (file.exists(outputPath) && file.exists(indexPath)) {
+    cat("  Output and index already exist, skipping conversion\n")
+    return(outputPath)
+  }
+
+  # Clean up any partial output from a previous failed run
+  if (file.exists(outputPath)) file.remove(outputPath)
+  if (file.exists(indexPath)) file.remove(indexPath)
+
+  # --- Streaming conversion via shell pipeline ---
+  # zcat handles .gz input; cut drops column 6 (strand); bgzip produces
+  # block-gzipped output compatible with tabix indexing.
+  # This never loads the file into R memory.
+  hasBgzip <- nchar(Sys.which("bgzip")) > 0
+  hasTabix <- nchar(Sys.which("tabix")) > 0
+
+  if (hasBgzip && hasTabix) {
+    cat("  Using streaming shell pipeline (zcat | cut | bgzip)...\n")
+    cmd <- sprintf(
+      "zcat '%s' | cut -f1-5 | bgzip -c > '%s'",
+      inputPath, outputPath
+    )
+    exitCode <- system(cmd, ignore.stdout = TRUE)
+    if (exitCode != 0) {
+      stop(sprintf("Fragment conversion failed (exit code %d) for %s", exitCode, inputPath))
+    }
+
+    cat("  Creating tabix index...\n")
+    exitCode <- system(sprintf("tabix -p bed '%s'", outputPath), ignore.stdout = TRUE)
+    if (exitCode != 0) {
+      stop(sprintf("Tabix indexing failed (exit code %d) for %s", exitCode, outputPath))
+    }
+  } else {
+    # Fallback: use R-based conversion (higher RAM, but functional)
+    cat("  bgzip/tabix not on PATH; falling back to R-based conversion...\n")
+    cat("  WARNING: This will load the full fragment file into R memory\n")
+
+    fragments <- data.table::fread(inputPath, header = FALSE, sep = "\t")
+    fragments5col <- fragments[, 1:5]
+
+    outputPathUncompressed <- sub("\\.gz$", "", outputPath)
+    data.table::fwrite(fragments5col, file = outputPathUncompressed,
+      sep = "\t", col.names = FALSE, compress = "none")
+    cat(sprintf("  Converted %d fragments\n", nrow(fragments)))
+    rm(fragments, fragments5col)
+    gc(verbose = FALSE)
+
+    Rsamtools::bgzip(outputPathUncompressed, dest = outputPath, overwrite = TRUE)
+    file.remove(outputPathUncompressed)
+    Rsamtools::indexTabix(outputPath, format = "bed")
+  }
+
+  cat(sprintf("  Fragment file indexed: %s\n", basename(indexPath)))
+  return(outputPath)
+}
 ```
 
 ```{r setHashtagNames}
@@ -351,83 +430,93 @@ for (poolName in names(seuratObjects.tmp)) {
 ```
 
 ```{r readATACFromArcFlowcells}
-## Read ATAC data from Arc flowcells (cellranger arc output)
-## Arc output contains Peaks in the h5 file and fragment files for downstream analysis
-## We integrate ATAC as a ChromatinAssay, matching barcodes to GEX cells from Multi
+## Validate Arc flowcell paths and compute barcode overlap with Multi GEX.
+## Peak matrices are NOT stored here — they are loaded on-demand during
+## integration (integrateATACAssay) one pool at a time to limit RAM usage.
+## Only file paths are recorded in atacInputs.tmp for downstream use.
 
-cat("Reading ATAC data from Arc flowcells...\n")
+cat("Reading ATAC metadata from Arc flowcells...\n")
 cat("=", rep("=", 60), "\n", sep = "")
 
-# Check which Arc h5 files exist
+# Check which Arc files exist
 arcFilesExist <- file.exists(P697_files_df$arc_filtered_h5)
 arcFragmentsExist <- file.exists(P697_files_df$arc_fragments)
 cat("Arc h5 files found:", sum(arcFilesExist), "of", nrow(P697_files_df), "\n")
 cat("Arc fragment files found:", sum(arcFragmentsExist), "of", nrow(P697_files_df), "\n\n")
 
-# Initialize storage for ATAC data
-peakObjects.tmp <- list()
-fragmentPaths.tmp <- list()
+# Store only paths — no peak matrices kept in memory
+atacInputs.tmp <- list()
 barcodeComparison <- list()
 
-# Read ATAC data from each pool
 for (i in seq_len(nrow(P697_files_df))) {
   poolName <- P697_files_df$pool[i]
   subproject <- P697_files_df$subproject[i]
   h5Path <- P697_files_df$arc_filtered_h5[i]
   fragPath <- P697_files_df$arc_fragments[i]
 
-  if (file.exists(h5Path)) {
-    cat(sprintf("Reading ATAC for %s (%s)...\n", poolName, subproject))
+  if (!file.exists(h5Path)) next
 
-    h5_data <- Read10X_h5(h5Path)
-    availableAssays <- names(h5_data)
-    cat(sprintf("  Available assays: %s\n", paste(availableAssays, collapse = ", ")))
+  cat(sprintf("Checking ATAC for %s (%s)...\n", poolName, subproject))
 
-    # Extract Peaks data
-    if ("Peaks" %in% availableAssays) {
-      peakMat <- h5_data[["Peaks"]]
-      peakObjects.tmp[[poolName]] <- peakMat
-      cat(sprintf("  Peaks: %d regions x %d cells\n", nrow(peakMat), ncol(peakMat)))
+  # Read h5 just to get barcodes and dimensions, then release
+  h5_data <- Read10X_h5(h5Path)
+  availableAssays <- names(h5_data)
+  cat(sprintf("  Available assays: %s\n", paste(availableAssays, collapse = ", ")))
 
-      # Compare barcodes with GEX from Multi
-      if (poolName %in% names(seuratObjects.tmp)) {
-        gexBarcodes <- colnames(seuratObjects.tmp[[poolName]])
-        arcBarcodes <- colnames(peakMat)
-
-        # Strip suffix for matching (barcodes are like ACGT...-1)
-        gexBase <- sub("-[0-9]+$", "", gexBarcodes)
-        arcBase <- sub("-[0-9]+$", "", arcBarcodes)
-
-        nGEX <- length(gexBarcodes)
-        nArc <- length(arcBarcodes)
-        nShared <- sum(gexBase %in% arcBase)
-        nGEXOnly <- sum(!gexBase %in% arcBase)
-        nArcOnly <- sum(!arcBase %in% gexBase)
-
-        barcodeComparison[[poolName]] <- data.frame(
-          pool = poolName,
-          subproject = subproject,
-          nGEX = nGEX,
-          nArc = nArc,
-          nShared = nShared,
-          nGEXOnly = nGEXOnly,
-          nArcOnly = nArcOnly,
-          pctGEXwithATAC = round(100 * nShared / nGEX, 1),
-          pctArcwithGEX = round(100 * nShared / nArc, 1)
-        )
-
-        cat(sprintf("  Barcode overlap: %d shared (%.1f%% of GEX, %.1f%% of Arc)\n",
-          nShared, 100 * nShared / nGEX, 100 * nShared / nArc))
-      }
-    }
-
-    # Store fragment path
-    if (file.exists(fragPath)) {
-      fragmentPaths.tmp[[poolName]] <- fragPath
-      cat(sprintf("  Fragment file: %s\n", basename(fragPath)))
-    }
-    cat("\n")
+  if (!("Peaks" %in% availableAssays)) {
+    cat("  No Peaks assay found, skipping\n\n")
+    rm(h5_data)
+    gc(verbose = FALSE)
+    next
   }
+
+  peakMat <- h5_data[["Peaks"]]
+  nPeaks <- nrow(peakMat)
+  arcBarcodes <- colnames(peakMat)
+  nArc <- length(arcBarcodes)
+  cat(sprintf("  Peaks: %d regions x %d cells\n", nPeaks, nArc))
+
+  # Record paths for on-demand loading in integrateATACAssay
+  atacInputs.tmp[[poolName]] <- list(
+    arc_filtered_h5 = h5Path,
+    arc_fragments = fragPath,
+    nPeaks = nPeaks,
+    nArcCells = nArc
+  )
+
+  # Barcode overlap with GEX (exact match first, then suffix-stripped diagnostic)
+  if (poolName %in% names(seuratObjects.tmp)) {
+    gexBarcodes <- colnames(seuratObjects.tmp[[poolName]])
+    nGEX <- length(gexBarcodes)
+
+    # Exact matches (preferred)
+    nExact <- length(intersect(gexBarcodes, arcBarcodes))
+
+    # Suffix-stripped overlap (diagnostic only)
+    gexBase <- sub("-[0-9]+$", "", gexBarcodes)
+    arcBase <- sub("-[0-9]+$", "", arcBarcodes)
+    nBaseShared <- sum(gexBase %in% arcBase)
+
+    barcodeComparison[[poolName]] <- data.frame(
+      pool = poolName,
+      subproject = subproject,
+      nGEX = nGEX,
+      nArc = nArc,
+      nExactMatch = nExact,
+      nBaseMatch = nBaseShared,
+      pctGEX_exact = round(100 * nExact / nGEX, 1),
+      pctGEX_base = round(100 * nBaseShared / nGEX, 1),
+      stringsAsFactors = FALSE
+    )
+
+    cat(sprintf("  Barcode overlap: %d exact (%.1f%%), %d suffix-stripped (%.1f%% of GEX)\n",
+      nExact, 100 * nExact / nGEX, nBaseShared, 100 * nBaseShared / nGEX))
+  }
+
+  # Free peak matrix immediately — it will be re-read per-pool during integration
+  rm(peakMat, h5_data)
+  gc(verbose = FALSE)
+  cat("\n")
 }
 
 # Summarize barcode comparison
@@ -435,114 +524,185 @@ cat("Barcode comparison summary (Multi GEX vs Arc ATAC):\n")
 barcodeComparisonDf <- do.call(rbind, barcodeComparison)
 print(barcodeComparisonDf, row.names = FALSE)
 
-# Save barcode comparison to Excel
 barcodeCompFile <- file.path(dataOutputDir, paste0(filenameSuffix, "_BarcodeComparison_Multi_vs_Arc.xlsx"))
 writexl::write_xlsx(barcodeComparisonDf, path = barcodeCompFile)
 cat(sprintf("\nSaved barcode comparison table to: %s\n", barcodeCompFile))
 
-cat(sprintf("\nSuccessfully loaded ATAC data from %d pools\n", length(peakObjects.tmp)))
+cat(sprintf("\nATAC inputs configured for %d pools (peak data will be loaded on-demand)\n",
+  length(atacInputs.tmp)))
 ```
 
 ```{r integrateATACAssay}
-## Add ATAC as ChromatinAssay to Seurat objects
-## For cells present in both Multi (GEX) and Arc (ATAC), add the peak counts
+## Add ATAC as ChromatinAssay to Seurat objects (matched cells only).
+##
+## Design rationale (RAM):
+##   - Peak matrices are loaded on-demand from atacInputs.tmp (paths only) and
+##     freed immediately after the ChromatinAssay is built.
+##   - The ATAC assay covers only the ~97% of cells with exact barcode matches
+##     between Multi and Arc. We do NOT pad with empty columns for the ~3% of
+##     GEX-only cells; that would roughly double column count for no analytical
+##     benefit. The hasATAC metadata flag tracks which cells carry ATAC.
+##   - Genome annotations are built once outside the loop.
+##
+## Fragment handling:
+##   - Barcodes registered with CreateFragmentObject use GEX barcode names.
+##     After merge() with add.cell.ids, Signac automatically prepends the pool
+##     prefix to fragment cell lists, so downstream functions (TSSEnrichment,
+##     NucleosomeSignal, etc.) continue to work.
 
 cat("Integrating ATAC assay into Seurat objects...\n")
 cat("=", rep("=", 60), "\n", sep = "")
 
+# Build genome annotation once (expensive; identical for all pools)
+cat("Building hg38 genome annotations...\n")
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- "UCSC"
+genome(annotations) <- "hg38"
+
 for (poolName in names(seuratObjects.tmp)) {
   seurat <- seuratObjects.tmp[[poolName]]
 
-  if (!(poolName %in% names(peakObjects.tmp))) {
+  if (!(poolName %in% names(atacInputs.tmp))) {
     cat(sprintf("  %s: No ATAC data available, skipping\n", poolName))
-    next
-  }
-
-  peakMat <- peakObjects.tmp[[poolName]]
-  fragPath <- fragmentPaths.tmp[[poolName]]
-
-  # Match barcodes (strip suffix for comparison)
-  gexBarcodes <- colnames(seurat)
-  arcBarcodes <- colnames(peakMat)
-  gexBase <- sub("-[0-9]+$", "", gexBarcodes)
-  arcBase <- sub("-[0-9]+$", "", arcBarcodes)
-
-  # Find shared barcodes
-  sharedBase <- intersect(gexBase, arcBase)
-
-  if (length(sharedBase) > 0) {
-    # Map back to original barcodes with suffix
-    gexSharedIdx <- which(gexBase %in% sharedBase)
-    arcSharedIdx <- which(arcBase %in% sharedBase)
-
-    # Subset peak matrix to shared cells, using GEX barcode names
-    # Create mapping from base to full barcode
-    gexMap <- setNames(gexBarcodes[gexSharedIdx], gexBase[gexSharedIdx])
-    arcMap <- setNames(arcBarcodes[arcSharedIdx], arcBase[arcSharedIdx])
-
-    # Reorder arc matrix to match GEX order
-    sharedGEXBarcodes <- gexBarcodes[gexSharedIdx]
-    sharedArcBarcodes <- arcMap[gexBase[gexSharedIdx]]
-
-    peakMatSubset <- peakMat[, sharedArcBarcodes, drop = FALSE]
-    colnames(peakMatSubset) <- sharedGEXBarcodes  # Use GEX barcode names
-
-    # Create ChromatinAssay
-    # Get annotation file path for this pool
-    poolIdx <- which(P697_files_df$pool == poolName)
-    annotationPath <- P697_files_df$arc_peak_annotation[poolIdx]
-
-    if (file.exists(annotationPath)) {
-      peakAnnotation <- read.table(annotationPath, header = TRUE, sep = "\t")
-      cat(sprintf("  %s: Loaded %d peak annotations\n", poolName, nrow(peakAnnotation)))
-    } else {
-      peakAnnotation <- NULL
-    }
-
-    # Create the ChromatinAssay (requires Signac)
-    # Note: Cell Ranger Arc 2.x fragment files have 6 columns (with strand),
-    # which is incompatible with Signac's expected 5-column format.
-    # We create the assay without fragments first, storing the path for later use.
-    chromAssay <- CreateChromatinAssay(
-      counts = peakMatSubset,
-      sep = c(":", "-"),
-      min.cells = 0,
-      min.features = 0
-    )
-
-    # Store fragment path in metadata for later use
-    # (Fragment files can be processed separately if needed for downstream ATAC analysis)
-    cat(sprintf("  %s: ChromatinAssay created (fragment path stored for later: %s)\n",
-      poolName, basename(fragPath)))
-
-    # Add ATAC assay to full Seurat object (cells without ATAC will have NA)
-    # First, expand to all cells
-    allCells <- colnames(seurat)
-    hasATAC <- allCells %in% sharedGEXBarcodes
-
-    # Add metadata flag for ATAC availability and fragment path
-    seurat[["hasATAC"]] <- hasATAC
-    seurat[["atacFragmentPath"]] <- fragPath
-    seurat[["hasGEX"]] <- TRUE  # All cells have GEX by definition
-
-    # For now, we'll subset to cells with both modalities for the ATAC assay
-    # and add a note that full integration may require different approach
-    if (sum(hasATAC) > 0) {
-      # Create a subset with ATAC data
-      seuratWithATAC <- subset(seurat, cells = sharedGEXBarcodes)
-      seuratWithATAC[["ATAC"]] <- chromAssay
-
-      # Store both versions
-      seuratObjects.tmp[[poolName]] <- seurat  # Full GEX object with hasATAC flag
-      cat(sprintf("  %s: Added ATAC for %d/%d cells (%.1f%%)\n",
-        poolName, sum(hasATAC), length(allCells), 100 * sum(hasATAC) / length(allCells)))
-    }
-  } else {
     seurat[["hasATAC"]] <- FALSE
     seurat[["hasGEX"]] <- TRUE
     seuratObjects.tmp[[poolName]] <- seurat
-    cat(sprintf("  %s: No overlapping barcodes with ATAC\n", poolName))
+    next
   }
+
+  # --- Load peaks on-demand for this pool ---
+  h5Path <- atacInputs.tmp[[poolName]]$arc_filtered_h5
+  fragPath <- atacInputs.tmp[[poolName]]$arc_fragments
+
+  cat(sprintf("  %s: Loading peaks from h5...\n", poolName))
+  h5_data <- Read10X_h5(h5Path)
+  peakMat <- h5_data[["Peaks"]]
+  rm(h5_data)  # free GEX component from Arc h5 immediately
+
+  # --- Barcode matching ---
+  gexBarcodes <- colnames(seurat)
+  arcBarcodes <- colnames(peakMat)
+
+  # Try exact matching first
+  exactMatches <- intersect(gexBarcodes, arcBarcodes)
+
+  if (length(exactMatches) > 0) {
+    cat(sprintf("  %s: %d exact barcode matches (%.1f%% of GEX)\n",
+      poolName, length(exactMatches), 100 * length(exactMatches) / length(gexBarcodes)))
+    sharedGEXBarcodes <- exactMatches
+    sharedArcBarcodes <- exactMatches
+
+  } else {
+    # Fallback: suffix-stripped matching with collision checks
+    cat(sprintf("  %s: No exact matches, trying suffix-stripped matching...\n", poolName))
+    gexBase <- sub("-[0-9]+$", "", gexBarcodes)
+    arcBase <- sub("-[0-9]+$", "", arcBarcodes)
+
+    if (sum(duplicated(gexBase)) > 0 || sum(duplicated(arcBase)) > 0) {
+      cat(sprintf("  %s: Duplicates after suffix stripping — skipping (collision risk)\n", poolName))
+      seurat[["hasATAC"]] <- FALSE
+      seurat[["hasGEX"]] <- TRUE
+      seuratObjects.tmp[[poolName]] <- seurat
+      rm(peakMat)
+      gc(verbose = FALSE)
+      next
+    }
+
+    sharedBase <- intersect(gexBase, arcBase)
+    if (length(sharedBase) == 0) {
+      cat(sprintf("  %s: No overlapping barcodes\n", poolName))
+      seurat[["hasATAC"]] <- FALSE
+      seurat[["hasGEX"]] <- TRUE
+      seuratObjects.tmp[[poolName]] <- seurat
+      rm(peakMat)
+      gc(verbose = FALSE)
+      next
+    }
+
+    gexSharedIdx <- match(sharedBase, gexBase)
+    arcSharedIdx <- match(sharedBase, arcBase)
+
+    if (length(unique(gexSharedIdx)) != length(gexSharedIdx) ||
+      length(unique(arcSharedIdx)) != length(arcSharedIdx)) {
+      cat(sprintf("  %s: Mapping not one-to-one — skipping\n", poolName))
+      seurat[["hasATAC"]] <- FALSE
+      seurat[["hasGEX"]] <- TRUE
+      seuratObjects.tmp[[poolName]] <- seurat
+      rm(peakMat)
+      gc(verbose = FALSE)
+      next
+    }
+
+    sharedGEXBarcodes <- gexBarcodes[gexSharedIdx]
+    sharedArcBarcodes <- arcBarcodes[arcSharedIdx]
+    cat(sprintf("  %s: %d suffix-stripped matches\n", poolName, length(sharedBase)))
+  }
+
+  if (length(sharedGEXBarcodes) == 0) {
+    seurat[["hasATAC"]] <- FALSE
+    seurat[["hasGEX"]] <- TRUE
+    seuratObjects.tmp[[poolName]] <- seurat
+    rm(peakMat)
+    gc(verbose = FALSE)
+    next
+  }
+
+  # --- Build ChromatinAssay for matched cells only ---
+  peakMatSubset <- peakMat[, sharedArcBarcodes, drop = FALSE]
+  colnames(peakMatSubset) <- sharedGEXBarcodes
+  rm(peakMat)  # free full peak matrix
+  gc(verbose = FALSE)
+
+  # Convert fragment file (6-col → 5-col) if needed
+  fragFilename <- paste0(poolName, "_atac_fragments.5col.tsv.gz")
+  fragPath5col <- file.path(dataOutputDir, fragFilename)
+  fragPath5col <- convertFragments6to5Column(fragPath, fragPath5col)
+
+  # Create ChromatinAssay with fragments and annotations
+  atacIntegrationSuccess <- FALSE
+  tryCatch(
+    {
+      chromAssay <- CreateChromatinAssay(
+        counts = peakMatSubset,
+        sep = c(":", "-"),
+        fragments = CreateFragmentObject(
+          path = fragPath5col,
+          cells = sharedGEXBarcodes
+        ),
+        annotation = annotations,
+        genome = "hg38",
+        min.cells = 0,
+        min.features = 0
+      )
+
+      # Add ATAC assay directly — matched cells only, no zero-padding
+      seurat[["ATAC"]] <- chromAssay
+      atacIntegrationSuccess <- TRUE
+
+      cat(sprintf("  %s: Added ATAC assay (%d peaks x %d cells, %.1f%% of GEX)\n",
+        poolName, nrow(chromAssay), ncol(chromAssay),
+        100 * ncol(chromAssay) / length(gexBarcodes)))
+    },
+    error = function(e) {
+      warning(sprintf("  %s: ATAC integration failed: %s", poolName, e$message))
+    }
+  )
+
+  # Metadata flags
+  seurat[["hasATAC"]] <- colnames(seurat) %in% sharedGEXBarcodes
+  seurat[["hasGEX"]] <- TRUE
+  Misc(seurat, "atacFragmentPath") <- fragPath5col
+
+  if (!atacIntegrationSuccess) {
+    seurat[["hasATAC"]] <- FALSE
+  }
+
+  seuratObjects.tmp[[poolName]] <- seurat
+
+  # Aggressive cleanup
+  rm(peakMatSubset)
+  if (exists("chromAssay")) rm(chromAssay)
+  gc(verbose = FALSE)
 }
 
 # Summary
@@ -550,9 +710,19 @@ cat("\nATAC integration summary:\n")
 for (poolName in names(seuratObjects.tmp)) {
   seurat <- seuratObjects.tmp[[poolName]]
   nTotal <- ncol(seurat)
-  nWithATAC <- sum(seurat$hasATAC)
-  cat(sprintf("  %s: %d cells total, %d with ATAC (%.1f%%)\n",
-    poolName, nTotal, nWithATAC, 100 * nWithATAC / nTotal))
+  if ("hasATAC" %in% colnames(seurat@meta.data)) {
+    nWithATAC <- sum(seurat$hasATAC, na.rm = TRUE)
+    hasATACAssay <- "ATAC" %in% names(seurat@assays)
+    cat(sprintf("  %s: %d cells total, %d with ATAC (%.1f%%), ATAC assay: %s\n",
+      poolName, nTotal, nWithATAC, 100 * nWithATAC / nTotal,
+      ifelse(hasATACAssay, "YES", "NO")))
+    if (hasATACAssay) {
+      cat(sprintf("    ATAC dimensions: %d peaks x %d cells\n",
+        nrow(seurat[["ATAC"]]), ncol(seurat[["ATAC"]])))
+    }
+  } else {
+    cat(sprintf("  %s: %d cells total, no ATAC metadata\n", poolName, nTotal))
+  }
 }
 ```
 
@@ -2198,6 +2368,26 @@ for (i in seq_along(seuratObjects.tmp)) {
   )
 }
 
+# Verify ATAC assay preserved through QC filtering
+# Note: ATAC assay covers matched cells only (not all GEX cells), so its
+# column count may differ from the RNA assay after QC subsetting.
+cat("\nVerifying ATAC assay after QC filtering:\n")
+for (i in seq_along(seuratQC.tmp)) {
+  poolName <- names(seuratQC.tmp)[i]
+  assays <- Assays(seuratQC.tmp[[i]])
+  hasATACAssay <- "ATAC" %in% assays
+  if (hasATACAssay) {
+    nATACCells <- ncol(seuratQC.tmp[[i]][["ATAC"]])
+    nRNACells <- ncol(seuratQC.tmp[[i]])
+    cat(sprintf("  %s: ATAC assay present, %d peaks x %d ATAC cells (of %d total)\n",
+      poolName, nrow(seuratQC.tmp[[i]][["ATAC"]]), nATACCells, nRNACells))
+  } else {
+    nWithFlag <- if ("hasATAC" %in% colnames(seuratQC.tmp[[i]]@meta.data))
+      sum(seuratQC.tmp[[i]]$hasATAC, na.rm = TRUE) else 0
+    cat(sprintf("  %s: No ATAC assay (hasATAC flag: %d cells)\n", poolName, nWithFlag))
+  }
+}
+
 # Tally how many cells pass QC by pool
 poolIds <- names(seuratObjects.tmp)
 poolAnno <- data.frame(
@@ -2676,6 +2866,22 @@ if (length(seuratQC.tmp) > 1) {
 }
 
 DefaultAssay(seuratQCMerged) <- "HT"
+
+# Verify ATAC assay preserved through merge
+# After merge, ATAC assay covers the union of matched cells across pools.
+# Column count will be smaller than RNA if some cells lack ATAC.
+cat("\nVerifying ATAC assay after merge:\n")
+assays <- Assays(seuratQCMerged)
+cat("  Assays present:", paste(assays, collapse = ", "), "\n")
+if ("ATAC" %in% assays) {
+  nATACFeatures <- nrow(seuratQCMerged[["ATAC"]])
+  nATACCells <- ncol(seuratQCMerged[["ATAC"]])
+  cat(sprintf("  ATAC assay: %d peaks x %d cells (%.1f%% of %d total)\n",
+    nATACFeatures, nATACCells, 100 * nATACCells / ncol(seuratQCMerged),
+    ncol(seuratQCMerged)))
+} else {
+  cat("  ATAC assay not present after merge (expected if pools had no ATAC)\n")
+}
 
 # Print final summary
 cat("\nFinal merged object summary:\n")
@@ -3528,6 +3734,28 @@ seuratQCSplitCleaned <- RunPCA(seuratQCSplitCleaned, assay = "RNA", npcs = 30)
 seuratSplitIntegrated <- IntegrateLayers(object = seuratQCSplitCleaned, method = HarmonyIntegration, assay = "RNA",
   orig.reduction = "pca", new.reduction = "harmony", verbose = T)
 seuratMergedIntegrated <- JoinLayers(seuratSplitIntegrated)
+
+# Verify ATAC assay preserved through integration
+# ATAC covers matched cells only; its column count tracks through merge/integration.
+cat("\nVerifying ATAC assay after Harmony integration:\n")
+assays <- Assays(seuratMergedIntegrated)
+cat("  Assays present:", paste(assays, collapse = ", "), "\n")
+if ("ATAC" %in% assays) {
+  nATACFeatures <- nrow(seuratMergedIntegrated[["ATAC"]])
+  nATACCells <- ncol(seuratMergedIntegrated[["ATAC"]])
+  cat(sprintf("  ATAC assay: %d peaks x %d cells (%.1f%% of %d total)\n",
+    nATACFeatures, nATACCells, 100 * nATACCells / ncol(seuratMergedIntegrated),
+    ncol(seuratMergedIntegrated)))
+  cat("  Note: RNA integrated via Harmony; ATAC remains unintegrated (expected)\n")
+  nFrags <- length(Fragments(seuratMergedIntegrated[["ATAC"]]))
+  cat(sprintf("  Fragment files linked: %d\n", nFrags))
+} else {
+  cat("  ATAC assay not present after integration\n")
+  if ("hasATAC" %in% colnames(seuratMergedIntegrated@meta.data)) {
+    cat(sprintf("  hasATAC flag: %d cells\n",
+      sum(seuratMergedIntegrated$hasATAC, na.rm = TRUE)))
+  }
+}
 ```
 
 ```{r reprocessCleanedIntegratedTCellData}
@@ -3856,8 +4084,138 @@ cat("\nFinal Seurat object sizes:\n")
 cat("  seuratTreg:", ncol(seuratTreg), "cells\n")
 cat("  seuratNK:", ncol(seuratNK), "cells\n")
 
+# Verify ATAC assay in compartment-split objects
+# ATAC covers matched cells only, so ncol(ATAC) <= ncol(obj)
+cat("\nVerifying ATAC assay after compartment split:\n")
+for (objName in c("seuratTreg", "seuratNK")) {
+  obj <- get(objName)
+  assays <- Assays(obj)
+  cat(sprintf("\n  %s:\n", objName))
+  cat("    Assays present:", paste(assays, collapse = ", "), "\n")
+  if ("ATAC" %in% assays) {
+    nATACFeatures <- nrow(obj[["ATAC"]])
+    nATACCells <- ncol(obj[["ATAC"]])
+    cat(sprintf("    ATAC: %d peaks x %d cells (%.1f%% of %d total)\n",
+      nATACFeatures, nATACCells, 100 * nATACCells / ncol(obj), ncol(obj)))
+
+    nFrags <- length(Fragments(obj[["ATAC"]]))
+    cat(sprintf("    Fragment files linked: %d\n", nFrags))
+  } else {
+    nWithFlag <- if ("hasATAC" %in% colnames(obj@meta.data))
+      sum(obj$hasATAC, na.rm = TRUE) else 0
+    cat(sprintf("    ATAC assay not present (hasATAC flag: %d cells)\n", nWithFlag))
+  }
+}
 
 rm_tmp(ask = FALSE)
+```
+
+```{r atacQCSummary}
+# Comprehensive ATAC QC Summary for Treg and NK compartments
+# ATAC assay covers matched cells only (not zero-padded to all cells).
+# ncol(ATAC) = number of cells with ATAC data; ncol(obj) = total GEX cells.
+# Detailed ATAC-specific QC (TSS enrichment, nucleosome signal) should be
+# performed in downstream analysis scripts using Signac functions.
+
+cat("\n")
+cat("=", rep("=", 70), "\n", sep = "")
+cat("ATAC Data Integration Summary\n")
+cat("=", rep("=", 70), "\n", sep = "")
+
+atacSummary <- data.frame(
+  Compartment = character(),
+  Total_Cells = integer(),
+  Cells_With_ATAC = integer(),
+  Pct_With_ATAC = numeric(),
+  Total_Peaks = integer(),
+  Peaks_Detected = integer(),
+  Mean_Peaks_Per_Cell = numeric(),
+  Median_Peaks_Per_Cell = numeric(),
+  Fragment_Files = integer(),
+  stringsAsFactors = FALSE
+)
+
+for (objName in c("seuratTreg", "seuratNK")) {
+  obj <- get(objName)
+  compartmentName <- sub("seurat", "", objName)
+  nTotalCells <- ncol(obj)
+
+  if ("ATAC" %in% Assays(obj)) {
+    atacAssay <- obj[["ATAC"]]
+    nATACCells <- ncol(atacAssay)
+    pctWithATAC <- 100 * nATACCells / nTotalCells
+    nTotalPeaks <- nrow(atacAssay)
+
+    # Compute per-cell peak counts (ATAC assay is matched-cells-only, so all
+    # columns have real data — no need to filter peakCountsPerCell > 0)
+    peakCountsPerCell <- colSums(atacAssay@counts)
+    nPeaksDetected <- sum(rowSums(atacAssay@counts) > 0)
+    meanPeaksPerCell <- mean(peakCountsPerCell)
+    medianPeaksPerCell <- median(peakCountsPerCell)
+    nFragFiles <- length(Fragments(atacAssay))
+
+    atacSummary <- rbind(atacSummary, data.frame(
+      Compartment = compartmentName,
+      Total_Cells = nTotalCells,
+      Cells_With_ATAC = nATACCells,
+      Pct_With_ATAC = round(pctWithATAC, 1),
+      Total_Peaks = nTotalPeaks,
+      Peaks_Detected = nPeaksDetected,
+      Mean_Peaks_Per_Cell = round(meanPeaksPerCell, 0),
+      Median_Peaks_Per_Cell = round(medianPeaksPerCell, 0),
+      Fragment_Files = nFragFiles,
+      stringsAsFactors = FALSE
+    ))
+
+    cat(sprintf("\n%s Compartment:\n", compartmentName))
+    cat(sprintf("  Total cells (GEX): %d\n", nTotalCells))
+    cat(sprintf("  Cells with ATAC: %d (%.1f%%)\n", nATACCells, pctWithATAC))
+    cat(sprintf("  Peaks: %d total, %d detected (%.1f%%)\n",
+      nTotalPeaks, nPeaksDetected, 100 * nPeaksDetected / nTotalPeaks))
+    cat(sprintf("  Peaks per cell: mean %.0f, median %.0f\n", meanPeaksPerCell, medianPeaksPerCell))
+    cat(sprintf("  Fragment files linked: %d\n", nFragFiles))
+  } else {
+    atacSummary <- rbind(atacSummary, data.frame(
+      Compartment = compartmentName,
+      Total_Cells = nTotalCells,
+      Cells_With_ATAC = 0,
+      Pct_With_ATAC = 0,
+      Total_Peaks = 0,
+      Peaks_Detected = 0,
+      Mean_Peaks_Per_Cell = 0,
+      Median_Peaks_Per_Cell = 0,
+      Fragment_Files = 0,
+      stringsAsFactors = FALSE
+    ))
+    cat(sprintf("\n%s Compartment: No ATAC assay present\n", compartmentName))
+  }
+}
+
+cat("\n")
+cat("Summary Table:\n")
+print(atacSummary, row.names = FALSE)
+
+# Save summary table
+write.csv(atacSummary,
+  file.path(dataOutputDir, paste0("ATAC_integration_summary_", filenameSuffix, ".csv")),
+  row.names = FALSE)
+
+cat("\n")
+cat("ATAC data integrated into Seurat objects (matched cells only).\n")
+cat("For downstream multimodal / DA analysis, objects contain:\n")
+cat("  - ChromatinAssay with peak counts (matched cells)\n")
+cat("  - Linked fragment files (5-column, bgzipped + tabix indexed)\n")
+cat("  - Genome annotations (hg38, EnsDb.Hsapiens.v86)\n")
+cat("  - hasATAC metadata flag on all cells\n")
+cat("\nRecommended downstream analyses (separate script):\n")
+cat("  - TSS enrichment and nucleosome signal (Signac QC)\n")
+cat("  - Differential accessibility testing\n")
+cat("  - Peak-to-gene linking\n")
+cat("  - WNN multimodal integration (RNA + ATAC)\n")
+cat("  - TF motif enrichment\n")
+cat("  - Gene activity scores\n")
+cat("  - Chromatin accessibility footprinting\n")
+cat("=", rep("=", 70), "\\n", sep = "")
 ```
 
 ```{r subClusterTregs}
@@ -4096,7 +4454,8 @@ palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
 bundle1_path <- file.path(dataOutputDir, paste0(filenameSuffix, "_preprocessingBundle.rds"))
 
 preprocessingBundle <- list(
-  # Core Seurat object (merged, integrated, QC-filtered, with CellTypist predictions)
+  # Core Seurat objects (compartment-split, integrated RNA, with ATAC assays)
+  # Each object contains: RNA (Harmony-integrated), HT, ATAC (unintegrated) assays
   # seuratMergedIntegrated = seuratMergedIntegrated,
   seuratTreg = seuratTreg,
   seuratNK = seuratNK,
@@ -4128,4 +4487,8 @@ preprocessingBundle <- list(
 saveRDS(preprocessingBundle, file = bundle1_path)
 cat("Bundle 1 (Preprocessing) saved to:", bundle1_path, "\n")
 cat("Bundle contains:", paste(names(preprocessingBundle), collapse = ", "), "\n")
+cat("\nSeurat objects include:\\n")
+cat("  - RNA assay (Harmony-integrated across donors)\\n")
+cat("  - HT assay (hashtag antibodies)\\n")
+cat("  - ATAC assay (ChromatinAssay with peaks, fragments, annotations)\\n")
 ```
