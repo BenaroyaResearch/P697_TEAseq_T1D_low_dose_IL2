@@ -110,7 +110,7 @@ baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
 dataInputDir <- file.path(baseDir, "data/inputData")
 plotDir <- file.path(baseDir, "figures")
 dataOutputDir <- file.path(baseDir, "data/outputData")
-dataDate <- "2026-02-10"
+dataDate <- "2026-03-09"
 filenameSuffix <- paste0(projNumber, ".", dataDate)
 
 ## ---------------------------------------------------------------------------
@@ -1960,11 +1960,11 @@ if (hasATACMetrics) {
 
   # Per-pool density scatter plots
   for (poolName in unique(combinedMetaATAC$pool)) {
-    poolData <- combinedMetaATAC %>% filter(pool == poolName)
+    poolData <- combinedMetaATAC %>% dplyr::filter(pool == poolName)
 
     # Filter out zeros/NAs for log scale
     poolData <- poolData %>%
-      filter(cr_arc_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
+      dplyr::filter(cr_arc_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
 
     pDensity <- ggplot(poolData, aes(x = cr_arc_atac_peak_region_fragments, y = tssEnrichmentPct)) +
       geom_pointdensity(size = 0.5) +
@@ -1993,7 +1993,7 @@ if (hasATACMetrics) {
 
   # Combined faceted density scatter
   combinedMetaATACFiltered <- combinedMetaATAC %>%
-    filter(cr_arc_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
+    dplyr::filter(cr_arc_atac_peak_region_fragments > 0, tssEnrichmentPct > 0)
 
   pDensityAll <- ggplot(combinedMetaATACFiltered,
     aes(x = cr_arc_atac_peak_region_fragments, y = tssEnrichmentPct)) +
@@ -2024,7 +2024,7 @@ if (hasATACMetrics) {
   # Also create nucleosome signal vs TSS enrichment scatter if we have both
   if ("nucleosomeSignal" %in% colnames(combinedMetaATAC)) {
     combinedMetaATACNS <- combinedMetaATAC %>%
-      filter(!is.na(nucleosomeSignal), nucleosomeSignal > 0, tssEnrichmentPct > 0)
+      dplyr::filter(!is.na(nucleosomeSignal), nucleosomeSignal > 0, tssEnrichmentPct > 0)
 
     pNSTSS <- ggplot(combinedMetaATACNS, aes(x = nucleosomeSignal, y = tssEnrichmentPct)) +
       geom_pointdensity(size = 0.3) +
@@ -2261,8 +2261,8 @@ if (!is.null(annoP697_1) && !is.null(annoP697_2)) {
 
   # Combine using all common columns
   annoP697 <- bind_rows(
-    annoP697_1 %>% select(all_of(commonCols)),
-    annoP697_2 %>% select(all_of(commonCols))
+    annoP697_1 %>% dplyr::select(all_of(commonCols)),
+    annoP697_2 %>% dplyr::select(all_of(commonCols))
   )
 
   # set visit as a character
@@ -2842,7 +2842,6 @@ for (i in seq_along(seuratQC.tmp)) {
   )
 }
 
-
 # Merge demux calls into meta.data for each seurat object
 for (i in seq_along(seuratQC.tmp)) {
   seurat <- seuratQC.tmp[[i]]
@@ -2852,6 +2851,7 @@ for (i in seq_along(seuratQC.tmp)) {
   seuratQC.tmp[[i]] <- seurat
 }
 
+# TODO we need to figure out why this is taking SO LONG to run now.
 # Merge all pools after demux (both subprojects)
 cat("\nMerging all pools from both subprojects...\n")
 if (length(seuratQC.tmp) > 1) {
