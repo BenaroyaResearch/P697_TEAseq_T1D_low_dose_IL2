@@ -110,7 +110,7 @@ baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
 dataInputDir <- file.path(baseDir, "data/inputData")
 plotDir <- file.path(baseDir, "figures")
 dataOutputDir <- file.path(baseDir, "data/outputData")
-dataDate <- "2026-03-09"
+dataDate <- "2026-03-11"
 filenameSuffix <- paste0(projNumber, ".", dataDate)
 
 ## ---------------------------------------------------------------------------
@@ -128,8 +128,8 @@ serverBase <- "/Volumes/bioinformatics/pipeline/Illumina"
 flowcells <- list(
   `P697-1` = list(
     multi = list(
-      flowcell = "251215_VH01513_82_AACYM3NHV",
-      processed = "Project_P697-1Processed_bri_251218"
+      flowcell = "251223_VH01513_84_AAHG23GM5", # "251215_VH01513_82_AACYM3NHV",
+      processed = "Project_P697-1Processed_bri_260127" # "Project_P697-1Processed_bri_251218"
     ),
     arc = list(
       flowcell = "251216_VH00126_442_AACYV5KHV",
@@ -1874,7 +1874,7 @@ if (file.exists(gtfFile)) {
 
     # Per-pool TSS profiles
     for (poolName in names(tssProfiles)) {
-      poolProfile <- combinedTSSProfiles %>% filter(pool == poolName)
+      poolProfile <- combinedTSSProfiles %>% dplyr::filter(pool == poolName)
 
       pTSS <- ggplot(poolProfile, aes(x = position, y = normalizedSignal)) +
         geom_line(color = "steelblue", linewidth = 1) +
@@ -2374,7 +2374,7 @@ for (i in seq_along(seuratObjects.tmp)) {
 cat("\nVerifying ATAC assay after QC filtering:\n")
 for (i in seq_along(seuratQC.tmp)) {
   poolName <- names(seuratQC.tmp)[i]
-  assays <- Assays(seuratQC.tmp[[i]])
+  assays <- names(seuratQC.tmp[[i]]@assays)
   hasATACAssay <- "ATAC" %in% assays
   if (hasATACAssay) {
     nATACCells <- ncol(seuratQC.tmp[[i]][["ATAC"]])
@@ -2851,15 +2851,29 @@ for (i in seq_along(seuratQC.tmp)) {
   seuratQC.tmp[[i]] <- seurat
 }
 
-# TODO we need to figure out why this is taking SO LONG to run now.
 # Merge all pools after demux (both subprojects)
+# Strip ATAC assay before merging — Seurat v5's merge is extremely slow with
+# ChromatinAssay due to repeated row-by-row matrix binding across pools.
+# ATAC will be re-added per-compartment in the peak-calling scripts
+# (P697_TregPeakCalling.rmd / P697_NKPeakCalling.rmd) using MACS2 peaks.
+# Preserve fragment paths and hasATAC metadata so ATAC can be reconstructed.
+cat("\nStripping ATAC assay before merge (will re-add in peak-calling scripts)...\n")
+for (i in seq_along(seuratQC.tmp)) {
+  if ("ATAC" %in% names(seuratQC.tmp[[i]]@assays)) {
+    seuratQC.tmp[[i]]@assays[["ATAC"]] <- NULL
+    cat(sprintf("  Pool %s: removed ATAC assay. Remaining: %s\n",
+      names(seuratQC.tmp)[i],
+      paste(names(seuratQC.tmp[[i]]@assays), collapse = ", ")))
+  }
+}
+
 cat("\nMerging all pools from both subprojects...\n")
 if (length(seuratQC.tmp) > 1) {
   seuratQCMerged <- merge(
     seuratQC.tmp[[1]],
     y = seuratQC.tmp[-1],
     add.cell.ids = names(seuratQC.tmp),
-    merge.data = TRUE
+    merge.data = FALSE
   )
 } else {
   seuratQCMerged <- seuratQC.tmp[[1]]
@@ -2867,20 +2881,18 @@ if (length(seuratQC.tmp) > 1) {
 
 DefaultAssay(seuratQCMerged) <- "HT"
 
-# Verify ATAC assay preserved through merge
-# After merge, ATAC assay covers the union of matched cells across pools.
-# Column count will be smaller than RNA if some cells lack ATAC.
-cat("\nVerifying ATAC assay after merge:\n")
-assays <- Assays(seuratQCMerged)
-cat("  Assays present:", paste(assays, collapse = ", "), "\n")
-if ("ATAC" %in% assays) {
+# Verify assays after merge (ATAC was stripped before merge)
+cat("\nVerifying assays after merge:\n")
+assayNames <- names(seuratQCMerged@assays)
+cat("  Assays present:", paste(assayNames, collapse = ", "), "\n")
+if ("ATAC" %in% assayNames) {
   nATACFeatures <- nrow(seuratQCMerged[["ATAC"]])
   nATACCells <- ncol(seuratQCMerged[["ATAC"]])
   cat(sprintf("  ATAC assay: %d peaks x %d cells (%.1f%% of %d total)\n",
     nATACFeatures, nATACCells, 100 * nATACCells / ncol(seuratQCMerged),
     ncol(seuratQCMerged)))
 } else {
-  cat("  ATAC assay not present after merge (expected if pools had no ATAC)\n")
+  cat("  ATAC assay not present (stripped before merge; will re-add in peak-calling scripts)\n")
 }
 
 # Print final summary
@@ -3497,7 +3509,7 @@ for (gene in genesOfInterest) {
     object = seuratQCMergedCleaned,
     reduction = "umap",
     features = gene,
-    shuffle = TRUE,
+    # shuffle = TRUE,
     alpha = 0.6,
     pt.size = 1
   ) +
@@ -3738,7 +3750,7 @@ seuratMergedIntegrated <- JoinLayers(seuratSplitIntegrated)
 # Verify ATAC assay preserved through integration
 # ATAC covers matched cells only; its column count tracks through merge/integration.
 cat("\nVerifying ATAC assay after Harmony integration:\n")
-assays <- Assays(seuratMergedIntegrated)
+assays <- names(seuratMergedIntegrated@assays)
 cat("  Assays present:", paste(assays, collapse = ", "), "\n")
 if ("ATAC" %in% assays) {
   nATACFeatures <- nrow(seuratMergedIntegrated[["ATAC"]])
@@ -4089,7 +4101,7 @@ cat("  seuratNK:", ncol(seuratNK), "cells\n")
 cat("\nVerifying ATAC assay after compartment split:\n")
 for (objName in c("seuratTreg", "seuratNK")) {
   obj <- get(objName)
-  assays <- Assays(obj)
+  assays <- names(obj@assays)
   cat(sprintf("\n  %s:\n", objName))
   cat("    Assays present:", paste(assays, collapse = ", "), "\n")
   if ("ATAC" %in% assays) {
@@ -4140,7 +4152,7 @@ for (objName in c("seuratTreg", "seuratNK")) {
   compartmentName <- sub("seurat", "", objName)
   nTotalCells <- ncol(obj)
 
-  if ("ATAC" %in% Assays(obj)) {
+  if ("ATAC" %in% names(obj@assays)) {
     atacAssay <- obj[["ATAC"]]
     nATACCells <- ncol(atacAssay)
     pctWithATAC <- 100 * nATACCells / nTotalCells
@@ -4444,7 +4456,7 @@ palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
   setNames(sort(unique(seuratNK@meta.data[[clusterName[["RNA"]]]])))
 ```
 
-```{r outputSeuratObjAndTCRs}
+```{r outputSeuratObj}
 # ==============================================================================
 # Bundle 1: Preprocessing Bundle
 # Output from: P650_preprocessing.rmd
@@ -4454,8 +4466,11 @@ palRNAClusters <- paletteer_d("khroma::okabeitoblack", n = num_clusters) %>%
 bundle1_path <- file.path(dataOutputDir, paste0(filenameSuffix, "_preprocessingBundle.rds"))
 
 preprocessingBundle <- list(
-  # Core Seurat objects (compartment-split, integrated RNA, with ATAC assays)
-  # Each object contains: RNA (Harmony-integrated), HT, ATAC (unintegrated) assays
+  # Core Seurat objects (compartment-split, integrated RNA, NO ATAC assay)
+  # Each object contains: RNA (Harmony-integrated), HT assays
+  # ATAC was stripped before merge to avoid slow ChromatinAssay merging;
+  # it is reconstructed from fragment files in peak-calling scripts.
+  # ATAC metadata (nCount_ATAC, nFeature_ATAC, hasATAC) is preserved.
   # seuratMergedIntegrated = seuratMergedIntegrated,
   seuratTreg = seuratTreg,
   seuratNK = seuratNK,
@@ -4490,5 +4505,6 @@ cat("Bundle contains:", paste(names(preprocessingBundle), collapse = ", "), "\n"
 cat("\nSeurat objects include:\\n")
 cat("  - RNA assay (Harmony-integrated across donors)\\n")
 cat("  - HT assay (hashtag antibodies)\\n")
-cat("  - ATAC assay (ChromatinAssay with peaks, fragments, annotations)\\n")
+cat("  - ATAC metadata (nCount_ATAC, nFeature_ATAC, hasATAC, pool) preserved\\n")
+cat("  - ATAC assay NOT included (stripped before merge; reconstructed in peak-calling scripts)\\n")
 ```

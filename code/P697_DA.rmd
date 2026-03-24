@@ -1,0 +1,1029 @@
+---
+title: "P697: Differential Accessibility, Pseudobulk DGE, and GSEA"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+setwd("/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+library(knitr)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(viridis)
+library(stringr)
+library(patchwork)
+library(Seurat)
+library(Signac)
+library(edgeR)
+library(limma)
+library(clusterProfiler)
+library(msigdbr)
+library(ggrepel)
+library(RColorBrewer)
+
+theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 1),
+      axis.text = element_text(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      legend.key = element_blank(),
+      strip.text.x = element_text(size = 14, margin = margin(b = 2, t = 2)),
+      strip.background = element_rect(fill = "white", colour = "black")))
+
+opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE,
+  warning = FALSE, message = FALSE, cache.lazy = FALSE, results = "hide")
+opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+options(stringsAsFactors = FALSE)
+options(future.globals.maxSize = 1591289600)
+```
+
+# Setup
+
+```{r setUpDirectories}
+projNumber <- "P697"
+baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
+dataInputDir <- file.path(baseDir, "data/inputData")
+plotDir <- file.path(baseDir, "figures")
+dataOutputDir <- file.path(baseDir, "data/outputData")
+tableDir <- file.path(baseDir, "tables")
+if (!dir.exists(tableDir)) dir.create(tableDir, recursive = TRUE)
+dataDate <- Sys.Date()
+filenameSuffix <- paste0(projNumber, ".", dataDate)
+```
+
+```{r setupFunctions}
+source(file.path(getwd(), "code/P697_functions.R"))
+```
+
+# Load WNN Bundle
+
+```{r loadBundle}
+bundleFiles <- list.files(dataOutputDir,
+  pattern = "P697\\..*_WNN_bundle\\.rds$", full.names = TRUE)
+bundleFile <- bundleFiles[which.max(file.mtime(bundleFiles))]
+cat("Loading WNN bundle:", basename(bundleFile), "\n")
+
+wnnBundle <- readRDS(bundleFile)
+
+seuratList <- list(
+  NK = wnnBundle$seuratNK,
+  Treg = wnnBundle$seuratTreg
+)
+compartments <- c("NK", "Treg")
+
+# Palettes
+palDonorId <- wnnBundle$palDonorId
+palVisit <- wnnBundle$palVisit
+palTreatmentPhase <- wnnBundle$palTreatmentPhase
+
+for (comp in compartments) {
+  cat(sprintf("%s: %d cells, %d WNN clusters\n",
+    comp, ncol(seuratList[[comp]]),
+    length(unique(seuratList[[comp]]$wnn_clusters))))
+}
+
+rm(wnnBundle); gc(verbose = FALSE)
+```
+
+# Define Contrasts
+
+```{r defineContrasts}
+# Longitudinal contrasts (all relative to baseline and consecutive)
+contrastDefs <- list(
+  PostIL2_vs_BL    = c("Post-IL2", "Baseline"),
+  PostRAPA_vs_BL   = c("Post-RAPA", "Baseline"),
+  Washout_vs_BL    = c("Washout", "Baseline"),
+  PostRAPA_vs_PostIL2  = c("Post-RAPA", "Post-IL2"),
+  Washout_vs_PostRAPA  = c("Washout", "Post-RAPA")
+)
+
+cat("Contrasts defined:\n")
+for (nm in names(contrastDefs)) {
+  cat(sprintf("  %s: %s vs %s\n", nm, contrastDefs[[nm]][1], contrastDefs[[nm]][2]))
+}
+```
+
+# Helper Functions
+
+```{r helperFunctions}
+# Pseudobulk aggregation: sum counts per donor × treatment phase
+aggregatePseudobulk <- function(countMat, metadata, groupCols) {
+  metadata$groupDGE <- apply(metadata[, groupCols, drop = FALSE], 1, paste, collapse = "_")
+
+  # Sum counts per group
+  groups <- unique(metadata$groupDGE)
+  aggMat <- matrix(0, nrow = nrow(countMat), ncol = length(groups),
+    dimnames = list(rownames(countMat), groups))
+
+  for (g in groups) {
+    cells <- which(metadata$groupDGE == g)
+    if (length(cells) == 1) {
+      aggMat[, g] <- countMat[, cells]
+    } else {
+      aggMat[, g] <- Matrix::rowSums(countMat[, cells])
+    }
+  }
+
+  # Build design info
+  designInfo <- metadata %>%
+    distinct(groupDGE, .keep_all = TRUE) %>%
+    dplyr::select(all_of(c(groupCols, "groupDGE")))
+  designInfo$nCells <- as.integer(table(metadata$groupDGE)[designInfo$groupDGE])
+  designInfo <- designInfo[match(colnames(aggMat), designInfo$groupDGE), ]
+
+  list(counts = aggMat, designInfo = designInfo)
+}
+
+# Run limma-voom DGE/DA with paired donor design
+runLimmaVoom <- function(aggCounts, designInfo, contrastDefs,
+                         filterExpr = TRUE, minCellsPerGroup = 3) {
+
+  # Require minimum cells per group
+  keep <- designInfo$nCells >= minCellsPerGroup
+  if (sum(!keep) > 0) {
+    cat(sprintf("  Dropped %d groups with < %d cells\n", sum(!keep), minCellsPerGroup))
+    aggCounts <- aggCounts[, keep]
+    designInfo <- designInfo[keep, ]
+  }
+
+  # Paired design: ~ 0 + treatmentPhase + donorID
+  designInfo$treatmentPhase <- factor(designInfo$treatmentPhase,
+    levels = c("Baseline", "Post-IL2", "Post-RAPA", "Washout"))
+  designInfo$donorID <- factor(designInfo$donorID)
+
+  design <- model.matrix(~ 0 + treatmentPhase + donorID, data = designInfo)
+  colnames(design) <- gsub("treatmentPhase", "", colnames(design))
+  colnames(design) <- gsub("donorID", "D", colnames(design))
+  colnames(design) <- make.names(colnames(design))
+
+  # DGEList + filtering + normalization
+  dge <- DGEList(counts = aggCounts)
+  if (filterExpr) {
+    keep <- filterByExpr(dge, design = design)
+    cat(sprintf("  filterByExpr: keeping %d / %d features\n", sum(keep), length(keep)))
+    dge <- dge[keep, , keep.lib.sizes = FALSE]
+  }
+  dge <- calcNormFactors(dge, method = "TMM")
+
+  # voom
+  v <- voom(dge, design, plot = FALSE)
+
+  # Fit
+  fit <- lmFit(v, design)
+
+  # Build contrast matrix from contrastDefs
+  # Only include contrasts where both levels are present in the design
+  validContrasts <- list()
+  for (nm in names(contrastDefs)) {
+    lvl1 <- make.names(contrastDefs[[nm]][1])
+    lvl2 <- make.names(contrastDefs[[nm]][2])
+    if (lvl1 %in% colnames(design) && lvl2 %in% colnames(design)) {
+      validContrasts[[nm]] <- paste0(lvl1, " - ", lvl2)
+    }
+  }
+
+  if (length(validContrasts) == 0) {
+    cat("  No valid contrasts — skipping\n")
+    return(NULL)
+  }
+
+  contStr <- unlist(validContrasts)
+  cont.matrix <- makeContrasts(contrasts = contStr, levels = design)
+  colnames(cont.matrix) <- names(validContrasts)
+
+  fit2 <- contrasts.fit(fit, cont.matrix)
+  fit2 <- eBayes(fit2)
+
+  # Extract results
+  results <- list()
+  for (nm in names(validContrasts)) {
+    tt <- topTable(fit2, coef = nm, adjust.method = "BH",
+      sort.by = "P", number = Inf)
+    tt$feature <- rownames(tt)
+    tt$contrast <- nm
+    results[[nm]] <- tt
+  }
+
+  list(results = results, fit = fit2, voom = v, design = design,
+    contMatrix = cont.matrix, designInfo = designInfo)
+}
+
+# Volcano plot
+plotVolcano <- function(tt, contrastName, featureType = "Gene",
+                        pCutoff = 0.05, fcCutoff = 0.5, nLabel = 15) {
+  tt$sig <- ifelse(tt$adj.P.Val < pCutoff & abs(tt$logFC) > fcCutoff,
+    ifelse(tt$logFC > 0, "Up", "Down"), "NS")
+  tt$sig <- factor(tt$sig, levels = c("Up", "Down", "NS"))
+
+  nUp <- sum(tt$sig == "Up")
+  nDown <- sum(tt$sig == "Down")
+
+  # Label top features
+  topFeatures <- tt %>%
+    dplyr::filter(sig != "NS") %>%
+    arrange(adj.P.Val) %>%
+    head(nLabel)
+
+  ggplot(tt, aes(x = logFC, y = -log10(adj.P.Val), color = sig)) +
+    geom_point(size = 0.8, alpha = 0.6) +
+    geom_hline(yintercept = -log10(pCutoff), linetype = "dashed", color = "grey50") +
+    geom_vline(xintercept = c(-fcCutoff, fcCutoff), linetype = "dashed", color = "grey50") +
+    scale_color_manual(values = c("Up" = "#E41A1C", "Down" = "#377EB8", "NS" = "grey70"),
+      drop = FALSE) +
+    geom_text_repel(data = topFeatures,
+      aes(label = feature), size = 3, max.overlaps = 20, color = "black") +
+    labs(x = "log2 Fold Change", y = "-log10(Adj. P-value)",
+      title = contrastName,
+      subtitle = sprintf("%s: %d up, %d down (FDR < %.2f, |logFC| > %.1f)",
+        featureType, nUp, nDown, pCutoff, fcCutoff)) +
+    theme(legend.position = "none")
+}
+```
+
+# Global Pseudobulk RNA DGE {.tabset}
+
+## Aggregation and Model Fitting
+
+```{r globalRNADGE}
+rnaResults <- list()
+
+for (comp in compartments) {
+  cat(sprintf("\n=== %s: Global RNA DGE ===\n", comp))
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  # Get raw counts
+  counts <- GetAssayData(seuratObj, layer = "counts")
+
+  # Filter genes: keep those expressed in >= 30% of cells
+  cellCount <- ncol(counts)
+  geneFilter <- Matrix::rowSums(counts > 0) >= 0.3 * cellCount
+  cat(sprintf("  Gene filter (>=30%% cells): %d / %d genes pass\n",
+    sum(geneFilter), length(geneFilter)))
+  counts <- counts[geneFilter, ]
+
+  # Build metadata for aggregation
+  meta <- seuratObj@meta.data[, c("donorID", "treatmentPhase")]
+
+  # Aggregate by donor × treatment phase
+  agg <- aggregatePseudobulk(counts, meta, c("donorID", "treatmentPhase"))
+  cat(sprintf("  Pseudobulk groups: %d\n", ncol(agg$counts)))
+
+  # Run limma-voom
+  rnaResults[[comp]] <- runLimmaVoom(agg$counts, agg$designInfo, contrastDefs)
+
+  if (!is.null(rnaResults[[comp]])) {
+    for (nm in names(rnaResults[[comp]]$results)) {
+      tt <- rnaResults[[comp]]$results[[nm]]
+      nSig <- sum(tt$adj.P.Val < 0.05)
+      nFC <- sum(tt$adj.P.Val < 0.05 & abs(tt$logFC) > 0.5)
+      cat(sprintf("  %s: %d DE genes (FDR<0.05), %d with |logFC|>0.5\n", nm, nSig, nFC))
+    }
+  }
+}
+```
+
+## RNA Volcano Plots
+
+```{r rnaVolcanos, fig.height = 10, fig.width = 14}
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+
+  plots <- list()
+  for (nm in names(rnaResults[[comp]]$results)) {
+    plots[[nm]] <- plotVolcano(rnaResults[[comp]]$results[[nm]],
+      paste(comp, "RNA:", nm), featureType = "Gene")
+  }
+
+  nPlots <- length(plots)
+  nCols <- min(3, nPlots)
+  nRows <- ceiling(nPlots / nCols)
+
+  combined <- wrap_plots(plots, ncol = nCols)
+  print(combined)
+
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_RNA_DGE_volcanos"),
+    height = 6 * nRows, width = 6 * nCols)
+}
+```
+
+## RNA Results Tables
+
+```{r rnaResultsTables}
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+
+  for (nm in names(rnaResults[[comp]]$results)) {
+    tt <- rnaResults[[comp]]$results[[nm]]
+    outFile <- file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_RNA_DGE_", nm, ".csv"))
+    write.csv(tt, file = outFile, row.names = FALSE)
+    cat(sprintf("Saved: %s\n", basename(outFile)))
+  }
+}
+```
+
+# Global Pseudobulk ATAC DA {.tabset}
+
+## Aggregation and Model Fitting
+
+```{r globalATACDA}
+atacResults <- list()
+
+for (comp in compartments) {
+  cat(sprintf("\n=== %s: Global ATAC DA ===\n", comp))
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "ATAC"
+
+  # Get ATAC peak counts
+  counts <- GetAssayData(seuratObj, layer = "counts")
+
+  # Filter peaks: keep those accessible in >= 5% of cells
+  # (lower threshold for ATAC since peaks are sparser than genes)
+  cellCount <- ncol(counts)
+  peakFilter <- Matrix::rowSums(counts > 0) >= 0.05 * cellCount
+  cat(sprintf("  Peak filter (>=5%% cells): %d / %d peaks pass\n",
+    sum(peakFilter), length(peakFilter)))
+  counts <- counts[peakFilter, ]
+
+  # Build metadata for aggregation
+  meta <- seuratObj@meta.data[, c("donorID", "treatmentPhase")]
+
+  # Aggregate by donor × treatment phase
+  agg <- aggregatePseudobulk(counts, meta, c("donorID", "treatmentPhase"))
+  cat(sprintf("  Pseudobulk groups: %d\n", ncol(agg$counts)))
+
+  # Run limma-voom
+  atacResults[[comp]] <- runLimmaVoom(agg$counts, agg$designInfo, contrastDefs)
+
+  if (!is.null(atacResults[[comp]])) {
+    for (nm in names(atacResults[[comp]]$results)) {
+      tt <- atacResults[[comp]]$results[[nm]]
+      nSig <- sum(tt$adj.P.Val < 0.05)
+      nFC <- sum(tt$adj.P.Val < 0.05 & abs(tt$logFC) > 0.5)
+      cat(sprintf("  %s: %d DA peaks (FDR<0.05), %d with |logFC|>0.5\n", nm, nSig, nFC))
+    }
+  }
+}
+```
+
+## ATAC Volcano Plots
+
+```{r atacVolcanos, fig.height = 10, fig.width = 14}
+for (comp in compartments) {
+  if (is.null(atacResults[[comp]])) next
+
+  plots <- list()
+  for (nm in names(atacResults[[comp]]$results)) {
+    plots[[nm]] <- plotVolcano(atacResults[[comp]]$results[[nm]],
+      paste(comp, "ATAC:", nm), featureType = "Peak")
+  }
+
+  nPlots <- length(plots)
+  nCols <- min(3, nPlots)
+  nRows <- ceiling(nPlots / nCols)
+
+  combined <- wrap_plots(plots, ncol = nCols)
+  print(combined)
+
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_ATAC_DA_volcanos"),
+    height = 5 * nRows, width = 5 * nCols)
+}
+```
+
+## ATAC Results Tables
+
+```{r atacResultsTables}
+for (comp in compartments) {
+  if (is.null(atacResults[[comp]])) next
+
+  for (nm in names(atacResults[[comp]]$results)) {
+    tt <- atacResults[[comp]]$results[[nm]]
+    outFile <- file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_ATAC_DA_", nm, ".csv"))
+    write.csv(tt, file = outFile, row.names = FALSE)
+    cat(sprintf("Saved: %s\n", basename(outFile)))
+  }
+}
+```
+
+# Per-Cluster RNA DGE {.tabset}
+
+## Aggregation and Model Fitting
+
+```{r perClusterRNADGE}
+perClusterRNA <- list()
+
+for (comp in compartments) {
+  cat(sprintf("\n=== %s: Per-Cluster RNA DGE ===\n", comp))
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  clusters <- sort(unique(seuratObj$wnn_clusters))
+  perClusterRNA[[comp]] <- list()
+
+  for (cl in clusters) {
+    cat(sprintf("\n  Cluster %s:\n", cl))
+
+    # Subset to cluster
+    cellIdx <- which(seuratObj$wnn_clusters == cl)
+    if (length(cellIdx) < 20) {
+      cat(sprintf("    Skipping: only %d cells\n", length(cellIdx)))
+      next
+    }
+
+    counts <- GetAssayData(seuratObj, layer = "counts")[, cellIdx]
+
+    # Filter genes: >= 30% of cells in this cluster
+    geneFilter <- Matrix::rowSums(counts > 0) >= 0.3 * length(cellIdx)
+    counts <- counts[geneFilter, ]
+    cat(sprintf("    %d cells, %d genes pass filter\n", length(cellIdx), nrow(counts)))
+
+    if (nrow(counts) < 50) {
+      cat("    Skipping: too few genes pass filter\n")
+      next
+    }
+
+    meta <- seuratObj@meta.data[cellIdx, c("donorID", "treatmentPhase")]
+
+    # Check: need at least 2 treatment phases with >= 2 donors each
+    phaseTab <- table(meta$treatmentPhase, meta$donorID)
+    phasesWithData <- rowSums(phaseTab > 0) >= 2
+    if (sum(phasesWithData) < 2) {
+      cat("    Skipping: insufficient donor coverage across phases\n")
+      next
+    }
+
+    agg <- aggregatePseudobulk(counts, meta, c("donorID", "treatmentPhase"))
+
+    result <- tryCatch(
+      runLimmaVoom(agg$counts, agg$designInfo, contrastDefs),
+      error = function(e) { cat(sprintf("    Error: %s\n", e$message)); NULL }
+    )
+
+    if (!is.null(result)) {
+      perClusterRNA[[comp]][[as.character(cl)]] <- result
+      for (nm in names(result$results)) {
+        nSig <- sum(result$results[[nm]]$adj.P.Val < 0.05)
+        cat(sprintf("    %s: %d DE genes\n", nm, nSig))
+      }
+    }
+  }
+}
+```
+
+## Per-Cluster RNA Summary Heatmap
+
+```{r perClusterRNASummary, fig.height = 6, fig.width = 10}
+for (comp in compartments) {
+  if (length(perClusterRNA[[comp]]) == 0) next
+
+  # Count significant genes per cluster × contrast
+  summaryDf <- do.call(rbind, lapply(names(perClusterRNA[[comp]]), function(cl) {
+    do.call(rbind, lapply(names(perClusterRNA[[comp]][[cl]]$results), function(nm) {
+      tt <- perClusterRNA[[comp]][[cl]]$results[[nm]]
+      data.frame(
+        cluster = cl,
+        contrast = nm,
+        nDE = sum(tt$adj.P.Val < 0.05),
+        nUp = sum(tt$adj.P.Val < 0.05 & tt$logFC > 0),
+        nDown = sum(tt$adj.P.Val < 0.05 & tt$logFC < 0)
+      )
+    }))
+  }))
+
+  pSummary <- ggplot(summaryDf, aes(x = contrast, y = cluster, fill = nDE)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = nDE), size = 3.5) +
+    scale_fill_gradient(low = "white", high = "#E41A1C", name = "# DE Genes") +
+    labs(x = "", y = "WNN Cluster",
+      title = paste(comp, "— Per-Cluster DE Genes (RNA, FDR < 0.05)")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(pSummary)
+
+  savePlot(plot = pSummary, plotDir = plotDir,
+    filename = paste0(comp, "_perCluster_RNA_DGE_summary"),
+    height = 6, width = 10)
+}
+```
+
+## Per-Cluster RNA Tables
+
+```{r perClusterRNATables}
+for (comp in compartments) {
+  for (cl in names(perClusterRNA[[comp]])) {
+    for (nm in names(perClusterRNA[[comp]][[cl]]$results)) {
+      tt <- perClusterRNA[[comp]][[cl]]$results[[nm]]
+      outFile <- file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_cluster", cl, "_RNA_DGE_", nm, ".csv"))
+      write.csv(tt, file = outFile, row.names = FALSE)
+    }
+  }
+  cat(sprintf("%s: per-cluster RNA tables saved\n", comp))
+}
+```
+
+# Per-Cluster ATAC DA {.tabset}
+
+## Aggregation and Model Fitting
+
+```{r perClusterATACDA}
+perClusterATAC <- list()
+
+for (comp in compartments) {
+  cat(sprintf("\n=== %s: Per-Cluster ATAC DA ===\n", comp))
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "ATAC"
+
+  clusters <- sort(unique(seuratObj$wnn_clusters))
+  perClusterATAC[[comp]] <- list()
+
+  for (cl in clusters) {
+    cat(sprintf("\n  Cluster %s:\n", cl))
+
+    cellIdx <- which(seuratObj$wnn_clusters == cl)
+    if (length(cellIdx) < 20) {
+      cat(sprintf("    Skipping: only %d cells\n", length(cellIdx)))
+      next
+    }
+
+    counts <- GetAssayData(seuratObj, layer = "counts")[, cellIdx]
+
+    # Filter peaks: >= 5% of cells in this cluster
+    peakFilter <- Matrix::rowSums(counts > 0) >= 0.05 * length(cellIdx)
+    counts <- counts[peakFilter, ]
+    cat(sprintf("    %d cells, %d peaks pass filter\n", length(cellIdx), nrow(counts)))
+
+    if (nrow(counts) < 50) {
+      cat("    Skipping: too few peaks pass filter\n")
+      next
+    }
+
+    meta <- seuratObj@meta.data[cellIdx, c("donorID", "treatmentPhase")]
+
+    phaseTab <- table(meta$treatmentPhase, meta$donorID)
+    phasesWithData <- rowSums(phaseTab > 0) >= 2
+    if (sum(phasesWithData) < 2) {
+      cat("    Skipping: insufficient donor coverage across phases\n")
+      next
+    }
+
+    agg <- aggregatePseudobulk(counts, meta, c("donorID", "treatmentPhase"))
+
+    result <- tryCatch(
+      runLimmaVoom(agg$counts, agg$designInfo, contrastDefs),
+      error = function(e) { cat(sprintf("    Error: %s\n", e$message)); NULL }
+    )
+
+    if (!is.null(result)) {
+      perClusterATAC[[comp]][[as.character(cl)]] <- result
+      for (nm in names(result$results)) {
+        nSig <- sum(result$results[[nm]]$adj.P.Val < 0.05)
+        cat(sprintf("    %s: %d DA peaks\n", nm, nSig))
+      }
+    }
+  }
+}
+```
+
+## Per-Cluster ATAC Summary Heatmap
+
+```{r perClusterATACSummary, fig.height = 6, fig.width = 10}
+for (comp in compartments) {
+  if (length(perClusterATAC[[comp]]) == 0) next
+
+  summaryDf <- do.call(rbind, lapply(names(perClusterATAC[[comp]]), function(cl) {
+    do.call(rbind, lapply(names(perClusterATAC[[comp]][[cl]]$results), function(nm) {
+      tt <- perClusterATAC[[comp]][[cl]]$results[[nm]]
+      data.frame(
+        cluster = cl,
+        contrast = nm,
+        nDA = sum(tt$adj.P.Val < 0.05),
+        nUp = sum(tt$adj.P.Val < 0.05 & tt$logFC > 0),
+        nDown = sum(tt$adj.P.Val < 0.05 & tt$logFC < 0)
+      )
+    }))
+  }))
+
+  pSummary <- ggplot(summaryDf, aes(x = contrast, y = cluster, fill = nDA)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = nDA), size = 3.5) +
+    scale_fill_gradient(low = "white", high = "#FF7F00", name = "# DA Peaks") +
+    labs(x = "", y = "WNN Cluster",
+      title = paste(comp, "— Per-Cluster DA Peaks (ATAC, FDR < 0.05)")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(pSummary)
+
+  savePlot(plot = pSummary, plotDir = plotDir,
+    filename = paste0(comp, "_perCluster_ATAC_DA_summary"),
+    height = 6, width = 10)
+}
+```
+
+## Per-Cluster ATAC Tables
+
+```{r perClusterATACTables}
+for (comp in compartments) {
+  for (cl in names(perClusterATAC[[comp]])) {
+    for (nm in names(perClusterATAC[[comp]][[cl]]$results)) {
+      tt <- perClusterATAC[[comp]][[cl]]$results[[nm]]
+      outFile <- file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_cluster", cl, "_ATAC_DA_", nm, ".csv"))
+      write.csv(tt, file = outFile, row.names = FALSE)
+    }
+  }
+  cat(sprintf("%s: per-cluster ATAC tables saved\n", comp))
+}
+```
+
+# GSEA on Global RNA DGE {.tabset}
+
+## Load Gene Sets
+
+```{r loadGeneSets}
+hallmarkSets <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+goSets <- msigdbr(species = "Homo sapiens", category = "C5",
+  subcategory = "GO:BP") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+cat(sprintf("Hallmark: %d gene sets\n", length(unique(hallmarkSets$gs_name))))
+cat(sprintf("GO:BP: %d gene sets\n", length(unique(goSets$gs_name))))
+```
+
+## Run GSEA
+
+```{r runGSEA}
+gseaResults <- list()
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+  gseaResults[[comp]] <- list()
+
+  for (nm in names(rnaResults[[comp]]$results)) {
+    tt <- rnaResults[[comp]]$results[[nm]]
+
+    # Rank by t-statistic (more stable than logFC for GSEA)
+    geneRanks <- tt$t
+    names(geneRanks) <- tt$feature
+    geneRanks <- sort(geneRanks, decreasing = TRUE)
+
+    # Remove duplicates and NAs
+    geneRanks <- geneRanks[!is.na(geneRanks)]
+    geneRanks <- geneRanks[!duplicated(names(geneRanks))]
+
+    cat(sprintf("\n%s %s: GSEA with %d ranked genes\n", comp, nm, length(geneRanks)))
+
+    # Hallmark GSEA
+    hallmarkGSEA <- tryCatch(
+      GSEA(geneRanks, TERM2GENE = hallmarkSets,
+        minGSSize = 10, maxGSSize = 500,
+        pvalueCutoff = 1.0, verbose = FALSE),
+      error = function(e) { cat(sprintf("  Hallmark error: %s\n", e$message)); NULL }
+    )
+
+    # GO:BP GSEA
+    goGSEA <- tryCatch(
+      GSEA(geneRanks, TERM2GENE = goSets,
+        minGSSize = 10, maxGSSize = 500,
+        pvalueCutoff = 1.0, verbose = FALSE),
+      error = function(e) { cat(sprintf("  GO:BP error: %s\n", e$message)); NULL }
+    )
+
+    gseaResults[[comp]][[nm]] <- list(
+      hallmark = hallmarkGSEA,
+      go_bp = goGSEA
+    )
+
+    if (!is.null(hallmarkGSEA)) {
+      nSigH <- sum(hallmarkGSEA@result$p.adjust < 0.05)
+      cat(sprintf("  Hallmark: %d significant (FDR<0.05)\n", nSigH))
+    }
+    if (!is.null(goGSEA)) {
+      nSigG <- sum(goGSEA@result$p.adjust < 0.05)
+      cat(sprintf("  GO:BP: %d significant (FDR<0.05)\n", nSigG))
+    }
+  }
+}
+```
+
+## GSEA Bubble Plots
+
+```{r gseaBubblePlots, fig.height = 10, fig.width = 12}
+for (comp in compartments) {
+  if (is.null(gseaResults[[comp]])) next
+
+  for (nm in names(gseaResults[[comp]])) {
+    gseaSets <- gseaResults[[comp]][[nm]]
+    plotData <- list()
+
+    # Hallmark results
+    if (!is.null(gseaSets$hallmark) && nrow(gseaSets$hallmark@result) > 0) {
+      hRes <- gseaSets$hallmark@result %>%
+        dplyr::filter(p.adjust < 0.1) %>%
+        mutate(GeneSet = "Hallmark",
+          Description_clean = gsub("^HALLMARK_", "", Description),
+          Description_clean = gsub("_", " ", Description_clean),
+          Description_clean = str_to_title(Description_clean))
+
+      if (nrow(hRes) > 0) plotData[["Hallmark"]] <- hRes
+    }
+
+    # GO:BP results (top 20 by p.adjust)
+    if (!is.null(gseaSets$go_bp) && nrow(gseaSets$go_bp@result) > 0) {
+      gRes <- gseaSets$go_bp@result %>%
+        dplyr::filter(p.adjust < 0.1) %>%
+        arrange(p.adjust) %>%
+        head(20) %>%
+        mutate(GeneSet = "GO:BP",
+          Description_clean = gsub("^GOBP_", "", Description),
+          Description_clean = gsub("_", " ", Description_clean),
+          Description_clean = str_to_title(Description_clean))
+
+      if (nrow(gRes) > 0) plotData[["GO:BP"]] <- gRes
+    }
+
+    if (length(plotData) == 0) {
+      cat(sprintf("%s %s: No significant GSEA results to plot\n", comp, nm))
+      next
+    }
+
+    combined <- bind_rows(plotData)
+
+    pBubble <- ggplot(combined, aes(x = NES, y = reorder(Description_clean, NES))) +
+      geom_vline(xintercept = 0, linetype = "solid", color = "gray80") +
+      geom_segment(aes(y = reorder(Description_clean, NES),
+        yend = reorder(Description_clean, NES),
+        x = 0, xend = NES), color = "black", linewidth = 0.5) +
+      geom_point(aes(size = setSize, fill = -log10(p.adjust)),
+        shape = 21, color = "black", stroke = 0.5) +
+      facet_grid(GeneSet ~ ., scales = "free_y", space = "free_y") +
+      scale_fill_gradient(low = "lightblue", high = "red",
+        name = "-log10(FDR)") +
+      scale_size_area(max_size = 8,
+        guide = guide_legend(override.aes = list(fill = NA, color = "black"))) +
+      labs(x = "Normalized Enrichment Score (NES)", y = "",
+        size = "Gene Set Size",
+        title = paste(comp, "—", nm)) +
+      theme(
+        strip.background = element_rect(fill = "white", color = "black", linewidth = 1),
+        strip.text = element_text(face = "bold", size = 12),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        axis.text.y = element_text(size = 10),
+        panel.grid.major.x = element_line(color = "gray95"),
+        panel.grid.major.y = element_blank())
+
+    print(pBubble)
+
+    savePlot(plot = pBubble, plotDir = plotDir,
+      filename = paste0(comp, "_GSEA_", nm),
+      height = max(6, 0.4 * nrow(combined) + 2), width = 12)
+  }
+}
+```
+
+## GSEA Results Tables
+
+```{r gseaResultsTables}
+for (comp in compartments) {
+  if (is.null(gseaResults[[comp]])) next
+
+  for (nm in names(gseaResults[[comp]])) {
+    gseaSets <- gseaResults[[comp]][[nm]]
+
+    for (setType in c("hallmark", "go_bp")) {
+      if (is.null(gseaSets[[setType]])) next
+      res <- gseaSets[[setType]]@result
+      outFile <- file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_GSEA_", setType, "_", nm, ".csv"))
+      write.csv(res, file = outFile, row.names = FALSE)
+    }
+  }
+  cat(sprintf("%s: GSEA tables saved\n", comp))
+}
+```
+
+# Cross-Modality Integration Summary {.tabset}
+
+## DA-DGE Overlap
+
+```{r daDgeOverlap, fig.height = 6, fig.width = 8}
+# For each contrast, identify peaks near DE genes and vice versa
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]]) || is.null(atacResults[[comp]])) next
+
+  overlapSummary <- data.frame()
+
+  for (nm in intersect(names(rnaResults[[comp]]$results),
+                       names(atacResults[[comp]]$results))) {
+    rna <- rnaResults[[comp]]$results[[nm]]
+    atac <- atacResults[[comp]]$results[[nm]]
+
+    nDE <- sum(rna$adj.P.Val < 0.05)
+    nDA <- sum(atac$adj.P.Val < 0.05)
+
+    overlapSummary <- rbind(overlapSummary, data.frame(
+      contrast = nm,
+      DE_genes = nDE,
+      DA_peaks = nDA
+    ))
+  }
+
+  cat(sprintf("\n%s: DA-DGE Summary\n", comp))
+  print(overlapSummary)
+
+  if (nrow(overlapSummary) > 0) {
+    overlapLong <- overlapSummary %>%
+      pivot_longer(cols = c(DE_genes, DA_peaks),
+        names_to = "modality", values_to = "count")
+
+    pOverlap <- ggplot(overlapLong, aes(x = contrast, y = count, fill = modality)) +
+      geom_col(position = "dodge") +
+      scale_fill_manual(values = c("DE_genes" = "#377EB8", "DA_peaks" = "#FF7F00"),
+        labels = c("DE Genes (RNA)", "DA Peaks (ATAC)")) +
+      labs(x = "", y = "# Significant Features (FDR < 0.05)",
+        fill = "", title = paste(comp, "— Significant Features per Contrast")) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+    print(pOverlap)
+
+    savePlot(plot = pOverlap, plotDir = plotDir,
+      filename = paste0(comp, "_DA_DGE_overlap_barplot"),
+      height = 6, width = 8)
+  }
+}
+```
+
+## LogFC Correlation (Top DE Peaks Nearest Genes)
+
+```{r logFCCorrelation, fig.height = 6, fig.width = 8}
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]]) || is.null(atacResults[[comp]])) next
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "ATAC"
+
+  for (nm in intersect(names(rnaResults[[comp]]$results),
+                       names(atacResults[[comp]]$results))) {
+    atac <- atacResults[[comp]]$results[[nm]]
+    rna <- rnaResults[[comp]]$results[[nm]]
+
+    # Get significant DA peaks
+    sigPeaks <- atac %>% dplyr::filter(adj.P.Val < 0.1)
+    if (nrow(sigPeaks) < 5) next
+
+    # Find nearest gene for each significant peak
+    peakGR <- StringToGRanges(sigPeaks$feature)
+
+    nearestGene <- tryCatch({
+      nearest <- ClosestFeature(seuratObj, regions = peakGR)
+      nearest
+    }, error = function(e) NULL)
+
+    if (is.null(nearestGene) || nrow(nearestGene) == 0) next
+
+    # Merge ATAC logFC with RNA logFC for nearest gene
+    sigPeaks$nearestGene <- nearestGene$gene_name[
+      match(sigPeaks$feature, nearestGene$query_region)]
+    sigPeaks$distance <- nearestGene$distance[
+      match(sigPeaks$feature, nearestGene$query_region)]
+
+    # Filter: only peaks within 100kb of a gene
+    sigPeaks <- sigPeaks %>%
+      dplyr::filter(!is.na(nearestGene) & distance <= 100000)
+
+    if (nrow(sigPeaks) < 5) next
+
+    # Join with RNA results
+    merged <- sigPeaks %>%
+      inner_join(rna %>% dplyr::select(feature, logFC, adj.P.Val) %>%
+        dplyr::rename(RNA_logFC = logFC, RNA_FDR = adj.P.Val),
+        by = c("nearestGene" = "feature"))
+
+    if (nrow(merged) < 5) next
+
+    corTest <- cor.test(merged$logFC, merged$RNA_logFC, method = "spearman")
+
+    pCorr <- ggplot(merged, aes(x = logFC, y = RNA_logFC)) +
+      geom_point(aes(color = -log10(adj.P.Val)), size = 2, alpha = 0.7) +
+      geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.5) +
+      scale_color_viridis_c(name = "-log10(ATAC FDR)") +
+      geom_text_repel(
+        data = merged %>% arrange(adj.P.Val) %>% head(10),
+        aes(label = nearestGene), size = 3, max.overlaps = 15) +
+      labs(x = "ATAC Peak logFC", y = "Nearest Gene RNA logFC",
+        title = paste(comp, nm),
+        subtitle = sprintf("Spearman rho = %.2f, p = %.2e (n = %d peaks)",
+          corTest$estimate, corTest$p.value, nrow(merged)))
+
+    print(pCorr)
+
+    savePlot(plot = pCorr, plotDir = plotDir,
+      filename = paste0(comp, "_logFC_correlation_", nm),
+      height = 6, width = 8)
+  }
+}
+```
+
+# Export for SCENIC+
+
+```{r scenicExport}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  exportDir <- file.path(dataOutputDir, paste0("scenic_export_", comp))
+  if (!dir.exists(exportDir)) dir.create(exportDir, recursive = TRUE)
+
+  # RNA counts (sparse matrix)
+  DefaultAssay(seuratObj) <- "RNA"
+  rnaCounts <- GetAssayData(seuratObj, layer = "counts")
+  Matrix::writeMM(rnaCounts, file.path(exportDir, "RNA_counts.mtx"))
+  writeLines(rownames(rnaCounts), file.path(exportDir, "RNA_genes.txt"))
+  writeLines(colnames(rnaCounts), file.path(exportDir, "RNA_barcodes.txt"))
+
+  # ATAC counts (sparse matrix)
+  DefaultAssay(seuratObj) <- "ATAC"
+  atacCounts <- GetAssayData(seuratObj, layer = "counts")
+  Matrix::writeMM(atacCounts, file.path(exportDir, "ATAC_counts.mtx"))
+  writeLines(rownames(atacCounts), file.path(exportDir, "ATAC_peaks.txt"))
+  writeLines(colnames(atacCounts), file.path(exportDir, "ATAC_barcodes.txt"))
+
+  # Metadata
+  metaCols <- c("donorID", "visitNum", "treatmentPhase", "wnn_clusters",
+    "RNA.weight", "ATAC.weight")
+  metaCols <- intersect(metaCols, colnames(seuratObj@meta.data))
+  meta <- seuratObj@meta.data[, metaCols]
+  write.csv(meta, file.path(exportDir, "metadata.csv"))
+
+  # Embeddings
+  for (redName in c("umap.wnn", "harmony", "harmony_lsi")) {
+    if (redName %in% names(seuratObj@reductions)) {
+      emb <- Embeddings(seuratObj, reduction = redName)
+      write.csv(emb, file.path(exportDir, paste0("embedding_", redName, ".csv")))
+    }
+  }
+
+  cat(sprintf("%s: SCENIC+ export saved to %s\n", comp, exportDir))
+  cat(sprintf("  RNA: %d genes × %d cells\n", nrow(rnaCounts), ncol(rnaCounts)))
+  cat(sprintf("  ATAC: %d peaks × %d cells\n", nrow(atacCounts), ncol(atacCounts)))
+}
+```
+
+# Save DA Bundle
+
+```{r saveDABundle}
+daBundle_path <- file.path(dataOutputDir,
+  paste0(filenameSuffix, "_DA_bundle.rds"))
+
+daBundle <- list(
+  # Global results
+  rnaResults = rnaResults,
+  atacResults = atacResults,
+
+  # Per-cluster results
+  perClusterRNA = perClusterRNA,
+  perClusterATAC = perClusterATAC,
+
+  # GSEA
+  gseaResults = gseaResults,
+
+  # Contrasts used
+  contrastDefs = contrastDefs,
+
+  # Carry forward palettes
+  palDonorId = palDonorId,
+  palVisit = palVisit,
+  palTreatmentPhase = palTreatmentPhase,
+
+  # Metadata
+  dataDate = dataDate,
+  bundle_created = Sys.time(),
+  source_script = "P697_DA.rmd"
+)
+
+saveRDS(daBundle, file = daBundle_path)
+cat("DA bundle saved to:", daBundle_path, "\n")
+cat("Bundle contains:", paste(names(daBundle), collapse = ", "), "\n")
+```
+
+# Session Info
+
+```{r sessionInfo, results = "markup"}
+sessionInfo()
+```

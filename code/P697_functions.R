@@ -491,9 +491,14 @@ savePlot <- function(
 
   # Save as PDF
   if ("pdf" %in% formats) {
-    pdf(file.path(plotDir, paste0(filenameSuffix, "_", filename, ".pdf")), height = height, width = width)
+    pdf(file.path(plotDir, paste0(filenameSuffix, "_", filename, ".pdf")),
+      height = height,
+      width = width)
+    # The on.exit() calls prevent the graphics device from staying open if the plot fails to print
+    on.exit(dev.off(), add = TRUE)
     print(plot)
     dev.off()
+    on.exit(NULL)
   }
 
   # Save as PNG
@@ -505,8 +510,11 @@ savePlot <- function(
       units = units,
       res = dpi
     )
+    # The on.exit() calls prevent the graphics device from staying open if the plot fails to print
+    on.exit(dev.off(), add = TRUE)
     print(plot)
     dev.off()
+    on.exit(NULL)
   }
 }
 

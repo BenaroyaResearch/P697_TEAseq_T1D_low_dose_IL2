@@ -1,0 +1,749 @@
+---
+title: "P697: NK ATAC Peak Calling (MACS2 via Signac)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+setwd("/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+library(knitr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(viridis)
+library(stringr)
+library(patchwork)
+library(Seurat)
+library(Signac)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(ggpointdensity)
+library(RColorBrewer)
+library(cowplot)
+library(harmony)
+
+theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 1),
+      axis.text = element_text(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      legend.key = element_blank(),
+      strip.text.x = element_text(size = 14, margin = margin(b = 2, t = 2)),
+      strip.background = element_rect(fill = "white", colour = "black")))
+
+opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE,
+  warning = FALSE, message = FALSE, cache.lazy = FALSE, results = "hide")
+opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+options(stringsAsFactors = FALSE)
+options(future.globals.maxSize = 1591289600)
+```
+
+# Setup
+
+```{r setUpDirectories}
+projNumber <- "P697"
+baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
+dataInputDir <- file.path(baseDir, "data/inputData")
+plotDir <- file.path(baseDir, "figures")
+dataOutputDir <- file.path(baseDir, "data/outputData")
+dataDate <- Sys.Date()
+filenameSuffix <- paste0(projNumber, ".", dataDate)
+```
+
+```{r setupFunctions}
+source(file.path(getwd(), "code/P697_functions.R"))
+```
+
+# Load Preprocessing Bundle
+
+```{r loadBundle}
+# Load most recent preprocessing bundle
+# NOTE: ATAC assay was stripped before merge in preprocessing (to avoid slow
+# ChromatinAssay merge). It will be reconstructed from fragment files below.
+bundleFiles <- list.files(dataOutputDir,
+  pattern = "P697\\..*_preprocessingBundle\\.rds$",
+  full.names = TRUE)
+bundleFile <- bundleFiles[which.max(file.mtime(bundleFiles))]
+cat("Loading bundle:", bundleFile, "\n")
+
+bundle <- readRDS(bundleFile)
+
+seuratNK <- bundle$seuratNK
+tcrGeneList <- bundle$tcrGeneList
+palDonorId <- bundle$palDonorId
+palVisit <- bundle$palVisit
+
+cat("NK object:", ncol(seuratNK), "cells\n")
+cat("Assays:", paste(names(seuratNK@assays), collapse = ", "), "\n")
+
+# Verify ATAC metadata survived the merge (needed for QC plots)
+stopifnot("nCount_ATAC" %in% colnames(seuratNK@meta.data))
+stopifnot("hasATAC" %in% colnames(seuratNK@meta.data))
+nATACCells <- sum(seuratNK$hasATAC, na.rm = TRUE)
+cat(sprintf("Cells with ATAC data (hasATAC): %d of %d (%.1f%%)\n",
+  nATACCells, ncol(seuratNK), 100 * nATACCells / ncol(seuratNK)))
+cat(sprintf("nCount_ATAC — median: %s, mean: %s\n",
+  format(median(seuratNK$nCount_ATAC[seuratNK$hasATAC], na.rm = TRUE), big.mark = ","),
+  format(round(mean(seuratNK$nCount_ATAC[seuratNK$hasATAC], na.rm = TRUE)), big.mark = ",")))
+
+# Free bundle — seuratNK was extracted above, keeping bundle wastes ~5+ GB
+rm(bundle)
+gc(verbose = FALSE)
+```
+
+# Reconstruct ATAC Assay from Fragment Files
+
+```{r reconstructATAC}
+# The ATAC assay was stripped before merge in preprocessing to avoid extremely
+# slow ChromatinAssay merging. Here we reconstruct it from the original fragment
+# files using pool metadata and cell-name mapping.
+
+# ---- Genome annotations (reused in replaceATACAssay later) ----
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86::EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotations) <- "UCSC"
+genome(annotations) <- "hg38"
+
+# ---- Find fragment files ----
+fragDir <- file.path(baseDir, "data/outputData")
+fragFiles <- list.files(fragDir,
+  pattern = "pool697-.*_atac_fragments\\.5col\\.tsv\\.gz$",
+  full.names = TRUE)
+fragFiles <- fragFiles[!grepl("\\.tbi$", fragFiles)]
+cat(sprintf("Found %d fragment files\n", length(fragFiles)))
+
+# ---- Build per-pool Fragment objects with cell-name mapping ----
+poolsInCompartment <- unique(seuratNK$pool[seuratNK$hasATAC])
+cat(sprintf("Pools with ATAC cells in NK compartment: %s\n",
+  paste(poolsInCompartment, collapse = ", ")))
+
+fragList <- list()
+for (poolName in poolsInCompartment) {
+  # Find the fragment file for this pool
+  fragFile <- fragFiles[grepl(paste0(poolName, "_atac_fragments"), fragFiles)]
+  if (length(fragFile) != 1) {
+    warning(sprintf("Expected 1 fragment file for %s, found %d — skipping",
+      poolName, length(fragFile)))
+    next
+  }
+
+  # Get merged cell names for this pool
+  poolCells <- colnames(seuratNK)[seuratNK$pool == poolName & seuratNK$hasATAC]
+
+  # Use bare barcodes (without pool prefix) to match fragment file content.
+  # Pool-prefix renaming is handled later in buildPeakMatrix.
+  bareBarcodes <- sub(paste0("^", poolName, "_"), "", poolCells)
+
+  fragObj <- CreateFragmentObject(
+    path = fragFile,
+    cells = bareBarcodes,
+    validate.fragments = FALSE
+  )
+  fragList <- c(fragList, fragObj)
+
+  cat(sprintf("  %s: %d cells, fragment file: %s\n",
+    poolName, length(bareBarcodes), basename(fragFile)))
+}
+
+cat(sprintf("Total Fragment objects created: %d\n", length(fragList)))
+
+# Fragment objects and annotations are now ready as standalone variables.
+# No dummy ATAC assay is created — the real ChromatinAssay will be built
+# after MACS2 peak calling in the replaceATACAssay chunk.
+# QC plots below use nCount_ATAC metadata from preprocessing.
+atacCellNames <- colnames(seuratNK)[seuratNK$hasATAC]
+cat(sprintf("ATAC cells in NK: %d\n", length(atacCellNames)))
+```
+
+# ATAC Fragment Depth QC {.tabset}
+
+## Fragments per cell distribution
+
+```{r atacFragmentDistribution, fig.height = 6, fig.width = 10}
+# Get ATAC fragment counts per cell
+# nCount_ATAC carried forward from preprocessing metadata (computed from Cell
+# Ranger Arc peaks). No ATAC assay exists yet — it will be created after MACS2
+# peak calling. QC plots use the preserved metadata columns.
+
+atacMeta <- seuratNK@meta.data
+if (!"barcode" %in% colnames(atacMeta)) {
+  atacMeta$barcode <- rownames(atacMeta)
+}
+
+# nCount_ATAC must be present from preprocessing
+stopifnot("nCount_ATAC" %in% colnames(atacMeta))
+cat("Using nCount_ATAC from preprocessing metadata\n")
+
+# Also check for CR ATAC metrics (total fragments from Cell Ranger Arc)
+hasCRFragments <- "cr_arc_atac_fragments" %in% colnames(atacMeta)
+
+# Summary statistics
+cat("\n=== ATAC Fragment Depth Summary (NK) ===\n")
+cat(sprintf("Total cells with ATAC: %d\n", sum(!is.na(atacMeta$nCount_ATAC))))
+cat(sprintf("nCount_ATAC (peaks):\n"))
+cat(sprintf("  Min:    %s\n", format(min(atacMeta$nCount_ATAC, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("  Q1:     %s\n", format(quantile(atacMeta$nCount_ATAC, 0.25, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("  Median: %s\n", format(median(atacMeta$nCount_ATAC, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("  Mean:   %s\n", format(round(mean(atacMeta$nCount_ATAC, na.rm = TRUE)), big.mark = ",")))
+cat(sprintf("  Q3:     %s\n", format(quantile(atacMeta$nCount_ATAC, 0.75, na.rm = TRUE), big.mark = ",")))
+cat(sprintf("  Max:    %s\n", format(max(atacMeta$nCount_ATAC, na.rm = TRUE), big.mark = ",")))
+
+if (hasCRFragments) {
+  cat(sprintf("\ncr_arc_atac_fragments (total ATAC fragments from Cell Ranger Arc):\n"))
+  cat(sprintf("  Min:    %s\n", format(min(atacMeta$cr_arc_atac_fragments, na.rm = TRUE), big.mark = ",")))
+  cat(sprintf("  Median: %s\n", format(median(atacMeta$cr_arc_atac_fragments, na.rm = TRUE), big.mark = ",")))
+  cat(sprintf("  Mean:   %s\n", format(round(mean(atacMeta$cr_arc_atac_fragments, na.rm = TRUE)), big.mark = ",")))
+  cat(sprintf("  Max:    %s\n", format(max(atacMeta$cr_arc_atac_fragments, na.rm = TRUE), big.mark = ",")))
+}
+
+# Cells below candidate thresholds
+for (thresh in c(500, 1000, 2000, 5000)) {
+  nBelow <- sum(atacMeta$nCount_ATAC < thresh, na.rm = TRUE)
+  cat(sprintf("  Cells with nCount_ATAC < %s: %d (%.1f%%)\n",
+    format(thresh, big.mark = ","), nBelow,
+    100 * nBelow / sum(!is.na(atacMeta$nCount_ATAC))))
+}
+
+# ---- Histogram of nCount_ATAC ----
+pHist <- ggplot(atacMeta %>% dplyr::filter(!is.na(nCount_ATAC)),
+  aes(x = nCount_ATAC)) +
+  geom_histogram(bins = 100, fill = "darkorange3", color = "black", linewidth = 0.2) +
+  scale_x_log10(labels = scales::comma) +
+  geom_vline(xintercept = 1000, linetype = "dashed", color = "red", linewidth = 0.8) +
+  geom_vline(xintercept = 500, linetype = "dotted", color = "orange", linewidth = 0.8) +
+  annotate("text", x = 1000, y = Inf, label = "1000", vjust = 2, hjust = -0.1,
+    color = "red", size = 3.5) +
+  annotate("text", x = 500, y = Inf, label = "500", vjust = 3.5, hjust = -0.1,
+    color = "orange", size = 3.5) +
+  labs(x = "ATAC fragment count per cell (log10)",
+    y = "Number of cells",
+    title = "NK: ATAC fragments per cell") +
+  theme(plot.title = element_text(size = 14))
+
+# ---- Density plot ----
+pDens <- ggplot(atacMeta %>% dplyr::filter(!is.na(nCount_ATAC)),
+  aes(x = nCount_ATAC)) +
+  geom_density(fill = "darkorange3", alpha = 0.4) +
+  scale_x_log10(labels = scales::comma) +
+  geom_vline(xintercept = 1000, linetype = "dashed", color = "red", linewidth = 0.8) +
+  geom_vline(xintercept = 500, linetype = "dotted", color = "orange", linewidth = 0.8) +
+  labs(x = "ATAC fragment count per cell (log10)",
+    y = "Density",
+    title = "NK: Fragment depth density") +
+  theme(plot.title = element_text(size = 14))
+
+pHist / pDens
+
+savePlot(
+  plot = pHist / pDens,
+  plotDir = plotDir,
+  filename = "NK_ATAC_fragmentDepth_histogram",
+  height = 8, width = 10
+)
+```
+
+## Fragments by donor and visit
+
+```{r atacFragmentsByDonorVisit, fig.height = 8, fig.width = 12}
+# Faceted violin plots of fragment depth by donor and visit
+
+if (all(c("donorID", "visitNum") %in% colnames(atacMeta))) {
+  atacMeta$donorID <- factor(atacMeta$donorID)
+  atacMeta$visitNum <- factor(atacMeta$visitNum)
+
+  # ---- By donor ----
+  pByDonor <- ggplot(atacMeta %>% dplyr::filter(!is.na(nCount_ATAC)),
+    aes(x = donorID, y = nCount_ATAC, fill = donorID)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.15, fill = "white", outlier.size = 0.3) +
+    scale_y_log10(labels = scales::comma) +
+    geom_hline(yintercept = 1000, linetype = "dashed", color = "red") +
+    scale_fill_manual(values = palDonorId) +
+    labs(x = "Donor", y = "ATAC fragments per cell (log10)",
+      title = "NK: Fragment depth by donor") +
+    theme(legend.position = "none")
+
+  # ---- By visit ----
+  pByVisit <- ggplot(atacMeta %>% dplyr::filter(!is.na(nCount_ATAC)),
+    aes(x = visitNum, y = nCount_ATAC, fill = visitNum)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.15, fill = "white", outlier.size = 0.3) +
+    scale_y_log10(labels = scales::comma) +
+    geom_hline(yintercept = 1000, linetype = "dashed", color = "red") +
+    scale_fill_manual(values = palVisit) +
+    labs(x = "Visit", y = "ATAC fragments per cell (log10)",
+      title = "NK: Fragment depth by visit") +
+    theme(legend.position = "none")
+
+  # ---- Faceted by donor x visit ----
+  pFaceted <- ggplot(atacMeta %>% dplyr::filter(!is.na(nCount_ATAC)),
+    aes(x = visitNum, y = nCount_ATAC, fill = visitNum)) +
+    geom_violin(scale = "width") +
+    geom_boxplot(width = 0.2, fill = "white", outlier.size = 0.3) +
+    scale_y_log10(labels = scales::comma) +
+    geom_hline(yintercept = 1000, linetype = "dashed", color = "red") +
+    scale_fill_manual(values = palVisit) +
+    facet_wrap(~donorID, nrow = 2) +
+    labs(x = "Visit", y = "ATAC fragments (log10)",
+      title = "NK: Fragment depth by donor x visit") +
+    theme(legend.position = "none",
+      axis.text.x = element_text(size = 9))
+
+  (pByDonor | pByVisit) / pFaceted +
+    plot_layout(heights = c(1, 1.5))
+
+  savePlot(
+    plot = (pByDonor | pByVisit) / pFaceted + plot_layout(heights = c(1, 1.5)),
+    plotDir = plotDir,
+    filename = "NK_ATAC_fragmentDepth_byDonorVisit",
+    height = 10, width = 14
+  )
+}
+```
+
+## nFeature_ATAC vs nCount_ATAC
+
+```{r atacFeatureVsCount, fig.height = 6, fig.width = 7}
+if (all(c("nCount_ATAC", "nFeature_ATAC") %in% colnames(seuratNK@meta.data))) {
+  pScatter <- ggplot(seuratNK@meta.data %>% dplyr::filter(!is.na(nCount_ATAC)),
+    aes(x = nCount_ATAC, y = nFeature_ATAC)) +
+    geom_pointdensity(size = 0.3) +
+    scale_color_viridis() +
+    scale_x_log10(labels = scales::comma) +
+    scale_y_log10(labels = scales::comma) +
+    geom_vline(xintercept = 1000, linetype = "dashed", color = "red") +
+    labs(x = "nCount_ATAC (total fragments in peaks)",
+      y = "nFeature_ATAC (peaks detected)",
+      title = "NK: ATAC complexity") +
+    theme(legend.position = "right")
+
+  print(pScatter)
+
+  savePlot(
+    plot = pScatter,
+    plotDir = plotDir,
+    filename = "NK_ATAC_nFeature_vs_nCount",
+    height = 6, width = 8
+  )
+}
+```
+
+# ATAC Depth Filtering
+
+```{r atacDepthFilter}
+# ---- Set ATAC depth threshold ----
+# Review the plots above before choosing. 1000 is a common starting point.
+# Adjust this value based on the fragment distribution observed above.
+atacMinFragments <- 1000
+
+nBefore <- ncol(seuratNK)
+nATACBefore <- sum(!is.na(seuratNK$nCount_ATAC))
+
+# Identify cells passing filter
+cellsPassATAC <- colnames(seuratNK)[
+  !is.na(seuratNK$nCount_ATAC) & seuratNK$nCount_ATAC >= atacMinFragments]
+cellsFailATAC <- colnames(seuratNK)[
+  !is.na(seuratNK$nCount_ATAC) & seuratNK$nCount_ATAC < atacMinFragments]
+
+seuratNK$atacPassDepthFilter <- colnames(seuratNK) %in% cellsPassATAC
+
+cat(sprintf("\n=== ATAC Depth Filter (threshold: %s fragments) ===\n",
+  format(atacMinFragments, big.mark = ",")))
+cat(sprintf("Cells with ATAC data: %d\n", nATACBefore))
+cat(sprintf("Pass filter: %d (%.1f%%)\n",
+  length(cellsPassATAC), 100 * length(cellsPassATAC) / nATACBefore))
+cat(sprintf("Fail filter: %d (%.1f%%)\n",
+  length(cellsFailATAC), 100 * length(cellsFailATAC) / nATACBefore))
+cat(sprintf("Total cells retained (all assays): %d\n", ncol(seuratNK)))
+```
+
+# MACS2 Peak Calling
+
+```{r callPeaksMACS2}
+# Call peaks using MACS2 directly on filtered fragment files.
+# Signac::CallPeaks doesn't support a list of Fragment objects, so we merge
+# per-pool fragment BED files (filtered to depth-passing NK cells) and
+# invoke MACS2 via system2.
+
+cat("Calling peaks with MACS2 on NK compartment...\n")
+cat(sprintf("Using %d cells passing ATAC depth filter\n", length(cellsPassATAC)))
+
+macs2Path <- "/Users/tedwards/miniconda3/envs/macs2_env/bin/macs2"
+stopifnot("MACS2 not found" = file.exists(macs2Path))
+
+peakOutDir <- file.path(dataOutputDir, "macs2_peaks")
+tmpDir <- file.path(dataOutputDir, "macs2_tmp")
+dir.create(peakOutDir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tmpDir, showWarnings = FALSE, recursive = TRUE)
+
+# ---- Merge per-pool fragment files, filtered to depth-passing cells ----
+tmpBed <- file.path(tmpDir, "NK_filtered_fragments.bed")
+if (file.exists(tmpBed)) unlink(tmpBed)
+file.create(tmpBed)  # pre-create so >> always has a target
+
+# Verify prerequisites
+stopifnot("poolsInCompartment not found" = exists("poolsInCompartment"))
+stopifnot("fragFiles not found" = exists("fragFiles"))
+stopifnot("tmpDir does not exist" = dir.exists(tmpDir))
+cat(sprintf("Pools to process: %s\n", paste(poolsInCompartment, collapse = ", ")))
+cat(sprintf("Fragment files available: %d\n", length(fragFiles)))
+
+# Diagnostic: verify cellsPassATAC content
+cat(sprintf("cellsPassATAC: %d cells, e.g. %s\n",
+  length(cellsPassATAC), paste(head(cellsPassATAC, 3), collapse = ", ")))
+
+cat("Filtering and merging fragments per pool...\n")
+for (poolName in poolsInCompartment) {
+  # Match cells by name prefix (poolName_) — more robust than metadata query
+  poolPrefix <- paste0(poolName, "_")
+  poolCellsPass <- cellsPassATAC[startsWith(cellsPassATAC, poolPrefix)]
+  if (length(poolCellsPass) == 0) {
+    cat(sprintf("  %s: 0 cells passing filter — skipping\n", poolName))
+    next
+  }
+
+  # Original barcodes (strip pool prefix added by merge)
+  originalBarcodes <- sub(paste0("^", poolName, "_"), "", poolCellsPass)
+
+  # Write barcodes for awk filtering
+  bcFile <- tempfile(fileext = ".txt")
+  writeLines(originalBarcodes, bcFile)
+
+  # Find fragment file for this pool
+  poolFragFile <- fragFiles[grepl(paste0(poolName, "_atac_fragments"), fragFiles)]
+  if (length(poolFragFile) != 1) {
+    warning(sprintf("Expected 1 fragment file for %s, found %d — skipping",
+      poolName, length(poolFragFile)))
+    unlink(bcFile)
+    next
+  }
+
+  # Filter fragments by barcode (col 4) and append to merged BED
+  # Use gunzip -c (not zcat) for macOS compatibility
+  cmd <- sprintf("gunzip -c %s | awk 'NR==FNR{a[$1];next} $4 in a' %s - >> %s",
+    shQuote(poolFragFile), shQuote(bcFile), shQuote(tmpBed))
+  exitStatus <- system(cmd)
+
+  unlink(bcFile)
+  cat(sprintf("  %s: %d cells (exit %d)\n", poolName, length(poolCellsPass), exitStatus))
+}
+
+nFragLines <- as.integer(trimws(system(sprintf("wc -l < %s", shQuote(tmpBed)), intern = TRUE)))
+cat(sprintf("Total fragments in merged BED: %s\n", format(nFragLines, big.mark = ",")))
+stopifnot("No fragments written — check fragment files and cell barcodes" = nFragLines > 0)
+
+# ---- Run MACS2 ----
+macs2Prefix <- "NK_MACS2"
+cat("Running MACS2 callpeak...\n")
+macs2_result <- system2(macs2Path, args = c(
+  "callpeak",
+  "-t", tmpBed,
+  "-f", "BED",
+  "-g", "2.7e9",
+  "--nomodel",
+  "--extsize", "200",
+  "--shift", "-100",
+  "--outdir", peakOutDir,
+  "-n", macs2Prefix,
+  "--keep-dup", "all"
+), stdout = TRUE, stderr = TRUE)
+cat(paste(tail(macs2_result, 15), collapse = "\n"), "\n")
+
+# ---- Read MACS2 peaks as GRanges ----
+peakFile <- file.path(peakOutDir, paste0(macs2Prefix, "_peaks.narrowPeak"))
+stopifnot("MACS2 narrowPeak output not found" = file.exists(peakFile))
+
+macs2Peaks <- makeGRangesFromDataFrame(
+  read.table(peakFile, col.names = c("chr", "start", "end", "name", "score",
+    "strand", "signalValue", "pValue", "qValue", "peak")),
+  keep.extra.columns = TRUE,
+  starts.in.df.are.0based = TRUE
+)
+
+# Clean up temp BED
+unlink(tmpBed)
+
+cat(sprintf("\nMACS2 called %d peaks\n", length(macs2Peaks)))
+cat(sprintf("Peak width: min %d, median %d, max %d bp\n",
+  min(width(macs2Peaks)), median(width(macs2Peaks)), max(width(macs2Peaks))))
+
+gc(verbose = FALSE)
+```
+
+```{r removeBlacklistRegions}
+# Remove peaks overlapping ENCODE blacklist regions
+nPeaksBefore <- length(macs2Peaks)
+
+macs2Peaks <- keepStandardChromosomes(macs2Peaks, pruning.mode = "coarse")
+macs2Peaks <- subsetByOverlaps(macs2Peaks, blacklist_hg38_unified, invert = TRUE)
+
+nPeaksAfter <- length(macs2Peaks)
+cat(sprintf("Peaks before blacklist filter: %d\n", nPeaksBefore))
+cat(sprintf("Peaks after blacklist filter: %d (%d removed)\n",
+  nPeaksAfter, nPeaksBefore - nPeaksAfter))
+```
+
+# Build New Peak-Count Matrix
+
+```{r subsetToATACCells}
+# Subset seuratNK to ATAC depth-passing cells BEFORE building the peak matrix.
+# This frees ~2+ GB of RNA/HT data for non-ATAC cells, which is critical on
+# a 24 GB machine where CreateChromatinAssay would otherwise OOM.
+
+# Clear nearest-neighbor graphs from preprocessing — they cause
+# "Please provide rownames to the matrix" error during Seurat v5 subsetting.
+for (g in names(seuratNK@graphs)) seuratNK@graphs[[g]] <- NULL
+
+nCellsBefore <- ncol(seuratNK)
+seuratNK <- seuratNK[, cellsPassATAC]
+cat(sprintf("Subset seuratNK to depth-passing ATAC cells: %d -> %d cells\n",
+  nCellsBefore, ncol(seuratNK)))
+
+# Free objects no longer needed
+rm(atacMeta, cellsFailATAC)
+gc(verbose = FALSE)
+```
+
+```{r buildPeakMatrix}
+cat("Building peak-count matrix from MACS2 peaks...\n")
+cat(sprintf("Total cells in seuratNK: %d\n", ncol(seuratNK)))
+
+# Process one pool at a time to avoid barcode collisions across pools
+# (same 10x barcodes reused in each pool) and reduce peak memory.
+peakCountsList <- list()
+for (i in seq_along(fragList)) {
+  poolName <- poolsInCompartment[i]
+  poolCells <- Cells(fragList[[i]])
+  cat(sprintf("  %s: %d cells ... ", poolName, length(poolCells)))
+
+  pc <- Signac::FeatureMatrix(
+    fragments = fragList[i],
+    features = macs2Peaks,
+    cells = poolCells,
+    verbose = FALSE
+  )
+
+  # Fix peak name format (chr1:100-200 -> chr1-100-200)
+  rownames(pc) <- gsub(":", "-", rownames(pc))
+
+  # Rename columns from bare barcodes to pool-prefixed merged names
+  mergedNames <- paste0(poolName, "_", colnames(pc))
+  # Only keep cells that exist in seuratNK
+  keep <- mergedNames %in% colnames(seuratNK)
+  pc <- pc[, keep, drop = FALSE]
+  colnames(pc) <- mergedNames[keep]
+
+  cat(sprintf("%d cells matched\n", ncol(pc)))
+  peakCountsList[[i]] <- pc
+  rm(pc); gc(verbose = FALSE)
+}
+
+peakCounts <- do.call(cbind, peakCountsList)
+rm(peakCountsList); gc(verbose = FALSE)
+
+# FeatureMatrix can return ngCMatrix (binary pattern matrix) — convert to
+# numeric dgCMatrix so CreateChromatinAssay stores actual count values.
+if (is(peakCounts, "ngCMatrix") || is(peakCounts, "lgCMatrix")) {
+  peakCounts <- as(peakCounts, "dgCMatrix")
+}
+
+stopifnot("No cells in peak matrix" = ncol(peakCounts) > 0)
+cat(sprintf("Peak matrix: %d peaks x %d cells\n",
+  nrow(peakCounts), ncol(peakCounts)))
+```
+
+```{r replaceATACAssay}
+# Create new ChromatinAssay with MACS2 peaks.
+# Pass pre-built GRanges via ranges= to bypass tidyr::separate() which hits
+# R 4.3 long vector limits on large matrices.
+peakNames <- rownames(peakCounts)
+parts <- do.call(rbind, strsplit(peakNames, "-"))
+peakRanges <- GRanges(
+  seqnames = parts[, 1],
+  ranges = IRanges(start = as.integer(parts[, 2]), end = as.integer(parts[, 3]))
+)
+
+newATAC <- CreateChromatinAssay(
+  counts = peakCounts,
+  ranges = peakRanges,
+  min.cells = 0,
+  min.features = 0
+)
+
+# Add annotation (fragments not attached here — Signac's Cells() returns bare
+# barcodes from Fragment objects regardless of cellMap, causing AddFragments to
+# fail. Fragments will be re-attached when needed for coverage/footprinting.)
+Annotation(newATAC) <- annotations
+
+# Replace the ATAC assay
+seuratNK[["ATAC"]] <- newATAC
+DefaultAssay(seuratNK) <- "ATAC"
+
+# Free intermediates no longer needed
+rm(newATAC, peakCounts)
+gc(verbose = FALSE)
+
+cat("Replaced ATAC assay with MACS2-called peaks\n")
+cat(sprintf("New ATAC assay: %d peaks x %d cells\n",
+  nrow(seuratNK[["ATAC"]]), ncol(seuratNK[["ATAC"]])))
+```
+
+# ATAC Normalization (LSI Pipeline)
+
+```{r lsiNormalization}
+DefaultAssay(seuratNK) <- "ATAC"
+
+seuratNK <- FindTopFeatures(seuratNK, min.cutoff = "q5")
+cat(sprintf("Variable features after q5 cutoff: %d of %d peaks\n",
+  length(VariableFeatures(seuratNK)), nrow(seuratNK[["ATAC"]])))
+
+seuratNK <- RunTFIDF(seuratNK)
+
+seuratNK <- RunSVD(seuratNK, n = 50)
+
+cat("LSI normalization complete (50 components)\n")
+```
+
+```{r harmonyIntegration}
+# Integrate across donors to remove donor-level technical variation
+# (library complexity, fragment depth) that can dominate the LSI embedding.
+seuratNK <- RunHarmony(
+  seuratNK,
+  group.by.vars = "donorID",
+  reduction = "lsi",
+  reduction.save = "harmony_lsi",
+  dims.use = 2:50,
+  project.dim = FALSE
+)
+cat("Harmony integration complete on LSI embedding\n")
+```
+
+```{r depthCorrelation, fig.height = 5, fig.width = 8}
+# Check correlation of LSI components with sequencing depth
+depthCorPlot <- DepthCor(seuratNK, n = 50)
+print(depthCorPlot)
+
+savePlot(
+  plot = depthCorPlot,
+  plotDir = plotDir,
+  filename = "NK_ATAC_LSI_DepthCor",
+  height = 5, width = 8
+)
+
+# Report correlation values for first few components
+lsiEmbeddings <- Embeddings(seuratNK, reduction = "lsi")
+atacCounts <- seuratNK$nCount_ATAC
+corValues <- sapply(1:min(10, ncol(lsiEmbeddings)), function(i) {
+  cor(lsiEmbeddings[, i], atacCounts[rownames(lsiEmbeddings)], use = "complete.obs")
+})
+cat("\nLSI component correlations with nCount_ATAC:\n")
+for (i in seq_along(corValues)) {
+  flag <- ifelse(abs(corValues[i]) > 0.7, " ** EXCLUDE **", "")
+  cat(sprintf("  Component %d: r = %.3f%s\n", i, corValues[i], flag))
+}
+```
+
+# ATAC UMAP
+
+```{r atacUMAP, fig.height = 6, fig.width = 8}
+lsiDimsToUse <- 2:30
+cat(sprintf("Running ATAC UMAP with LSI components %d-%d\n",
+  min(lsiDimsToUse), max(lsiDimsToUse)))
+
+set.seed(6022)
+seuratNK <- RunUMAP(
+  seuratNK,
+  reduction = "harmony_lsi",
+  dims = 1:29,
+  reduction.name = "umap.atac",
+  reduction.key = "atacUMAP_"
+)
+
+# Plot ATAC UMAP colored by various metadata
+pCluster <- DimPlot(seuratNK, reduction = "umap.atac",
+  group.by = "seurat_clusters", label = TRUE) +
+  ggtitle("NK ATAC UMAP: RNA clusters")
+
+pDonor <- DimPlot(seuratNK, reduction = "umap.atac",
+  group.by = "donorID", cols = palDonorId) +
+  ggtitle("NK ATAC UMAP: Donor")
+
+pVisit <- DimPlot(seuratNK, reduction = "umap.atac",
+  group.by = "visitNum", cols = palVisit) +
+  ggtitle("NK ATAC UMAP: Visit")
+
+(pCluster | pDonor) / (pVisit | plot_spacer())
+
+savePlot(
+  plot = (pCluster | pDonor) / (pVisit | plot_spacer()),
+  plotDir = plotDir,
+  filename = "NK_ATAC_UMAP_overview",
+  height = 10, width = 14
+)
+```
+
+# QC: New Peaks vs Cell Ranger Peaks
+
+```{r peakComparisonQC}
+cat("\n=== Peak Calling Comparison ===\n")
+cat(sprintf("MACS2 peaks (NK): %d\n", length(macs2Peaks)))
+cat(sprintf("  Total width: %s bp\n",
+  format(sum(width(macs2Peaks)), big.mark = ",")))
+cat(sprintf("  Mean width: %.0f bp\n", mean(width(macs2Peaks))))
+cat(sprintf("  Median width: %.0f bp\n", median(width(macs2Peaks))))
+
+# FRiP with new peaks
+newPeakCounts <- colSums(GetAssayData(seuratNK, assay = "ATAC", layer = "counts"))
+if ("cr_arc_atac_fragments" %in% colnames(seuratNK@meta.data)) {
+  totalFrags <- seuratNK$cr_arc_atac_fragments
+  cellsWithBoth <- !is.na(totalFrags) & !is.na(newPeakCounts) & totalFrags > 0
+  newFRiP <- newPeakCounts[cellsWithBoth] / totalFrags[cellsWithBoth]
+  cat(sprintf("\nFRiP with MACS2 peaks:\n"))
+  cat(sprintf("  Median: %.1f%%\n", 100 * median(newFRiP)))
+  cat(sprintf("  Mean: %.1f%%\n", 100 * mean(newFRiP)))
+}
+```
+
+# Save Peak Calling Bundle
+
+```{r saveBundle}
+peakCallingBundle_path <- file.path(dataOutputDir,
+  paste0(filenameSuffix, "_NK_peakCallingBundle.rds"))
+
+peakCallingBundle <- list(
+  seuratNK = seuratNK,
+  macs2Peaks = macs2Peaks,
+  atacMinFragments = atacMinFragments,
+  lsiDimsToUse = lsiDimsToUse,
+
+  # Carry forward from preprocessing
+  tcrGeneList = tcrGeneList,
+  palDonorId = palDonorId,
+  palVisit = palVisit,
+
+  # Metadata
+  dataDate = dataDate,
+  bundle_created = Sys.time(),
+  source_script = "P697_NKPeakCalling.rmd"
+)
+
+saveRDS(peakCallingBundle, file = peakCallingBundle_path)
+cat("NK peak calling bundle saved to:", peakCallingBundle_path, "\n")
+cat("Bundle contains:", paste(names(peakCallingBundle), collapse = ", "), "\n")
+```
+
+# Session Info
+
+```{r sessionInfo, results = "markup"}
+sessionInfo()
+```

@@ -6,9 +6,19 @@
 *.RData
 *.rds
 
+# Ignore table files
+*.csv
+*.xlsx
+*.xls
+*.mtx
+
 # Ignore h5 files
 *.h5ad
 *.h5Seurat
+
+# Ignore large data files
+*.narrowPeak
+*.bed
 
 # Ignore R history files
 .Rhistory
@@ -37,3 +47,4 @@ renv/staging/
 *.tbi
 *.sorted
 data/.DS_Store
+.DS_Store

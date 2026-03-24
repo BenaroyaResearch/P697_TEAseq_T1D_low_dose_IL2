@@ -1,0 +1,755 @@
+---
+title: "P697: WNN Multimodal Analysis (RNA + ATAC)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+setwd("/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+library(knitr)
+library(dplyr)
+library(tibble)
+library(ggplot2)
+library(viridis)
+library(stringr)
+library(patchwork)
+library(Seurat)
+library(Signac)
+library(ggpointdensity)
+library(RColorBrewer)
+library(cowplot)
+library(cluster)
+library(ComplexHeatmap)
+library(circlize)
+
+theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, size = 1),
+      axis.text = element_text(colour = "black"),
+      axis.ticks = element_line(colour = "black"),
+      legend.key = element_blank(),
+      strip.text.x = element_text(size = 14, margin = margin(b = 2, t = 2)),
+      strip.background = element_rect(fill = "white", colour = "black")))
+
+opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE,
+  warning = FALSE, message = FALSE, cache.lazy = FALSE, results = "hide")
+opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
+
+options(stringsAsFactors = FALSE)
+options(future.globals.maxSize = 1591289600)
+```
+
+# Setup
+
+```{r setUpDirectories}
+projNumber <- "P697"
+baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
+dataInputDir <- file.path(baseDir, "data/inputData")
+plotDir <- file.path(baseDir, "figures")
+dataOutputDir <- file.path(baseDir, "data/outputData")
+dataDate <- Sys.Date()
+filenameSuffix <- paste0(projNumber, ".", dataDate)
+```
+
+```{r setupFunctions}
+source(file.path(getwd(), "code/P697_functions.R"))
+```
+
+# Load Peak Calling Bundles
+
+```{r loadBundles}
+compartments <- c("NK", "Treg")
+seuratList <- list()
+macs2PeaksList <- list()
+
+for (comp in compartments) {
+  pattern <- sprintf("P697\\..*_%s_peakCallingBundle\\.rds$", comp)
+  bundleFiles <- list.files(dataOutputDir, pattern = pattern, full.names = TRUE)
+  bundleFile <- bundleFiles[which.max(file.mtime(bundleFiles))]
+  cat(sprintf("Loading %s bundle: %s\n", comp, basename(bundleFile)))
+
+  bundle <- readRDS(bundleFile)
+
+  objName <- paste0("seurat", comp)
+  seuratList[[comp]] <- bundle[[objName]]
+  macs2PeaksList[[comp]] <- bundle$macs2Peaks
+
+  if (comp == compartments[1]) {
+    tcrGeneList <- bundle$tcrGeneList
+    palDonorId <- bundle$palDonorId
+    palVisit <- bundle$palVisit
+  }
+
+  cat(sprintf("  %s: %d cells, assays: %s\n", comp,
+    ncol(seuratList[[comp]]),
+    paste(names(seuratList[[comp]]@assays), collapse = ", ")))
+  cat(sprintf("  Reductions: %s\n",
+    paste(names(seuratList[[comp]]@reductions), collapse = ", ")))
+
+  rm(bundle); gc(verbose = FALSE)
+}
+```
+
+# Create Treatment Phase Variable
+
+```{r createTreatmentPhase}
+# Map visitNum to treatment phase based on trial design:
+#   LD IL-2 treatment → stopped → RAPA treatment → stopped → washout
+#   V0:  Baseline (pre-treatment)
+#   V4/5: End of IL-2 phase (Post-IL2)
+#   V8/10: End of RAPA phase (Post-RAPA)
+#   V12: ~6 months after all treatment cessation (Washout)
+treatmentPhaseMap <- c(
+  "0" = "Baseline",
+  "4" = "Post-IL2", "5" = "Post-IL2",
+  "8" = "Post-RAPA", "10" = "Post-RAPA",
+  "12" = "Washout"
+)
+
+palTreatmentPhase <- c(
+  "Baseline" = "#4DAF4A",
+  "Post-IL2" = "#377EB8",
+  "Post-RAPA" = "#FF7F00",
+  "Washout" = "#984EA3"
+)
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  seuratObj$treatmentPhase <- factor(
+    unname(treatmentPhaseMap[as.character(seuratObj$visitNum)]),
+    levels = c("Baseline", "Post-IL2", "Post-RAPA", "Washout")
+  )
+
+  cat(sprintf("\n%s treatmentPhase distribution:\n", comp))
+  print(table(seuratObj$treatmentPhase, seuratObj$donorID))
+
+  nNA <- sum(is.na(seuratObj$treatmentPhase))
+  if (nNA > 0) cat(sprintf("  WARNING: %d cells with unmapped visitNum\n", nNA))
+
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj)
+```
+
+# Recompute RNA UMAP on Subset
+
+```{r recomputeRNAUMAP}
+# The RNA UMAP from preprocessing was computed on all cells (including
+# non-ATAC-passing). After subsetting in peak calling, coordinates are stale.
+# Recompute for fair comparison with ATAC and WNN UMAPs.
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  set.seed(6022)
+  seuratObj <- RunUMAP(
+    seuratObj,
+    reduction = "harmony",
+    dims = 1:18,
+    reduction.name = "umap.rna",
+    reduction.key = "rnaUMAP_",
+    verbose = FALSE
+  )
+
+  cat(sprintf("%s: RNA UMAP recomputed (%d cells)\n", comp, ncol(seuratObj)))
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj); gc(verbose = FALSE)
+```
+
+# WNN Integration
+
+```{r wnnIntegration}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  cat(sprintf("\n%s: Running FindMultiModalNeighbors...\n", comp))
+  cat(sprintf("  RNA: harmony (dims 1:18)\n"))
+  cat(sprintf("  ATAC: harmony_lsi (dims 1:29)\n"))
+
+  seuratObj <- FindMultiModalNeighbors(
+    seuratObj,
+    reduction.list = list("harmony", "harmony_lsi"),
+    dims.list = list(1:18, 1:29),
+    modality.weight.name = c("RNA.weight", "ATAC.weight"),
+    verbose = FALSE
+  )
+
+  cat(sprintf("  Median RNA weight: %.3f\n", median(seuratObj$RNA.weight)))
+  cat(sprintf("  Median ATAC weight: %.3f\n", median(seuratObj$ATAC.weight)))
+
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj); gc(verbose = FALSE)
+```
+
+# WNN UMAP
+
+```{r wnnUMAP}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  set.seed(6022)
+  seuratObj <- RunUMAP(
+    seuratObj,
+    nn.name = "weighted.nn",
+    reduction.name = "umap.wnn",
+    reduction.key = "wnnUMAP_",
+    verbose = FALSE
+  )
+
+  cat(sprintf("%s: WNN UMAP computed\n", comp))
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj); gc(verbose = FALSE)
+```
+
+# WNN Clustering Evaluation
+
+```{r evaluateResolutions}
+resolutions <- seq(0.1, 2.0, by = 0.1)
+evalResults <- list()
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  # Build combined scaled embedding for silhouette computation
+  rnaEmbed <- scale(Embeddings(seuratObj, "harmony")[, 1:18])
+  atacEmbed <- scale(Embeddings(seuratObj, "harmony_lsi")[, 1:29])
+  combinedEmbed <- cbind(rnaEmbed, atacEmbed)
+  rm(rnaEmbed, atacEmbed)
+
+  # Subsample for efficiency
+  set.seed(42)
+  nSample <- min(3000, nrow(combinedEmbed))
+  sampleIdx <- sample(nrow(combinedEmbed), nSample)
+  distSub <- dist(combinedEmbed[sampleIdx, ])
+  rm(combinedEmbed)
+
+  metrics <- data.frame(
+    resolution = resolutions,
+    nClusters = NA_integer_,
+    meanSilhouette = NA_real_
+  )
+
+  cat(sprintf("\n%s: evaluating %d resolutions...\n", comp, length(resolutions)))
+  for (j in seq_along(resolutions)) {
+    res <- resolutions[j]
+    seuratObj <- FindClusters(seuratObj, graph.name = "wsnn",
+      resolution = res, verbose = FALSE)
+    clusters <- as.integer(seuratObj$seurat_clusters)
+    clustersSub <- clusters[sampleIdx]
+    nUnique <- length(unique(clustersSub))
+
+    metrics$nClusters[j] <- length(unique(clusters))
+
+    if (nUnique > 1 && nUnique < nSample) {
+      sil <- cluster::silhouette(clustersSub, distSub)
+      metrics$meanSilhouette[j] <- mean(sil[, 3])
+    }
+
+    cat(sprintf("  res %.1f: %d clusters, sil %.3f\n",
+      res, metrics$nClusters[j],
+      ifelse(is.na(metrics$meanSilhouette[j]), NA, metrics$meanSilhouette[j])))
+  }
+
+  evalResults[[comp]] <- metrics
+  seuratList[[comp]] <- seuratObj
+  rm(distSub)
+}
+rm(seuratObj); gc(verbose = FALSE)
+```
+
+```{r clusterMetricsPlot, fig.height = 5, fig.width = 12}
+allMetrics <- bind_rows(
+  lapply(compartments, function(comp) {
+    evalResults[[comp]] %>% mutate(compartment = comp)
+  })
+)
+
+pSil <- ggplot(allMetrics, aes(x = resolution, y = meanSilhouette, color = compartment)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("NK" = "#E41A1C", "Treg" = "#377EB8")) +
+  labs(x = "Resolution", y = "Mean Silhouette Width",
+    title = "WNN Clustering: Silhouette") +
+  theme(legend.position = "bottom")
+
+pNCl <- ggplot(allMetrics, aes(x = resolution, y = nClusters, color = compartment)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("NK" = "#E41A1C", "Treg" = "#377EB8")) +
+  labs(x = "Resolution", y = "Number of Clusters",
+    title = "WNN Clustering: Cluster Count") +
+  theme(legend.position = "bottom")
+
+pSil | pNCl
+
+savePlot(plot = pSil | pNCl, plotDir = plotDir,
+  filename = "WNN_clusterMetrics", height = 5, width = 12)
+
+for (comp in compartments) {
+  bestIdx <- which.max(evalResults[[comp]]$meanSilhouette)
+  cat(sprintf("%s best silhouette: res %.1f → %d clusters (sil = %.3f)\n",
+    comp, evalResults[[comp]]$resolution[bestIdx],
+    evalResults[[comp]]$nClusters[bestIdx],
+    evalResults[[comp]]$meanSilhouette[bestIdx]))
+}
+```
+
+# Select Final Resolution
+
+```{r selectResolution}
+# Default: resolution with highest mean silhouette.
+# Override by uncommenting the manual lines below after inspecting the metrics.
+selectedRes <- list()
+for (comp in compartments) {
+  bestIdx <- which.max(evalResults[[comp]]$meanSilhouette)
+  selectedRes[[comp]] <- evalResults[[comp]]$resolution[bestIdx]
+}
+
+# Manual override (uncomment to use):
+# selectedRes[["NK"]] <- 0.5
+# selectedRes[["Treg"]] <- 0.5
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  seuratObj <- FindClusters(seuratObj, graph.name = "wsnn",
+    resolution = selectedRes[[comp]], verbose = FALSE)
+
+  seuratObj$wnn_clusters <- seuratObj$seurat_clusters
+
+  cat(sprintf("\n%s: %d WNN clusters at resolution %.2f\n",
+    comp, length(unique(seuratObj$wnn_clusters)), selectedRes[[comp]]))
+  print(table(seuratObj$wnn_clusters))
+
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj); gc(verbose = FALSE)
+```
+
+# WNN Visualization {.tabset}
+
+## Overview UMAPs
+
+```{r overviewUMAPs, fig.height = 5, fig.width = 18}
+# Side-by-side RNA, ATAC, and WNN UMAPs colored by WNN clusters
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  pRNA <- DimPlot(seuratObj, reduction = "umap.rna",
+    group.by = "wnn_clusters", label = TRUE, repel = TRUE) +
+    ggtitle(paste(comp, "— RNA UMAP")) + NoLegend()
+
+  pATAC <- DimPlot(seuratObj, reduction = "umap.atac",
+    group.by = "wnn_clusters", label = TRUE, repel = TRUE) +
+    ggtitle(paste(comp, "— ATAC UMAP")) + NoLegend()
+
+  pWNN <- DimPlot(seuratObj, reduction = "umap.wnn",
+    group.by = "wnn_clusters", label = TRUE, repel = TRUE) +
+    ggtitle(paste(comp, "— WNN UMAP"))
+
+  print(pRNA | pATAC | pWNN)
+
+  savePlot(plot = pRNA | pATAC | pWNN, plotDir = plotDir,
+    filename = paste0(comp, "_WNN_UMAP_overview"),
+    height = 5, width = 18)
+}
+```
+
+## WNN UMAP by Metadata
+
+```{r wnnMetadataUMAPs, fig.height = 10, fig.width = 14}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  pClust <- DimPlot(seuratObj, reduction = "umap.wnn",
+    group.by = "wnn_clusters", label = TRUE, repel = TRUE) +
+    ggtitle("WNN Clusters")
+
+  pDonor <- DimPlot(seuratObj, reduction = "umap.wnn",
+    group.by = "donorID", cols = palDonorId) +
+    ggtitle("Donor")
+
+  pPhase <- DimPlot(seuratObj, reduction = "umap.wnn",
+    group.by = "treatmentPhase", cols = palTreatmentPhase) +
+    ggtitle("Treatment Phase")
+
+  pVisit <- DimPlot(seuratObj, reduction = "umap.wnn",
+    group.by = "visitNum", cols = palVisit) +
+    ggtitle("Visit")
+
+  combined <- (pClust | pDonor) / (pPhase | pVisit)
+  print(combined)
+
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_WNN_UMAP_metadata"),
+    height = 10, width = 14)
+}
+```
+
+## WNN UMAP Faceted by Phase
+
+```{r wnnUMAPByPhase, fig.height = 5, fig.width = 20}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  pFaceted <- DimPlot(seuratObj, reduction = "umap.wnn",
+    group.by = "wnn_clusters", split.by = "treatmentPhase",
+    label = TRUE, repel = TRUE, ncol = 4) +
+    ggtitle(paste(comp, "— WNN Clusters by Treatment Phase"))
+
+  print(pFaceted)
+
+  savePlot(plot = pFaceted, plotDir = plotDir,
+    filename = paste0(comp, "_WNN_UMAP_byPhase"),
+    height = 5, width = 20)
+}
+```
+
+## Modality Weights
+
+```{r modalityWeights, fig.height = 8, fig.width = 10}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  pDens <- ggplot(seuratObj@meta.data, aes(x = RNA.weight)) +
+    geom_density(fill = "#377EB8", alpha = 0.5) +
+    geom_vline(xintercept = 0.5, linetype = "dashed") +
+    labs(x = "RNA Weight (ATAC Weight = 1 - RNA Weight)", y = "Density",
+      title = paste(comp, "— Modality Weight Distribution")) +
+    xlim(0, 1)
+
+  pViolin <- VlnPlot(seuratObj, features = "RNA.weight",
+    group.by = "wnn_clusters", pt.size = 0) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    ggtitle(paste(comp, "— RNA Weight per WNN Cluster")) +
+    NoLegend()
+
+  print(pDens / pViolin)
+
+  savePlot(plot = pDens / pViolin, plotDir = plotDir,
+    filename = paste0(comp, "_WNN_modalityWeights"),
+    height = 8, width = 10)
+}
+```
+
+# WNN vs RNA Cluster Comparison
+
+```{r clusterComparison, fig.height = 6, fig.width = 8}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  # Find RNA cluster column from preprocessing
+  rnaClusCol <- intersect(
+    c("seurat_clusters_RNA_0p3", "RNA_snn_res.0.3", "seurat_clusters"),
+    colnames(seuratObj@meta.data)
+  )
+
+  if (length(rnaClusCol) == 0) {
+    cat(sprintf("%s: no RNA cluster column found, skipping comparison\n", comp))
+    next
+  }
+  rnaClusCol <- rnaClusCol[1]
+  cat(sprintf("%s: comparing WNN clusters to RNA clusters (%s)\n", comp, rnaClusCol))
+
+  ct <- table(
+    RNA = seuratObj@meta.data[[rnaClusCol]],
+    WNN = seuratObj$wnn_clusters
+  )
+  ctProp <- prop.table(ct, margin = 1)
+  ctDf <- as.data.frame(ctProp)
+  colnames(ctDf) <- c("RNA_cluster", "WNN_cluster", "Proportion")
+
+  pHeat <- ggplot(ctDf, aes(x = WNN_cluster, y = RNA_cluster, fill = Proportion)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.0f%%", 100 * Proportion)),
+      size = 3, color = "black") +
+    scale_fill_gradient(low = "white", high = "#377EB8") +
+    labs(x = "WNN Cluster", y = "RNA Cluster",
+      title = paste(comp, "— RNA → WNN Cluster Mapping"))
+
+  print(pHeat)
+
+  savePlot(plot = pHeat, plotDir = plotDir,
+    filename = paste0(comp, "_WNN_vs_RNA_clusters"),
+    height = 6, width = 8)
+}
+```
+
+# WNN Cluster Characterization
+
+```{r clusterMarkers}
+allMarkers <- list()
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+  Idents(seuratObj) <- "wnn_clusters"
+
+  cat(sprintf("\n%s: Finding markers for %d WNN clusters...\n",
+    comp, length(unique(seuratObj$wnn_clusters))))
+
+  markers <- FindAllMarkers(
+    seuratObj,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25,
+    test.use = "wilcox",
+    verbose = FALSE
+  )
+
+  nSig <- sum(markers$p_val_adj < 0.05)
+  cat(sprintf("  %d significant markers (p_val_adj < 0.05)\n", nSig))
+
+  allMarkers[[comp]] <- markers
+}
+```
+
+```{r markerDotplots, fig.height = 6, fig.width = 12}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  markers <- allMarkers[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+  Idents(seuratObj) <- "wnn_clusters"
+
+  topMarkers <- markers %>%
+    dplyr::filter(p_val_adj < 0.05) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) %>%
+    ungroup()
+
+  if (nrow(topMarkers) > 0) {
+    topGenes <- unique(topMarkers$gene)
+
+    pDot <- createGeneDotPlot(
+      seuratObj = seuratObj,
+      genes = topGenes,
+      groupBy = "wnn_clusters",
+      title = paste0(comp, " — Top WNN Cluster Markers (",
+        length(unique(seuratObj$wnn_clusters)), " clusters)"),
+      xlab = "Marker Genes",
+      ylab = "WNN Cluster",
+      plotDir = plotDir,
+      filename = paste0(comp, "_WNN_clusterMarkers_dotplot"),
+      orderGenes = TRUE,
+      height = 6,
+      width = max(10, 4 + length(topGenes) * 0.25)
+    )
+
+    if (!is.null(pDot)) print(pDot)
+  }
+}
+```
+
+## Marker Heatmap by Treatment Phase
+
+```{r markerHeatmapByPhase, fig.height = 8, fig.width = 12}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  markers <- allMarkers[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  topMarkers <- markers %>%
+    dplyr::filter(p_val_adj < 0.05) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) %>%
+    ungroup()
+
+  if (nrow(topMarkers) == 0) next
+  topGenes <- unique(topMarkers$gene)
+
+  # Get scaled expression for marker genes
+  seuratObj <- ScaleData(seuratObj, features = topGenes, verbose = FALSE)
+  matScaled <- as.matrix(GetAssayData(seuratObj, layer = "scale.data")[topGenes, , drop = FALSE])
+
+  # Order cells by treatment phase, then by WNN cluster within phase
+  cellOrder <- order(seuratObj$treatmentPhase, seuratObj$wnn_clusters)
+  matScaled <- matScaled[, cellOrder]
+
+  # Clamp extreme values for visualization
+  matScaled[matScaled > 2.5] <- 2.5
+  matScaled[matScaled < -2.5] <- -2.5
+
+  # Build annotations
+  phaseOrdered <- seuratObj$treatmentPhase[cellOrder]
+  clusterOrdered <- factor(seuratObj$wnn_clusters[cellOrder])
+
+  htAnnot <- ComplexHeatmap::HeatmapAnnotation(
+    Phase = phaseOrdered,
+    Cluster = clusterOrdered,
+    col = list(
+      Phase = palTreatmentPhase,
+      Cluster = setNames(
+        scales::hue_pal()(length(levels(clusterOrdered))),
+        levels(clusterOrdered))
+    ),
+    show_annotation_name = TRUE,
+    annotation_name_side = "left",
+    annotation_legend_param = list(
+      Phase = list(title = "Treatment Phase"),
+      Cluster = list(title = "WNN Cluster")
+    )
+  )
+
+  ht <- ComplexHeatmap::Heatmap(matScaled,
+    name = "z-score",
+    top_annotation = htAnnot,
+    column_split = phaseOrdered,
+    cluster_columns = FALSE,
+    show_column_names = FALSE,
+    row_names_gp = grid::gpar(fontsize = 8),
+    column_title_gp = grid::gpar(fontsize = 10),
+    column_title_rot = 0,
+    col = colorRamp2(c(-2.5, 0, 2.5), c("blue", "white", "red")),
+    column_title = paste0(comp, " — Marker Genes by Treatment Phase"),
+    heatmap_legend_param = list(title = "z-score"),
+    use_raster = TRUE,
+    raster_quality = 3
+  )
+
+  ComplexHeatmap::draw(ht)
+
+  pdf(file.path(plotDir, paste0(filenameSuffix, "_", comp,
+    "_WNN_markerHeatmap_byPhase.pdf")), width = 12, height = 8)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+
+  png(file.path(plotDir, paste0(filenameSuffix, "_", comp,
+    "_WNN_markerHeatmap_byPhase.png")),
+    width = 12, height = 8, units = "in", res = 600)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+}
+```
+
+## Marker Heatmap by Visit
+
+```{r markerHeatmapByVisit, fig.height = 8, fig.width = 14}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  markers <- allMarkers[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  topMarkers <- markers %>%
+    dplyr::filter(p_val_adj < 0.05) %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) %>%
+    ungroup()
+
+  if (nrow(topMarkers) == 0) next
+  topGenes <- unique(topMarkers$gene)
+
+  # Get scaled expression for marker genes
+  seuratObj <- ScaleData(seuratObj, features = topGenes, verbose = FALSE)
+  matScaled <- as.matrix(GetAssayData(seuratObj, layer = "scale.data")[topGenes, , drop = FALSE])
+
+  # Order cells by visitNum, then by WNN cluster within visit
+  visitFactor <- factor(seuratObj$visitNum,
+    levels = sort(unique(as.numeric(as.character(seuratObj$visitNum)))))
+  cellOrder <- order(visitFactor, seuratObj$wnn_clusters)
+  matScaled <- matScaled[, cellOrder]
+
+  matScaled[matScaled > 2.5] <- 2.5
+  matScaled[matScaled < -2.5] <- -2.5
+
+  visitOrdered <- visitFactor[cellOrder]
+  clusterOrdered <- factor(seuratObj$wnn_clusters[cellOrder])
+  phaseOrdered <- seuratObj$treatmentPhase[cellOrder]
+
+  htAnnot <- ComplexHeatmap::HeatmapAnnotation(
+    Visit = visitOrdered,
+    Phase = phaseOrdered,
+    Cluster = clusterOrdered,
+    col = list(
+      Visit = palVisit,
+      Phase = palTreatmentPhase,
+      Cluster = setNames(
+        scales::hue_pal()(length(levels(clusterOrdered))),
+        levels(clusterOrdered))
+    ),
+    show_annotation_name = TRUE,
+    annotation_name_side = "left",
+    annotation_legend_param = list(
+      Visit = list(title = "Visit"),
+      Phase = list(title = "Treatment Phase"),
+      Cluster = list(title = "WNN Cluster")
+    )
+  )
+
+  ht <- ComplexHeatmap::Heatmap(matScaled,
+    name = "z-score",
+    top_annotation = htAnnot,
+    column_split = visitOrdered,
+    cluster_columns = FALSE,
+    show_column_names = FALSE,
+    row_names_gp = grid::gpar(fontsize = 8),
+    column_title_gp = grid::gpar(fontsize = 10),
+    column_title_rot = 0,
+    col = colorRamp2(c(-2.5, 0, 2.5), c("blue", "white", "red")),
+    column_title = paste0(comp, " — Marker Genes by Visit"),
+    heatmap_legend_param = list(title = "z-score"),
+    use_raster = TRUE,
+    raster_quality = 3
+  )
+
+  ComplexHeatmap::draw(ht)
+
+  pdf(file.path(plotDir, paste0(filenameSuffix, "_", comp,
+    "_WNN_markerHeatmap_byVisit.pdf")), width = 14, height = 8)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+
+  png(file.path(plotDir, paste0(filenameSuffix, "_", comp,
+    "_WNN_markerHeatmap_byVisit.png")),
+    width = 14, height = 8, units = "in", res = 600)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+}
+```
+
+# Save WNN Bundle
+
+```{r saveBundle}
+wnnBundle_path <- file.path(dataOutputDir,
+  paste0(filenameSuffix, "_WNN_bundle.rds"))
+
+wnnBundle <- list(
+  seuratNK = seuratList[["NK"]],
+  seuratTreg = seuratList[["Treg"]],
+  macs2PeaksNK = macs2PeaksList[["NK"]],
+  macs2PeaksTreg = macs2PeaksList[["Treg"]],
+  wnnResolution = selectedRes,
+  clusterMarkers = allMarkers,
+  evalResults = evalResults,
+
+  # Carry forward
+  tcrGeneList = tcrGeneList,
+  palDonorId = palDonorId,
+  palVisit = palVisit,
+  palTreatmentPhase = palTreatmentPhase,
+
+  # Metadata
+  dataDate = dataDate,
+  bundle_created = Sys.time(),
+  source_script = "P697_WNN.rmd"
+)
+
+saveRDS(wnnBundle, file = wnnBundle_path)
+cat("WNN bundle saved to:", wnnBundle_path, "\n")
+cat("Bundle contains:", paste(names(wnnBundle), collapse = ", "), "\n")
+```
+
+# Session Info
+
+```{r sessionInfo, results = "markup"}
+sessionInfo()
+```
