@@ -36,7 +36,7 @@ library(ggvenn)
 library(viridis)
 library(stringr)
 library(tidyverse)
-library(readxl)
+# library(readxl)
 library(openxlsx)
 library(kableExtra)
 library(RColorBrewer)
@@ -110,7 +110,7 @@ baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
 dataInputDir <- file.path(baseDir, "data/inputData")
 plotDir <- file.path(baseDir, "figures")
 dataOutputDir <- file.path(baseDir, "data/outputData")
-dataDate <- "2026-03-11"
+dataDate <- "2026-03-30"
 filenameSuffix <- paste0(projNumber, ".", dataDate)
 
 ## ---------------------------------------------------------------------------
@@ -2225,7 +2225,7 @@ annoP697_1_file <- file.path(dataInputDir,
   "LabDB _ P697-1_ TEAseq studies on samples from a low dose IL-2 trial in T1D.xlsx")
 
 if (file.exists(annoP697_1_file)) {
-  annoP697_1 <- read_excel(annoP697_1_file)
+  annoP697_1 <- openxlsx::read.xlsx(annoP697_1_file)
   colnames(annoP697_1) <- cleanColumnNames(colnames(annoP697_1))
   annoP697_1$subproject <- "P697-1"
   cat(sprintf("  P697-1: Loaded %d rows from LabDB file\n", nrow(annoP697_1)))
@@ -2240,7 +2240,7 @@ annoP697_2_file <- file.path(dataInputDir,
   "LabDB _ P697-2_ TEAseq studies on samples from a low dose IL-2 trial in T1D.xlsx")
 
 if (file.exists(annoP697_2_file)) {
-  annoP697_2 <- read_excel(annoP697_2_file)
+  annoP697_2 <- openxlsx::read.xlsx(annoP697_2_file)
   colnames(annoP697_2) <- cleanColumnNames(colnames(annoP697_2))
   annoP697_2$subproject <- "P697-2"
   cat(sprintf("  P697-2: Loaded %d rows from LabDB file\n", nrow(annoP697_2)))
@@ -2260,10 +2260,12 @@ if (!is.null(annoP697_1) && !is.null(annoP697_2)) {
   if (length(commonCols) > 15) cat(sprintf("    ... and %d more\n", length(commonCols) - 15))
 
   # Combine using all common columns
+  # Coerce all columns to character first to avoid type-mismatch errors
+  # (e.g., double vs. character for numeric-looking columns), then re-infer types
   annoP697 <- bind_rows(
-    annoP697_1 %>% dplyr::select(all_of(commonCols)),
-    annoP697_2 %>% dplyr::select(all_of(commonCols))
-  )
+    annoP697_1 %>% dplyr::select(all_of(commonCols)) %>% dplyr::mutate(dplyr::across(everything(), as.character)),
+    annoP697_2 %>% dplyr::select(all_of(commonCols)) %>% dplyr::mutate(dplyr::across(everything(), as.character))
+  ) %>% type.convert(as.is = TRUE)
 
   # set visit as a character
   annoP697$visitNum <- as.character(annoP697$visitNum)
@@ -3372,7 +3374,7 @@ seuratBarcodes <- seuratQCMergedCleaned@meta.data$barcode
 
 for (level in cellTypist_levels) {
   # Construct filename for current level
-  filename <- paste0("20260204_P697_celltypist_", level, "_predictions.csv")
+  filename <- paste0("20260330_P697_celltypist_", level, "_predictions.csv")
   filepath <- file.path(dataOutputDir, filename)
 
   # Check if file exists before trying to load it
@@ -3595,20 +3597,20 @@ savePlot(
   formats = c("pdf", "png")
 )
 
-# It looks like we can exclude cells with UMAP 2 greater than 6.
+# It looks like we can exclude cells with UMAP 2 greater than 10.
 # Let's find those barcodes, determine which donor/stim they are all from, and then remove them from
 # the Seurat object
 
-# Identify and remove cells with UMAP_2 > 6
+# Identify and remove cells with UMAP_2 > 10
 umapCoords.tmp <- as.data.frame(Embeddings(seuratQCMergedCleaned, reduction = "umap"))
 colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
 umapCoords.tmp$barcode <- rownames(umapCoords.tmp)
 
 # Find barcodes to exclude
 excludeBarcodes.tmp <- umapCoords.tmp %>%
-  dplyr::filter(UMAP_2 > 6) %>%
+  dplyr::filter(UMAP_2 > 10) %>%
   dplyr::pull(barcode)
-length(excludeBarcodes.tmp) # 227
+length(excludeBarcodes.tmp) # 238
 
 # save excluded barcodes
 write.csv(excludeBarcodes.tmp, file.path(dataOutputDir, "barcodesSuspectedBCellsOrDCsToExclude.csv"), row.names = FALSE)
@@ -4031,23 +4033,23 @@ savePlot(
 )
 
 # Split into Treg and NK compartments based on UMAP_1 coordinate
-# Treg cells: UMAP_1 > 0
-# NK cells: UMAP_1 < 0
+# Treg cells: UMAP_1 < 0
+# NK cells: UMAP_1 > 0
 
 # Get UMAP coordinates
 umapCoords.tmp <- as.data.frame(Embeddings(seuratMergedIntegrated, reduction = "umap"))
 colnames(umapCoords.tmp) <- c("UMAP_1", "UMAP_2")
 umapCoords.tmp$barcode <- rownames(umapCoords.tmp)
 
-# Identify Treg barcodes (UMAP_1 > 0)
+# Identify Treg barcodes (UMAP_1 < 0)
 tregBarcodes.tmp <- umapCoords.tmp %>%
-  dplyr::filter(UMAP_1 > 0) %>%
+  dplyr::filter(UMAP_1 < 0) %>%
   dplyr::pull(barcode)
 length(tregBarcodes.tmp)
 
-# Identify NK barcodes (UMAP_1 < 0)
+# Identify NK barcodes (UMAP_1 > 0)
 nkBarcodes.tmp <- umapCoords.tmp %>%
-  dplyr::filter(UMAP_1 < 0) %>%
+  dplyr::filter(UMAP_1 > 0) %>%
   dplyr::pull(barcode)
 length(nkBarcodes.tmp)
 

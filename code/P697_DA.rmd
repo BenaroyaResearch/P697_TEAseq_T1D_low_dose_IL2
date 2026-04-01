@@ -83,10 +83,21 @@ seuratList <- list(
 )
 compartments <- c("NK", "Treg")
 
+# TODO: clean up this hack rename stuff after we regenerate the bundle
+# Rename Washout → Followup to match updated nomenclature
+for (comp in compartments) {
+  lvls <- levels(seuratList[[comp]]$treatmentPhase)
+  if ("Washout" %in% lvls) {
+    levels(seuratList[[comp]]$treatmentPhase)[lvls == "Washout"] <- "Followup"
+    cat(sprintf("  %s: renamed Washout → Followup in factor levels\n", comp))
+  }
+}
+
 # Palettes
 palDonorId <- wnnBundle$palDonorId
 palVisit <- wnnBundle$palVisit
 palTreatmentPhase <- wnnBundle$palTreatmentPhase
+names(palTreatmentPhase) <- gsub("Washout", "Followup", names(palTreatmentPhase))
 
 for (comp in compartments) {
   cat(sprintf("%s: %d cells, %d WNN clusters\n",
@@ -94,7 +105,8 @@ for (comp in compartments) {
     length(unique(seuratList[[comp]]$wnn_clusters))))
 }
 
-rm(wnnBundle); gc(verbose = FALSE)
+rm(wnnBundle)
+gc(verbose = FALSE)
 ```
 
 # Define Contrasts
@@ -104,9 +116,11 @@ rm(wnnBundle); gc(verbose = FALSE)
 contrastDefs <- list(
   PostIL2_vs_BL    = c("Post-IL2", "Baseline"),
   PostRAPA_vs_BL   = c("Post-RAPA", "Baseline"),
-  Washout_vs_BL    = c("Washout", "Baseline"),
+  Followup_vs_BL    = c("Followup", "Baseline"),
   PostRAPA_vs_PostIL2  = c("Post-RAPA", "Post-IL2"),
-  Washout_vs_PostRAPA  = c("Washout", "Post-RAPA")
+  Followup_vs_PostRAPA  = c("Followup", "Post-RAPA"),
+  PostIL2_vs_Followup  = c("Post-IL2", "Followup"),
+  PostRAPA_vs_Followup = c("Post-RAPA", "Followup")
 )
 
 cat("Contrasts defined:\n")
@@ -149,7 +163,6 @@ aggregatePseudobulk <- function(countMat, metadata, groupCols) {
 # Run limma-voom DGE/DA with paired donor design
 runLimmaVoom <- function(aggCounts, designInfo, contrastDefs,
                          filterExpr = TRUE, minCellsPerGroup = 3) {
-
   # Require minimum cells per group
   keep <- designInfo$nCells >= minCellsPerGroup
   if (sum(!keep) > 0) {
@@ -160,7 +173,7 @@ runLimmaVoom <- function(aggCounts, designInfo, contrastDefs,
 
   # Paired design: ~ 0 + treatmentPhase + donorID
   designInfo$treatmentPhase <- factor(designInfo$treatmentPhase,
-    levels = c("Baseline", "Post-IL2", "Post-RAPA", "Washout"))
+    levels = c("Baseline", "Post-IL2", "Post-RAPA", "Followup"))
   designInfo$donorID <- factor(designInfo$donorID)
 
   design <- model.matrix(~ 0 + treatmentPhase + donorID, data = designInfo)
@@ -316,7 +329,7 @@ for (comp in compartments) {
 
   savePlot(plot = combined, plotDir = plotDir,
     filename = paste0(comp, "_RNA_DGE_volcanos"),
-    height = 6 * nRows, width = 6 * nCols)
+    height = 6 * nRows, width = 6.5 * nCols)
 }
 ```
 
@@ -401,7 +414,7 @@ for (comp in compartments) {
 
   savePlot(plot = combined, plotDir = plotDir,
     filename = paste0(comp, "_ATAC_DA_volcanos"),
-    height = 5 * nRows, width = 5 * nCols)
+    height = 6 * nRows, width = 7 * nCols)
 }
 ```
 
@@ -472,7 +485,10 @@ for (comp in compartments) {
 
     result <- tryCatch(
       runLimmaVoom(agg$counts, agg$designInfo, contrastDefs),
-      error = function(e) { cat(sprintf("    Error: %s\n", e$message)); NULL }
+      error = function(e) {
+        cat(sprintf("    Error: %s\n", e$message))
+        NULL
+      }
     )
 
     if (!is.null(result)) {
@@ -587,7 +603,10 @@ for (comp in compartments) {
 
     result <- tryCatch(
       runLimmaVoom(agg$counts, agg$designInfo, contrastDefs),
-      error = function(e) { cat(sprintf("    Error: %s\n", e$message)); NULL }
+      error = function(e) {
+        cat(sprintf("    Error: %s\n", e$message))
+        NULL
+      }
     )
 
     if (!is.null(result)) {
@@ -664,8 +683,19 @@ goSets <- msigdbr(species = "Homo sapiens", category = "C5",
   subcategory = "GO:BP") %>%
   dplyr::select(gs_name, gene_symbol)
 
+c7Sets <- msigdbr(species = "Homo sapiens", category = "C7") %>%
+  dplyr::select(gs_name, gene_symbol)
+
+# Extract IL2-STAT5 signaling gene set for focused roast analysis
+il2Stat5Genes <- hallmarkSets %>%
+  dplyr::filter(gs_name == "HALLMARK_IL2_STAT5_SIGNALING") %>%
+  dplyr::pull(gene_symbol) %>%
+  unique()
+
 cat(sprintf("Hallmark: %d gene sets\n", length(unique(hallmarkSets$gs_name))))
 cat(sprintf("GO:BP: %d gene sets\n", length(unique(goSets$gs_name))))
+cat(sprintf("C7 Immunologic: %d gene sets\n", length(unique(c7Sets$gs_name))))
+cat(sprintf("IL2-STAT5 signaling: %d genes\n", length(il2Stat5Genes)))
 ```
 
 ## Run GSEA
@@ -696,7 +726,10 @@ for (comp in compartments) {
       GSEA(geneRanks, TERM2GENE = hallmarkSets,
         minGSSize = 10, maxGSSize = 500,
         pvalueCutoff = 1.0, verbose = FALSE),
-      error = function(e) { cat(sprintf("  Hallmark error: %s\n", e$message)); NULL }
+      error = function(e) {
+        cat(sprintf("  Hallmark error: %s\n", e$message))
+        NULL
+      }
     )
 
     # GO:BP GSEA
@@ -704,7 +737,10 @@ for (comp in compartments) {
       GSEA(geneRanks, TERM2GENE = goSets,
         minGSSize = 10, maxGSSize = 500,
         pvalueCutoff = 1.0, verbose = FALSE),
-      error = function(e) { cat(sprintf("  GO:BP error: %s\n", e$message)); NULL }
+      error = function(e) {
+        cat(sprintf("  GO:BP error: %s\n", e$message))
+        NULL
+      }
     )
 
     gseaResults[[comp]][[nm]] <- list(
@@ -820,6 +856,509 @@ for (comp in compartments) {
 }
 ```
 
+# Focused Roast: IL2-STAT5 Signaling {.tabset}
+
+## Global Roast
+
+```{r roastIL2STAT5, fig.height = 8, fig.width = 8}
+roastPlotDir <- file.path(plotDir, "roast_IL2STAT5")
+if (!dir.exists(roastPlotDir)) dir.create(roastPlotDir, recursive = TRUE)
+
+roastResults <- list()
+roastSummary <- data.frame()
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+  roastResults[[comp]] <- list()
+
+  v <- rnaResults[[comp]]$voom
+  design <- rnaResults[[comp]]$design
+  contMatrix <- rnaResults[[comp]]$contMatrix
+
+  # Gene index for IL2-STAT5
+  idx <- which(rownames(v) %in% il2Stat5Genes)
+  cat(sprintf("\n%s: %d / %d IL2-STAT5 genes found in voom object\n",
+    comp, length(idx), length(il2Stat5Genes)))
+
+  if (length(idx) < 10) {
+    cat("  Too few genes overlap — skipping roast\n")
+    next
+  }
+
+  for (nm in colnames(contMatrix)) {
+    roastObj <- roast(y = v, index = idx, design = design,
+      contrast = contMatrix[, nm], nrot = 9999)
+    roastPV <- roastObj$p.value  # data.frame with rows Down/Up/UpOrDown/Mixed
+
+    roastResults[[comp]][[nm]] <- roastPV
+
+    roastSummary <- rbind(roastSummary, data.frame(
+      compartment = comp,
+      contrast = nm,
+      NGenes = length(idx),
+      PropDown = roastPV["Down", "Active.Prop"],
+      PropUp = roastPV["Up", "Active.Prop"],
+      Direction_Up_PValue = roastPV["Up", "P.Value"],
+      Direction_Down_PValue = roastPV["Down", "P.Value"],
+      Mixed_PValue = roastPV["Mixed", "P.Value"]
+    ))
+
+    cat(sprintf("  %s: Mixed P = %.4f, Up P = %.4f, Down P = %.4f\n",
+      nm, roastPV["Mixed", "P.Value"],
+      roastPV["Up", "P.Value"], roastPV["Down", "P.Value"]))
+  }
+}
+```
+
+## Global Volcano + Barcode Plots
+
+```{r roastIL2VolcanoBarcode, fig.height = 8, fig.width = 8}
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]]) || is.null(roastResults[[comp]])) next
+
+  v <- rnaResults[[comp]]$voom
+  fit2 <- rnaResults[[comp]]$fit
+  idx <- which(rownames(v) %in% il2Stat5Genes)
+
+  for (nm in names(roastResults[[comp]])) {
+    tt <- rnaResults[[comp]]$results[[nm]]
+    roastRes <- roastResults[[comp]][[nm]]
+
+    # Classify genes
+    tt$inSet <- tt$feature %in% il2Stat5Genes
+    tt$highlight <- ifelse(tt$inSet, "IL2-STAT5", "Other")
+    tt$highlight <- factor(tt$highlight, levels = c("IL2-STAT5", "Other"))
+
+    # Top IL2-STAT5 genes to label (by significance within the set)
+    topSetGenes <- tt %>%
+      dplyr::filter(inSet) %>%
+      arrange(P.Value) %>%
+      head(10)
+
+    # Volcano panel
+    pVolcano <- ggplot(tt, aes(x = logFC, y = -log10(adj.P.Val))) +
+      geom_point(data = dplyr::filter(tt, !inSet),
+        color = "grey80", size = 0.6, alpha = 0.5) +
+      geom_point(data = dplyr::filter(tt, inSet),
+        color = "#8B0000", size = 1.5, alpha = 0.8) +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey50") +
+      geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "grey50") +
+      geom_text_repel(data = topSetGenes,
+        aes(label = feature), size = 3, color = "#8B0000",
+        max.overlaps = 20, fontface = "italic") +
+      labs(x = NULL, y = expression(-log[10](P[adj])),
+        title = paste(comp, "—", nm),
+        subtitle = "IL2-STAT5 Signaling genes highlighted") +
+      theme(plot.margin = margin(5, 5, 0, 5))
+
+    # Barcode panel — rug strip showing logFC distribution
+    # All genes as light ticks, IL2-STAT5 as dark red ticks
+    allGenes <- data.frame(logFC = tt$logFC, inSet = tt$inSet)
+    bgGenes <- dplyr::filter(allGenes, !inSet)
+    setGenes <- dplyr::filter(allGenes, inSet)
+
+    # Roast annotation text
+    roastPV <- roastResults[[comp]][[nm]]  # already the $p.value data.frame
+    mixedP <- roastPV["Mixed", "P.Value"]
+    upP <- roastPV["Up", "P.Value"]
+    downP <- roastPV["Down", "P.Value"]
+    bestDir <- ifelse(upP < downP, "Up", "Down")
+    bestP <- min(upP, downP)
+    annotText <- sprintf("Roast: P = %.2e (%s)", bestP, bestDir)
+
+    pBarcode <- ggplot() +
+      geom_segment(data = bgGenes,
+        aes(x = logFC, xend = logFC, y = 0, yend = 0.4),
+        color = "grey80", linewidth = 0.15, alpha = 0.3) +
+      geom_segment(data = setGenes,
+        aes(x = logFC, xend = logFC, y = 0, yend = 1),
+        color = "#8B0000", linewidth = 0.4, alpha = 0.8) +
+      annotate("text", x = max(tt$logFC) * 0.7, y = 0.5,
+        label = annotText, size = 3.5, hjust = 0.5) +
+      scale_y_continuous(breaks = NULL, limits = c(0, 1.1)) +
+      labs(x = expression(log[2] ~ fold ~ change), y = "GSEA") +
+      theme_minimal(base_size = 12) +
+      theme(
+        panel.grid = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_text(angle = 0, vjust = 0.5, size = 10),
+        plot.margin = margin(0, 5, 5, 5))
+
+    # Combine with patchwork
+    combined <- pVolcano / pBarcode + plot_layout(heights = c(5, 1))
+    print(combined)
+
+    savePlot(plot = combined, plotDir = roastPlotDir,
+      filename = paste0(comp, "_roast_IL2STAT5_volcano_", nm),
+      height = 8, width = 8)
+  }
+}
+```
+
+## Global Roast Summary Table
+
+```{r roastIL2Table, results = "markup"}
+if (nrow(roastSummary) > 0) {
+  kable(roastSummary, digits = 4, row.names = FALSE,
+    caption = "Roast test of HALLMARK_IL2_STAT5_SIGNALING across contrasts")
+
+  outFile <- file.path(tableDir,
+    paste0(filenameSuffix, "_roast_IL2STAT5_global_summary.csv"))
+  write.csv(roastSummary, file = outFile, row.names = FALSE)
+  cat(sprintf("Saved: %s\n", basename(outFile)))
+}
+```
+
+## Per-Cluster Roast
+
+```{r roastIL2PerCluster}
+roastPerCluster <- list()
+roastPerClusterSummary <- data.frame()
+
+for (comp in compartments) {
+  if (length(perClusterRNA[[comp]]) == 0) next
+  roastPerCluster[[comp]] <- list()
+
+  for (cl in names(perClusterRNA[[comp]])) {
+    clResult <- perClusterRNA[[comp]][[cl]]
+    v <- clResult$voom
+    design <- clResult$design
+    contMatrix <- clResult$contMatrix
+
+    idx <- which(rownames(v) %in% il2Stat5Genes)
+    if (length(idx) < 5) {
+      cat(sprintf("%s cluster %s: only %d IL2-STAT5 genes — skipping\n",
+        comp, cl, length(idx)))
+      next
+    }
+
+    roastPerCluster[[comp]][[cl]] <- list()
+
+    for (nm in colnames(contMatrix)) {
+      roastPV <- tryCatch(
+        {
+          roastObj <- roast(y = v, index = idx, design = design,
+            contrast = contMatrix[, nm], nrot = 9999)
+          roastObj$p.value
+        },
+        error = function(e) {
+          cat(sprintf("  %s cl%s %s error: %s\n",
+            comp, cl, nm, e$message))
+          NULL
+        }
+      )
+
+      if (is.null(roastPV)) next
+      roastPerCluster[[comp]][[cl]][[nm]] <- roastPV
+
+      roastPerClusterSummary <- rbind(roastPerClusterSummary, data.frame(
+        compartment = comp,
+        cluster = cl,
+        contrast = nm,
+        NGenes = length(idx),
+        PropDown = roastPV["Down", "Active.Prop"],
+        PropUp = roastPV["Up", "Active.Prop"],
+        Direction_Up_PValue = roastPV["Up", "P.Value"],
+        Direction_Down_PValue = roastPV["Down", "P.Value"],
+        Mixed_PValue = roastPV["Mixed", "P.Value"]
+      ))
+    }
+
+    cat(sprintf("%s cluster %s: roast complete (%d genes)\n", comp, cl, length(idx)))
+  }
+}
+```
+
+## Per-Cluster Roast Heatmap
+
+```{r roastIL2PerClusterHeatmap, fig.height = 8, fig.width = 12}
+for (comp in compartments) {
+  compSummary <- roastPerClusterSummary %>%
+    dplyr::filter(compartment == comp)
+  if (nrow(compSummary) == 0) next
+
+  # Determine direction for annotation
+  compSummary <- compSummary %>%
+    mutate(
+      bestP = pmin(Direction_Up_PValue, Direction_Down_PValue),
+      direction = ifelse(Direction_Up_PValue < Direction_Down_PValue, "Up", "Down"),
+      dirLabel = case_when(
+        bestP < 0.01 ~ ifelse(direction == "Up", "\u2191\u2191", "\u2193\u2193"),
+        bestP < 0.05 ~ ifelse(direction == "Up", "\u2191", "\u2193"),
+        bestP < 0.1  ~ ifelse(direction == "Up", "\u2191?", "\u2193?"),
+        TRUE ~ ""
+      ),
+      negLog10P = -log10(Mixed_PValue)
+    )
+
+  pHeat <- ggplot(compSummary, aes(x = contrast, y = cluster)) +
+    geom_tile(aes(fill = negLog10P), color = "white") +
+    geom_text(aes(label = paste0(dirLabel, "\n",
+      sprintf("P=%.3f", Mixed_PValue))), size = 3) +
+    scale_fill_gradient(low = "white", high = "#8B0000",
+      name = expression(-log[10](P))) +
+    labs(x = "", y = "WNN Cluster",
+      title = paste(comp, "— Per-Cluster Roast: IL2-STAT5 Signaling")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(pHeat)
+
+  savePlot(plot = pHeat, plotDir = roastPlotDir,
+    filename = paste0(comp, "_roast_IL2STAT5_perCluster_heatmap"),
+    height = 8, width = 12)
+}
+```
+
+## Per-Cluster Roast Table
+
+```{r roastIL2PerClusterTable, results = "markup"}
+if (nrow(roastPerClusterSummary) > 0) {
+  kable(roastPerClusterSummary, digits = 4, row.names = FALSE,
+    caption = "Per-cluster Roast: HALLMARK_IL2_STAT5_SIGNALING")
+
+  outFile <- file.path(tableDir,
+    paste0(filenameSuffix, "_roast_IL2STAT5_perCluster_summary.csv"))
+  write.csv(roastPerClusterSummary, file = outFile, row.names = FALSE)
+  cat(sprintf("Saved: %s\n", basename(outFile)))
+}
+```
+
+# GSEA: C7 Immunologic Signatures {.tabset}
+
+## Global C7 GSEA
+
+```{r runC7GSEA}
+c7PlotDir <- file.path(plotDir, "C7_GSEA")
+if (!dir.exists(c7PlotDir)) dir.create(c7PlotDir, recursive = TRUE)
+
+c7GseaResults <- list()
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+  c7GseaResults[[comp]] <- list()
+
+  for (nm in names(rnaResults[[comp]]$results)) {
+    tt <- rnaResults[[comp]]$results[[nm]]
+
+    geneRanks <- tt$t
+    names(geneRanks) <- tt$feature
+    geneRanks <- sort(geneRanks, decreasing = TRUE)
+    geneRanks <- geneRanks[!is.na(geneRanks)]
+    geneRanks <- geneRanks[!duplicated(names(geneRanks))]
+
+    cat(sprintf("\n%s %s: C7 GSEA with %d ranked genes\n",
+      comp, nm, length(geneRanks)))
+
+    c7GSEA <- tryCatch(
+      GSEA(geneRanks, TERM2GENE = c7Sets,
+        minGSSize = 10, maxGSSize = 500,
+        pvalueCutoff = 1.0, verbose = FALSE),
+      error = function(e) {
+        cat(sprintf("  C7 error: %s\n", e$message))
+        NULL
+      }
+    )
+
+    c7GseaResults[[comp]][[nm]] <- c7GSEA
+
+    if (!is.null(c7GSEA)) {
+      nSig <- sum(c7GSEA@result$p.adjust < 0.05)
+      cat(sprintf("  C7: %d significant (FDR<0.05)\n", nSig))
+    }
+  }
+}
+```
+
+## Global C7 Bubble Plots
+
+```{r c7BubblePlots, fig.height = 14, fig.width = 14}
+for (comp in compartments) {
+  if (is.null(c7GseaResults[[comp]])) next
+
+  for (nm in names(c7GseaResults[[comp]])) {
+    c7Res <- c7GseaResults[[comp]][[nm]]
+    if (is.null(c7Res) || nrow(c7Res@result) == 0) next
+
+    plotDf <- c7Res@result %>%
+      dplyr::filter(p.adjust < 0.1) %>%
+      arrange(p.adjust) %>%
+      head(30) %>%
+      mutate(
+        Description_clean = gsub("^GSE\\d+_", "", Description),
+        Description_clean = gsub("_", " ", Description_clean),
+        Description_clean = str_to_title(Description_clean),
+        Description_clean = str_wrap(Description_clean, width = 50))
+
+    if (nrow(plotDf) == 0) {
+      cat(sprintf("%s %s: No significant C7 results to plot\n", comp, nm))
+      next
+    }
+
+    pBubble <- ggplot(plotDf, aes(x = NES,
+      y = reorder(Description_clean, NES))) +
+      geom_vline(xintercept = 0, linetype = "solid", color = "gray80") +
+      geom_segment(aes(y = reorder(Description_clean, NES),
+        yend = reorder(Description_clean, NES),
+        x = 0, xend = NES), color = "black", linewidth = 0.5) +
+      geom_point(aes(size = setSize, fill = -log10(p.adjust)),
+        shape = 21, color = "black", stroke = 0.5) +
+      scale_fill_gradient(low = "lightblue", high = "red",
+        name = "-log10(FDR)") +
+      scale_size_area(max_size = 8,
+        guide = guide_legend(override.aes = list(fill = NA, color = "black"))) +
+      labs(x = "Normalized Enrichment Score (NES)", y = "",
+        size = "Gene Set Size",
+        title = paste(comp, "— C7 Immunologic:", nm)) +
+      theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        axis.text.y = element_text(size = 9),
+        panel.grid.major.x = element_line(color = "gray95"),
+        panel.grid.major.y = element_blank())
+
+    print(pBubble)
+
+    savePlot(plot = pBubble, plotDir = c7PlotDir,
+      filename = paste0(comp, "_C7_GSEA_", nm),
+      height = max(8, 0.5 * nrow(plotDf) + 3), width = 14)
+  }
+}
+```
+
+## Global C7 Results Tables
+
+```{r c7ResultsTables}
+for (comp in compartments) {
+  if (is.null(c7GseaResults[[comp]])) next
+
+  for (nm in names(c7GseaResults[[comp]])) {
+    c7Res <- c7GseaResults[[comp]][[nm]]
+    if (is.null(c7Res)) next
+    res <- c7Res@result
+    outFile <- file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_GSEA_C7_", nm, ".csv"))
+    write.csv(res, file = outFile, row.names = FALSE)
+  }
+  cat(sprintf("%s: C7 GSEA tables saved\n", comp))
+}
+```
+
+## Per-Cluster C7 GSEA
+
+```{r runC7GSEAPerCluster}
+c7GseaPerCluster <- list()
+
+for (comp in compartments) {
+  if (length(perClusterRNA[[comp]]) == 0) next
+  c7GseaPerCluster[[comp]] <- list()
+
+  for (cl in names(perClusterRNA[[comp]])) {
+    clResult <- perClusterRNA[[comp]][[cl]]
+    c7GseaPerCluster[[comp]][[cl]] <- list()
+
+    for (nm in names(clResult$results)) {
+      tt <- clResult$results[[nm]]
+
+      geneRanks <- tt$t
+      names(geneRanks) <- tt$feature
+      geneRanks <- sort(geneRanks, decreasing = TRUE)
+      geneRanks <- geneRanks[!is.na(geneRanks)]
+      geneRanks <- geneRanks[!duplicated(names(geneRanks))]
+
+      if (length(geneRanks) < 50) next
+
+      c7Res <- tryCatch(
+        GSEA(geneRanks, TERM2GENE = c7Sets,
+          minGSSize = 10, maxGSSize = 500,
+          pvalueCutoff = 1.0, verbose = FALSE),
+        error = function(e) NULL
+      )
+
+      c7GseaPerCluster[[comp]][[cl]][[nm]] <- c7Res
+
+      if (!is.null(c7Res)) {
+        nSig <- sum(c7Res@result$p.adjust < 0.05)
+        cat(sprintf("%s cluster %s %s: %d significant C7 terms\n",
+          comp, cl, nm, nSig))
+      }
+    }
+  }
+}
+```
+
+## Per-Cluster C7 Bubble Plots
+
+```{r c7PerClusterBubblePlots, fig.height = 12, fig.width = 14}
+for (comp in compartments) {
+  if (is.null(c7GseaPerCluster[[comp]])) next
+
+  for (cl in names(c7GseaPerCluster[[comp]])) {
+    for (nm in names(c7GseaPerCluster[[comp]][[cl]])) {
+      c7Res <- c7GseaPerCluster[[comp]][[cl]][[nm]]
+      if (is.null(c7Res) || nrow(c7Res@result) == 0) next
+
+      plotDf <- c7Res@result %>%
+        dplyr::filter(p.adjust < 0.1) %>%
+        arrange(p.adjust) %>%
+        head(20) %>%
+        mutate(
+          Description_clean = gsub("^GSE\\d+_", "", Description),
+          Description_clean = gsub("_", " ", Description_clean),
+          Description_clean = str_to_title(Description_clean),
+          Description_clean = str_wrap(Description_clean, width = 50))
+
+      if (nrow(plotDf) == 0) next
+
+      pBubble <- ggplot(plotDf, aes(x = NES,
+        y = reorder(Description_clean, NES))) +
+        geom_vline(xintercept = 0, linetype = "solid", color = "gray80") +
+        geom_segment(aes(y = reorder(Description_clean, NES),
+          yend = reorder(Description_clean, NES),
+          x = 0, xend = NES), color = "black", linewidth = 0.5) +
+        geom_point(aes(size = setSize, fill = -log10(p.adjust)),
+          shape = 21, color = "black", stroke = 0.5) +
+        scale_fill_gradient(low = "lightblue", high = "red",
+          name = "-log10(FDR)") +
+        scale_size_area(max_size = 8,
+          guide = guide_legend(override.aes = list(fill = NA, color = "black"))) +
+        labs(x = "Normalized Enrichment Score (NES)", y = "",
+          size = "Gene Set Size",
+          title = paste(comp, "cluster", cl, "— C7:", nm)) +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold", size = 13),
+          axis.text.y = element_text(size = 9),
+          panel.grid.major.x = element_line(color = "gray95"),
+          panel.grid.major.y = element_blank())
+
+      print(pBubble)
+
+      savePlot(plot = pBubble, plotDir = c7PlotDir,
+        filename = paste0(comp, "_cluster", cl, "_C7_GSEA_", nm),
+        height = max(8, 0.5 * nrow(plotDf) + 3), width = 14)
+    }
+  }
+}
+```
+
+## Per-Cluster C7 Results Tables
+
+```{r c7PerClusterTables}
+for (comp in compartments) {
+  if (is.null(c7GseaPerCluster[[comp]])) next
+
+  for (cl in names(c7GseaPerCluster[[comp]])) {
+    for (nm in names(c7GseaPerCluster[[comp]][[cl]])) {
+      c7Res <- c7GseaPerCluster[[comp]][[cl]][[nm]]
+      if (is.null(c7Res)) next
+      res <- c7Res@result
+      outFile <- file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_cluster", cl, "_GSEA_C7_", nm, ".csv"))
+      write.csv(res, file = outFile, row.names = FALSE)
+    }
+  }
+  cat(sprintf("%s: per-cluster C7 GSEA tables saved\n", comp))
+}
+```
+
 # Cross-Modality Integration Summary {.tabset}
 
 ## DA-DGE Overlap
@@ -832,7 +1371,7 @@ for (comp in compartments) {
   overlapSummary <- data.frame()
 
   for (nm in intersect(names(rnaResults[[comp]]$results),
-                       names(atacResults[[comp]]$results))) {
+    names(atacResults[[comp]]$results))) {
     rna <- rnaResults[[comp]]$results[[nm]]
     atac <- atacResults[[comp]]$results[[nm]]
 
@@ -880,7 +1419,7 @@ for (comp in compartments) {
   DefaultAssay(seuratObj) <- "ATAC"
 
   for (nm in intersect(names(rnaResults[[comp]]$results),
-                       names(atacResults[[comp]]$results))) {
+    names(atacResults[[comp]]$results))) {
     atac <- atacResults[[comp]]$results[[nm]]
     rna <- rnaResults[[comp]]$results[[nm]]
 
@@ -891,10 +1430,12 @@ for (comp in compartments) {
     # Find nearest gene for each significant peak
     peakGR <- StringToGRanges(sigPeaks$feature)
 
-    nearestGene <- tryCatch({
-      nearest <- ClosestFeature(seuratObj, regions = peakGR)
-      nearest
-    }, error = function(e) NULL)
+    nearestGene <- tryCatch(
+      {
+        nearest <- ClosestFeature(seuratObj, regions = peakGR)
+        nearest
+      },
+      error = function(e) NULL)
 
     if (is.null(nearestGene) || nrow(nearestGene) == 0) next
 
@@ -914,7 +1455,7 @@ for (comp in compartments) {
     merged <- sigPeaks %>%
       inner_join(rna %>% dplyr::select(feature, logFC, adj.P.Val) %>%
         dplyr::rename(RNA_logFC = logFC, RNA_FDR = adj.P.Val),
-        by = c("nearestGene" = "feature"))
+      by = c("nearestGene" = "feature"))
 
     if (nrow(merged) < 5) next
 
@@ -937,6 +1478,215 @@ for (comp in compartments) {
     savePlot(plot = pCorr, plotDir = plotDir,
       filename = paste0(comp, "_logFC_correlation_", nm),
       height = 6, width = 8)
+  }
+}
+```
+
+# LogFC Scatterplots (Baseline vs Followup Reference) {.tabset}
+
+## RNA LogFC Scatterplots
+
+```{r rnaLogfcScatter, fig.height = 8, fig.width = 10}
+scatterPairs <- list(
+  list(xContrast = "PostIL2_vs_BL", yContrast = "PostIL2_vs_Followup",
+    treatment = "Post-IL2", xRef = "Baseline", yRef = "Followup"),
+  list(xContrast = "PostRAPA_vs_BL", yContrast = "PostRAPA_vs_Followup",
+    treatment = "Post-RAPA", xRef = "Baseline", yRef = "Followup")
+)
+
+pCutoff <- 0.05
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+
+  for (sp in scatterPairs) {
+    xTT <- rnaResults[[comp]]$results[[sp$xContrast]]
+    yTT <- rnaResults[[comp]]$results[[sp$yContrast]]
+    if (is.null(xTT) || is.null(yTT)) next
+
+    merged_df <- merge(
+      xTT[, c("feature", "logFC", "adj.P.Val")],
+      yTT[, c("feature", "logFC", "adj.P.Val")],
+      by = "feature", suffixes = c("_xRef", "_yRef"))
+
+    merged_df <- merged_df %>%
+      mutate(
+        sig_x = adj.P.Val_xRef <= pCutoff,
+        sig_y = adj.P.Val_yRef <= pCutoff,
+        sig = sig_x | sig_y,
+        distance_from_diagonal = abs(logFC_yRef - logFC_xRef)
+      )
+
+    top30 <- merged_df %>%
+      filter(sig) %>%
+      arrange(desc(distance_from_diagonal)) %>%
+      slice(1:30)
+
+    axMax <- max(abs(c(merged_df$logFC_xRef, merged_df$logFC_yRef)), na.rm = TRUE) * 1.05
+
+    p <- ggplot(merged_df, aes(x = logFC_xRef, y = logFC_yRef)) +
+      geom_point(data = filter(merged_df, !sig),
+        aes(fill = adj.P.Val_yRef, color = adj.P.Val_xRef),
+        shape = 21, size = 2, stroke = 0.8, alpha = 0.4) +
+      geom_point(data = filter(merged_df, sig),
+        aes(fill = adj.P.Val_yRef, color = adj.P.Val_xRef),
+        shape = 21, size = 2.5, stroke = 0.8) +
+      geom_text_repel(data = top30,
+        aes(label = feature), size = 2.8, max.overlaps = 30,
+        fontface = "italic", segment.color = "grey50", segment.size = 0.3) +
+      scale_fill_gradient(
+        low = "blue", high = "grey", limits = c(0, pCutoff),
+        oob = scales::squish,
+        name = paste0("FDR (vs ", sp$yRef, ")")) +
+      scale_color_gradient(
+        low = "red", high = "grey", limits = c(0, pCutoff),
+        oob = scales::squish,
+        name = paste0("FDR (vs ", sp$xRef, ")")) +
+      geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "grey40") +
+      geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+      geom_vline(xintercept = 0, color = "grey70", linewidth = 0.3) +
+      annotate("text", x = axMax * 0.7, y = -axMax * 0.95,
+        label = paste("Up in", sp$treatment), size = 3.2, color = "grey40") +
+      annotate("text", x = -axMax * 0.7, y = -axMax * 0.95,
+        label = paste("Up in", sp$xRef), size = 3.2, color = "grey40") +
+      annotate("text", x = -axMax * 0.95, y = axMax * 0.7,
+        label = paste("Up in", sp$treatment), size = 3.2, color = "grey40",
+        angle = 90) +
+      annotate("text", x = -axMax * 0.95, y = -axMax * 0.7,
+        label = paste("Up in", sp$yRef), size = 3.2, color = "grey40",
+        angle = 90) +
+      coord_equal(xlim = c(-axMax, axMax), ylim = c(-axMax, axMax)) +
+      labs(
+        x = paste0("logFC (", sp$treatment, " vs ", sp$xRef, ")"),
+        y = paste0("logFC (", sp$treatment, " vs ", sp$yRef, ")"),
+        title = paste0(comp, " RNA — ", sp$treatment),
+        subtitle = sprintf(
+          "Fill = FDR vs %s, Outline = FDR vs %s\nSig: %d vs %s, %d vs %s, %d both",
+          sp$yRef, sp$xRef,
+          sum(merged_df$sig_x), sp$xRef,
+          sum(merged_df$sig_y), sp$yRef,
+          sum(merged_df$sig_x & merged_df$sig_y)))
+
+    print(p)
+
+    savePlot(plot = p, plotDir = plotDir,
+      filename = paste0(comp, "_RNA_logFC_scatter_",
+        gsub("-", "", sp$treatment)),
+      height = 8, width = 12)
+  }
+}
+```
+
+## ATAC LogFC Scatterplots
+
+```{r atacLogfcScatter, fig.height = 8, fig.width = 10}
+for (comp in compartments) {
+  if (is.null(atacResults[[comp]])) next
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "ATAC"
+
+  for (sp in scatterPairs) {
+    xTT <- atacResults[[comp]]$results[[sp$xContrast]]
+    yTT <- atacResults[[comp]]$results[[sp$yContrast]]
+    if (is.null(xTT) || is.null(yTT)) next
+
+    merged_df <- merge(
+      xTT[, c("feature", "logFC", "adj.P.Val")],
+      yTT[, c("feature", "logFC", "adj.P.Val")],
+      by = "feature", suffixes = c("_xRef", "_yRef"))
+
+    merged_df <- merged_df %>%
+      mutate(
+        sig_x = adj.P.Val_xRef <= pCutoff,
+        sig_y = adj.P.Val_yRef <= pCutoff,
+        sig = sig_x | sig_y,
+        distance_from_diagonal = abs(logFC_yRef - logFC_xRef)
+      )
+
+    # Annotate significant peaks with nearest gene
+    sigIdx <- which(merged_df$sig)
+    if (length(sigIdx) == 0) next
+
+    peakGR <- tryCatch(StringToGRanges(merged_df$feature[sigIdx]),
+      error = function(e) NULL)
+    if (is.null(peakGR)) next
+
+    nearestInfo <- tryCatch(ClosestFeature(seuratObj, regions = peakGR),
+      error = function(e) NULL)
+    if (is.null(nearestInfo) || nrow(nearestInfo) == 0) next
+
+    merged_df$nearestGene <- NA_character_
+    merged_df$geneDistance <- NA_real_
+    matched <- match(merged_df$feature[sigIdx], nearestInfo$query_region)
+    merged_df$nearestGene[sigIdx] <- nearestInfo$gene_name[matched]
+    merged_df$geneDistance[sigIdx] <- nearestInfo$distance[matched]
+
+    # Top 15 off-diagonal sig peaks within 50kb of a gene
+    labelDf <- merged_df %>%
+      filter(sig & !is.na(nearestGene) & geneDistance <= 50000) %>%
+      arrange(desc(distance_from_diagonal)) %>%
+      slice(1:15)
+
+    labelDf$label <- ifelse(
+      labelDf$geneDistance == 0,
+      labelDf$nearestGene,
+      paste0(labelDf$nearestGene, " (", round(labelDf$geneDistance / 1000), "kb)"))
+
+    axMax <- max(abs(c(merged_df$logFC_xRef, merged_df$logFC_yRef)),
+      na.rm = TRUE) * 1.05
+
+    p <- ggplot(merged_df, aes(x = logFC_xRef, y = logFC_yRef)) +
+      geom_point(data = filter(merged_df, !sig),
+        aes(fill = adj.P.Val_yRef, color = adj.P.Val_xRef),
+        shape = 21, size = 1.2, stroke = 0.5, alpha = 0.3) +
+      geom_point(data = filter(merged_df, sig),
+        aes(fill = adj.P.Val_yRef, color = adj.P.Val_xRef),
+        shape = 21, size = 1.8, stroke = 0.7) +
+      geom_text_repel(data = labelDf,
+        aes(x = logFC_xRef, y = logFC_yRef, label = label),
+        size = 2.4, max.overlaps = 20,
+        fontface = "italic", segment.color = "grey50", segment.size = 0.3) +
+      scale_fill_gradient(
+        low = "blue", high = "grey", limits = c(0, pCutoff),
+        oob = scales::squish,
+        name = paste0("FDR (vs ", sp$yRef, ")")) +
+      scale_color_gradient(
+        low = "red", high = "grey", limits = c(0, pCutoff),
+        oob = scales::squish,
+        name = paste0("FDR (vs ", sp$xRef, ")")) +
+      geom_abline(intercept = 0, slope = 1, linetype = "dotted", color = "grey40") +
+      geom_hline(yintercept = 0, color = "grey70", linewidth = 0.3) +
+      geom_vline(xintercept = 0, color = "grey70", linewidth = 0.3) +
+      annotate("text", x = axMax * 0.6, y = -axMax * 0.95,
+        label = paste("More accessible in", sp$treatment),
+        size = 2.8, color = "grey40") +
+      annotate("text", x = -axMax * 0.6, y = -axMax * 0.95,
+        label = paste("More accessible in", sp$xRef),
+        size = 2.8, color = "grey40") +
+      annotate("text", x = -axMax * 0.95, y = axMax * 0.6,
+        label = paste("More accessible in", sp$treatment),
+        size = 2.8, color = "grey40", angle = 90) +
+      annotate("text", x = -axMax * 0.95, y = -axMax * 0.6,
+        label = paste("More accessible in", sp$yRef),
+        size = 2.8, color = "grey40", angle = 90) +
+      coord_equal(xlim = c(-axMax, axMax), ylim = c(-axMax, axMax)) +
+      labs(
+        x = paste0("logFC (", sp$treatment, " vs ", sp$xRef, ")"),
+        y = paste0("logFC (", sp$treatment, " vs ", sp$yRef, ")"),
+        title = paste0(comp, " ATAC — ", sp$treatment),
+        subtitle = sprintf(
+          "Fill = FDR vs %s, Outline = FDR vs %s\nSig: %d vs %s, %d vs %s, %d both",
+          sp$yRef, sp$xRef,
+          sum(merged_df$sig_x), sp$xRef,
+          sum(merged_df$sig_y), sp$yRef,
+          sum(merged_df$sig_x & merged_df$sig_y)))
+
+    print(p)
+
+    savePlot(plot = p, plotDir = plotDir,
+      filename = paste0(comp, "_ATAC_logFC_scatter_",
+        gsub("-", "", sp$treatment)),
+      height = 8, width = 12)
   }
 }
 ```
@@ -1002,6 +1752,14 @@ daBundle <- list(
 
   # GSEA
   gseaResults = gseaResults,
+
+  # Roast IL2-STAT5
+  roastResults = roastResults,
+  roastPerCluster = roastPerCluster,
+
+  # C7 Immunologic GSEA
+  c7GseaResults = c7GseaResults,
+  c7GseaPerCluster = c7GseaPerCluster,
 
   # Contrasts used
   contrastDefs = contrastDefs,

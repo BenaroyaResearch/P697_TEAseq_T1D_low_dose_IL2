@@ -95,7 +95,8 @@ for (comp in compartments) {
   cat(sprintf("  Reductions: %s\n",
     paste(names(seuratList[[comp]]@reductions), collapse = ", ")))
 
-  rm(bundle); gc(verbose = FALSE)
+  rm(bundle)
+  gc(verbose = FALSE)
 }
 ```
 
@@ -103,30 +104,30 @@ for (comp in compartments) {
 
 ```{r createTreatmentPhase}
 # Map visitNum to treatment phase based on trial design:
-#   LD IL-2 treatment → stopped → RAPA treatment → stopped → washout
+#   LD IL-2 treatment → stopped → RAPA treatment → stopped → Followup
 #   V0:  Baseline (pre-treatment)
 #   V4/5: End of IL-2 phase (Post-IL2)
 #   V8/10: End of RAPA phase (Post-RAPA)
-#   V12: ~6 months after all treatment cessation (Washout)
+#   V12: ~6 months after all treatment cessation (Followup)
 treatmentPhaseMap <- c(
   "0" = "Baseline",
   "4" = "Post-IL2", "5" = "Post-IL2",
   "8" = "Post-RAPA", "10" = "Post-RAPA",
-  "12" = "Washout"
+  "12" = "Followup"
 )
 
 palTreatmentPhase <- c(
   "Baseline" = "#4DAF4A",
   "Post-IL2" = "#377EB8",
   "Post-RAPA" = "#FF7F00",
-  "Washout" = "#984EA3"
+  "Followup" = "#984EA3"
 )
 
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
   seuratObj$treatmentPhase <- factor(
     unname(treatmentPhaseMap[as.character(seuratObj$visitNum)]),
-    levels = c("Baseline", "Post-IL2", "Post-RAPA", "Washout")
+    levels = c("Baseline", "Post-IL2", "Post-RAPA", "Followup")
   )
 
   cat(sprintf("\n%s treatmentPhase distribution:\n", comp))
@@ -162,7 +163,8 @@ for (comp in compartments) {
   cat(sprintf("%s: RNA UMAP recomputed (%d cells)\n", comp, ncol(seuratObj)))
   seuratList[[comp]] <- seuratObj
 }
-rm(seuratObj); gc(verbose = FALSE)
+rm(seuratObj)
+gc(verbose = FALSE)
 ```
 
 # WNN Integration
@@ -188,7 +190,8 @@ for (comp in compartments) {
 
   seuratList[[comp]] <- seuratObj
 }
-rm(seuratObj); gc(verbose = FALSE)
+rm(seuratObj)
+gc(verbose = FALSE)
 ```
 
 # WNN UMAP
@@ -209,7 +212,8 @@ for (comp in compartments) {
   cat(sprintf("%s: WNN UMAP computed\n", comp))
   seuratList[[comp]] <- seuratObj
 }
-rm(seuratObj); gc(verbose = FALSE)
+rm(seuratObj)
+gc(verbose = FALSE)
 ```
 
 # WNN Clustering Evaluation
@@ -265,7 +269,8 @@ for (comp in compartments) {
   seuratList[[comp]] <- seuratObj
   rm(distSub)
 }
-rm(seuratObj); gc(verbose = FALSE)
+rm(seuratObj)
+gc(verbose = FALSE)
 ```
 
 ```{r clusterMetricsPlot, fig.height = 5, fig.width = 12}
@@ -333,7 +338,52 @@ for (comp in compartments) {
 
   seuratList[[comp]] <- seuratObj
 }
-rm(seuratObj); gc(verbose = FALSE)
+rm(seuratObj)
+gc(verbose = FALSE)
+```
+
+# RNA-Only and ATAC-Only Clustering
+
+```{r rnaClustering}
+# RNA-only clustering using the same resolution as WNN for comparability.
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  seuratObj <- FindNeighbors(seuratObj, reduction = "harmony", dims = 1:18,
+    graph.name = c("RNA_nn", "RNA_snn"), verbose = FALSE)
+  seuratObj <- FindClusters(seuratObj, graph.name = "RNA_snn",
+    resolution = selectedRes[[comp]], verbose = FALSE)
+  seuratObj$rna_clusters <- seuratObj$seurat_clusters
+
+  cat(sprintf("%s: %d RNA clusters at resolution %.2f\n",
+    comp, length(unique(seuratObj$rna_clusters)), selectedRes[[comp]]))
+  print(table(seuratObj$rna_clusters))
+
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj)
+gc(verbose = FALSE)
+```
+
+```{r atacClustering}
+# ATAC-only clustering using the same resolution as WNN for comparability.
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  seuratObj <- FindNeighbors(seuratObj, reduction = "harmony_lsi", dims = 1:29,
+    graph.name = c("ATAC_nn", "ATAC_snn"), verbose = FALSE)
+  seuratObj <- FindClusters(seuratObj, graph.name = "ATAC_snn",
+    resolution = selectedRes[[comp]], verbose = FALSE)
+  seuratObj$atac_clusters <- seuratObj$seurat_clusters
+
+  cat(sprintf("%s: %d ATAC clusters at resolution %.2f\n",
+    comp, length(unique(seuratObj$atac_clusters)), selectedRes[[comp]]))
+  print(table(seuratObj$atac_clusters))
+
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj)
+gc(verbose = FALSE)
 ```
 
 # WNN Visualization {.tabset}
@@ -524,7 +574,7 @@ for (comp in compartments) {
   topMarkers <- markers %>%
     dplyr::filter(p_val_adj < 0.05) %>%
     group_by(cluster) %>%
-    top_n(n = 5, wt = avg_log2FC) %>%
+    top_n(n = 15, wt = avg_log2FC) %>%
     ungroup()
 
   if (nrow(topMarkers) > 0) {
@@ -534,7 +584,7 @@ for (comp in compartments) {
       seuratObj = seuratObj,
       genes = topGenes,
       groupBy = "wnn_clusters",
-      title = paste0(comp, " — Top WNN Cluster Markers (",
+      title = paste0(comp, " — Top 15 WNN Cluster Markers (",
         length(unique(seuratObj$wnn_clusters)), " clusters)"),
       xlab = "Marker Genes",
       ylab = "WNN Cluster",
@@ -542,7 +592,7 @@ for (comp in compartments) {
       filename = paste0(comp, "_WNN_clusterMarkers_dotplot"),
       orderGenes = TRUE,
       height = 6,
-      width = max(10, 4 + length(topGenes) * 0.25)
+      width = 12
     )
 
     if (!is.null(pDot)) print(pDot)
@@ -625,7 +675,7 @@ for (comp in compartments) {
 
   png(file.path(plotDir, paste0(filenameSuffix, "_", comp,
     "_WNN_markerHeatmap_byPhase.png")),
-    width = 12, height = 8, units = "in", res = 600)
+  width = 12, height = 8, units = "in", res = 600)
   ComplexHeatmap::draw(ht)
   dev.off()
 }
@@ -710,9 +760,294 @@ for (comp in compartments) {
 
   png(file.path(plotDir, paste0(filenameSuffix, "_", comp,
     "_WNN_markerHeatmap_byVisit.png")),
-    width = 14, height = 8, units = "in", res = 600)
+  width = 14, height = 8, units = "in", res = 600)
   ComplexHeatmap::draw(ht)
   dev.off()
+}
+```
+
+# Cluster Exploration: All Three Clusterings {.tabset}
+
+## Cluster-Defining Markers (RNA & ATAC Clusters)
+
+```{r rnaAtacClusterMarkers}
+# FindAllMarkers for RNA-only and ATAC-only cluster identities (WNN already done above).
+rnaClusterMarkers <- list()
+atacClusterMarkers <- list()
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  # RNA cluster markers
+  Idents(seuratObj) <- "rna_clusters"
+  cat(sprintf("\n%s: Finding markers for %d RNA clusters...\n",
+    comp, length(unique(seuratObj$rna_clusters))))
+  rnaClusterMarkers[[comp]] <- FindAllMarkers(seuratObj, only.pos = TRUE,
+    min.pct = 0.25, logfc.threshold = 0.25, test.use = "wilcox", verbose = FALSE)
+  cat(sprintf("  %d significant markers (p_val_adj < 0.05)\n",
+    sum(rnaClusterMarkers[[comp]]$p_val_adj < 0.05)))
+
+  # ATAC cluster markers (still using RNA expression to define them)
+  Idents(seuratObj) <- "atac_clusters"
+  cat(sprintf("%s: Finding markers for %d ATAC clusters...\n",
+    comp, length(unique(seuratObj$atac_clusters))))
+  atacClusterMarkers[[comp]] <- FindAllMarkers(seuratObj, only.pos = TRUE,
+    min.pct = 0.25, logfc.threshold = 0.25, test.use = "wilcox", verbose = FALSE)
+  cat(sprintf("  %d significant markers (p_val_adj < 0.05)\n",
+    sum(atacClusterMarkers[[comp]]$p_val_adj < 0.05)))
+}
+```
+
+## Top 15 Marker Dotplots
+
+```{r clusterDefiningDotplots, fig.height = 6, fig.width = 12}
+clusteringSchemes <- list(
+  list(name = "RNA",  clusterCol = "rna_clusters",  markerList = rnaClusterMarkers),
+  list(name = "ATAC", clusterCol = "atac_clusters", markerList = atacClusterMarkers),
+  list(name = "WNN",  clusterCol = "wnn_clusters",  markerList = allMarkers)
+)
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  for (scheme in clusteringSchemes) {
+    markers <- scheme$markerList[[comp]]
+    if (is.null(markers) || nrow(markers) == 0) next
+
+    topMarkers <- markers %>%
+      dplyr::filter(p_val_adj < 0.05) %>%
+      group_by(cluster) %>%
+      top_n(n = 15, wt = avg_log2FC) %>%
+      ungroup()
+
+    if (nrow(topMarkers) == 0) next
+    topGenes <- unique(topMarkers$gene)
+
+    Idents(seuratObj) <- scheme$clusterCol
+    nClust <- length(unique(seuratObj@meta.data[[scheme$clusterCol]]))
+
+    pDot <- createGeneDotPlot(
+      seuratObj = seuratObj,
+      genes = topGenes,
+      groupBy = scheme$clusterCol,
+      title = paste0(comp, " \u2014 Top 15 ", scheme$name, " Cluster Markers (",
+        nClust, " clusters)"),
+      xlab = "Cluster-defining genes",
+      ylab = paste(scheme$name, "Cluster"),
+      plotDir = plotDir,
+      filename = paste0(comp, "_", scheme$name, "_clusterMarkers_top15_dotplot"),
+      orderGenes = TRUE,
+      height = 6,
+      width = 12
+    )
+
+    if (!is.null(pDot)) print(pDot)
+  }
+}
+```
+
+## Cluster Composition Barplots
+
+```{r clusterCompositionBarplots, fig.height = 14, fig.width = 18}
+barTheme <- theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  meta <- seuratObj@meta.data
+
+  # Build CellTypist L2 palette dynamically
+  ctL2Levels <- sort(unique(as.character(meta$cellTypistCallingL2)))
+  ctL2Levels <- ctL2Levels[!is.na(ctL2Levels)]
+  nL2 <- length(ctL2Levels)
+  if (nL2 > 0) {
+    palCellTypistL2 <- setNames(scales::hue_pal()(nL2), ctL2Levels)
+  } else {
+    palCellTypistL2 <- character(0)
+  }
+
+  barPlots <- list()
+
+  for (scheme in clusteringSchemes) {
+    clCol <- scheme$clusterCol
+    clName <- scheme$name
+
+    plotMeta <- meta %>%
+      tibble::rownames_to_column("cell") %>%
+      dplyr::mutate(cluster = factor(.data[[clCol]],
+        levels = gtools::mixedsort(unique(as.character(.data[[clCol]])))))
+
+    countsPerCluster <- plotMeta %>%
+      dplyr::count(cluster, name = "n") %>%
+      dplyr::mutate(y = 1.02, label = as.character(n))
+
+    # Donor
+    pDonor <- ggplot(plotMeta, aes(x = cluster, fill = donorID)) +
+      geom_bar(position = "fill") +
+      scale_fill_manual(values = palDonorId, na.value = "grey80") +
+      labs(title = paste(clName, "\u2014 Donor"), x = "Cluster",
+        y = "Proportion", fill = "Donor") +
+      barTheme +
+      coord_cartesian(ylim = c(0, 1.08), clip = "off") +
+      geom_text(data = countsPerCluster,
+        aes(x = cluster, y = y, label = label),
+        inherit.aes = FALSE, size = 3, vjust = 0)
+
+    # Treatment Phase
+    pPhase <- ggplot(plotMeta, aes(x = cluster, fill = treatmentPhase)) +
+      geom_bar(position = "fill") +
+      scale_fill_manual(values = palTreatmentPhase, na.value = "grey80") +
+      labs(title = paste(clName, "\u2014 Treatment Phase"), x = "Cluster",
+        y = "Proportion", fill = "Phase") +
+      barTheme +
+      coord_cartesian(ylim = c(0, 1.08), clip = "off") +
+      geom_text(data = countsPerCluster,
+        aes(x = cluster, y = y, label = label),
+        inherit.aes = FALSE, size = 3, vjust = 0)
+
+    # CellTypist L2
+    pCT <- ggplot(plotMeta, aes(x = cluster, fill = cellTypistCallingL2)) +
+      geom_bar(position = "fill") +
+      scale_fill_manual(values = palCellTypistL2, na.value = "grey80") +
+      labs(title = paste(clName, "\u2014 CellTypist L2"), x = "Cluster",
+        y = "Proportion", fill = "CellTypist L2") +
+      barTheme +
+      coord_cartesian(ylim = c(0, 1.08), clip = "off") +
+      geom_text(data = countsPerCluster,
+        aes(x = cluster, y = y, label = label),
+        inherit.aes = FALSE, size = 3, vjust = 0)
+
+    barPlots[[paste0(clName, "_donor")]] <- pDonor
+    barPlots[[paste0(clName, "_phase")]] <- pPhase
+    barPlots[[paste0(clName, "_ct")]]    <- pCT
+  }
+
+  # 3x3 grid: rows = metadata variable, columns = clustering type
+  combined <- (barPlots[["RNA_donor"]] | barPlots[["ATAC_donor"]] | barPlots[["WNN_donor"]]) /
+    (barPlots[["RNA_phase"]] | barPlots[["ATAC_phase"]] | barPlots[["WNN_phase"]]) /
+    (barPlots[["RNA_ct"]] | barPlots[["ATAC_ct"]] | barPlots[["WNN_ct"]]) +
+    patchwork::plot_annotation(
+      title = paste(comp, "\u2014 Cluster Composition by Metadata"),
+      theme = theme(plot.title = element_text(size = 16, face = "bold")))
+
+  print(combined)
+
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_cluster_composition_barplots"),
+    height = 14, width = 18)
+}
+```
+
+## HALLMARK IL2-STAT5 Signaling Score
+
+```{r il2Stat5Score}
+library(msigdbr)
+
+il2Stat5Genes <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::filter(gs_name == "HALLMARK_IL2_STAT5_SIGNALING") %>%
+  dplyr::pull(gene_symbol) %>%
+  unique()
+
+cat(sprintf("HALLMARK_IL2_STAT5_SIGNALING: %d genes\n", length(il2Stat5Genes)))
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "RNA"
+
+  genesPresent <- il2Stat5Genes[il2Stat5Genes %in% rownames(seuratObj)]
+  cat(sprintf("%s: %d / %d IL2-STAT5 genes present\n",
+    comp, length(genesPresent), length(il2Stat5Genes)))
+
+  seuratObj <- AddModuleScore(seuratObj, features = list(genesPresent),
+    name = "IL2_STAT5_score", seed = 42)
+
+  seuratList[[comp]] <- seuratObj
+}
+```
+
+## IL2-STAT5 UMAPs
+
+```{r il2Stat5UMAPs, fig.height = 5, fig.width = 18}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  pRNA <- FeaturePlot(seuratObj, features = "IL2_STAT5_score1",
+    reduction = "umap.rna") +
+    scale_color_viridis_c() +
+    ggtitle(paste(comp, "\u2014 RNA UMAP"))
+
+  pATAC <- FeaturePlot(seuratObj, features = "IL2_STAT5_score1",
+    reduction = "umap.atac") +
+    scale_color_viridis_c() +
+    ggtitle(paste(comp, "\u2014 ATAC UMAP"))
+
+  pWNN <- FeaturePlot(seuratObj, features = "IL2_STAT5_score1",
+    reduction = "umap.wnn") +
+    scale_color_viridis_c() +
+    ggtitle(paste(comp, "\u2014 WNN UMAP"))
+
+  combined <- pRNA | pATAC | pWNN
+  combined <- combined + patchwork::plot_annotation(
+    title = paste(comp, "\u2014 HALLMARK IL2-STAT5 Signaling Score"),
+    theme = theme(plot.title = element_text(size = 16, face = "bold")))
+
+  print(combined)
+
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_IL2_STAT5_UMAPs"),
+    height = 5, width = 18)
+}
+```
+
+## IL2-STAT5 Violins by Cluster
+
+```{r il2Stat5Violins, fig.height = 6, fig.width = 14}
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  meta <- seuratObj@meta.data
+
+  vlnPlots <- list()
+  for (scheme in clusteringSchemes) {
+    clCol <- scheme$clusterCol
+    clName <- scheme$name
+
+    clLevels <- gtools::mixedsort(unique(as.character(meta[[clCol]])))
+    nClust <- length(clLevels)
+    clPal <- setNames(scales::hue_pal()(nClust), clLevels)
+
+    pVln <- ggplot(meta, aes(x = factor(.data[[clCol]], levels = clLevels),
+      y = IL2_STAT5_score1, fill = factor(.data[[clCol]], levels = clLevels))) +
+      geom_violin(scale = "width", linewidth = 0.3) +
+      geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white",
+        alpha = 0.6, linewidth = 0.4) +
+      scale_fill_manual(values = clPal) +
+      labs(title = paste(clName, "Clusters"), x = "Cluster",
+        y = "IL2-STAT5 Score") +
+      theme_bw() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        legend.position = "none",
+        plot.title = element_text(size = 12)
+      )
+
+    vlnPlots[[clName]] <- pVln
+  }
+
+  combined <- vlnPlots[["RNA"]] | vlnPlots[["ATAC"]] | vlnPlots[["WNN"]]
+  combined <- combined + patchwork::plot_annotation(
+    title = paste(comp, "\u2014 HALLMARK IL2-STAT5 Signaling by Cluster"),
+    theme = theme(plot.title = element_text(size = 16, face = "bold")))
+
+  print(combined)
+
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_IL2_STAT5_violins"),
+    height = 6, width = 14)
 }
 ```
 
@@ -729,6 +1064,8 @@ wnnBundle <- list(
   macs2PeaksTreg = macs2PeaksList[["Treg"]],
   wnnResolution = selectedRes,
   clusterMarkers = allMarkers,
+  rnaClusterMarkers = rnaClusterMarkers,
+  atacClusterMarkers = atacClusterMarkers,
   evalResults = evalResults,
 
   # Carry forward
