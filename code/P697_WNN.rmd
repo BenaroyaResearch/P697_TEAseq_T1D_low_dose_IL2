@@ -45,6 +45,7 @@ opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE,
 opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
 
 options(stringsAsFactors = FALSE)
+knitr::opts_chunk$set(error = FALSE)
 options(future.globals.maxSize = 1591289600)
 ```
 
@@ -56,6 +57,8 @@ baseDir <- "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2"
 dataInputDir <- file.path(baseDir, "data/inputData")
 plotDir <- file.path(baseDir, "figures")
 dataOutputDir <- file.path(baseDir, "data/outputData")
+tableDir <- file.path(baseDir, "tables")
+if (!dir.exists(tableDir)) dir.create(tableDir, recursive = TRUE)
 dataDate <- Sys.Date()
 filenameSuffix <- paste0(projNumber, ".", dataDate)
 ```
@@ -64,18 +67,609 @@ filenameSuffix <- paste0(projNumber, ".", dataDate)
 source(file.path(getwd(), "code/P697_functions.R"))
 ```
 
+```{r analysisHelpers}
+phaseLevels <- c("Baseline", "Post-IL2", "Post-RAPA", "Followup")
+primaryContrastDefs <- list(
+  PostIL2_vs_BL = c("Post-IL2", "Baseline"),
+  PostRAPA_vs_BL = c("Post-RAPA", "Baseline"),
+  Followup_vs_BL = c("Followup", "Baseline"),
+  Followup_vs_PostRAPA = c("Followup", "Post-RAPA")
+)
+
+integrationSettings <- list(
+  rnaReduction = "harmony",
+  rnaDims = 1:18,
+  atacReduction = "harmony_lsi",
+  atacDims = 1:29,
+  wnnReductions = c("harmony", "harmony_lsi")
+)
+
+saveComplexHeatmap <- function(ht, plotDir, filename, width, height) {
+  pdf(file.path(plotDir, paste0(filenameSuffix, "_", filename, ".pdf")),
+    width = width, height = height)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+
+  png(file.path(plotDir, paste0(filenameSuffix, "_", filename, ".png")),
+    width = width, height = height, units = "in", res = 600)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+}
+
+aggregateCountsByGroups <- function(countMat, metadata, groupCols) {
+  groupMeta <- metadata[, groupCols, drop = FALSE]
+  groupMeta[] <- lapply(groupMeta, as.character)
+  groupMeta$groupID <- apply(groupMeta[, groupCols, drop = FALSE], 1, paste,
+    collapse = "__")
+
+  groups <- unique(groupMeta$groupID)
+  aggMat <- matrix(0, nrow = nrow(countMat), ncol = length(groups),
+    dimnames = list(rownames(countMat), groups))
+
+  for (grp in groups) {
+    idx <- which(groupMeta$groupID == grp)
+    if (length(idx) == 1) {
+      aggMat[, grp] <- as.numeric(countMat[, idx])
+    } else {
+      aggMat[, grp] <- Matrix::rowSums(countMat[, idx, drop = FALSE])
+    }
+  }
+
+  groupSummary <- tibble::as_tibble(groupMeta) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(c(groupCols, "groupID")))) %>%
+    dplyr::summarise(nCells = dplyr::n(), .groups = "drop")
+  groupSummary <- groupSummary[match(colnames(aggMat), groupSummary$groupID), , drop = FALSE]
+
+  list(counts = aggMat, groupMeta = groupSummary)
+}
+
+mostFrequentValue <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+buildClusterCoverageTable <- function(seuratObj, clusterCol = "wnn_clusters") {
+  meta <- seuratObj@meta.data
+  donorLevels <- sort(unique(as.character(meta$donorID)))
+  clusterLevels <- gtools::mixedsort(unique(as.character(meta[[clusterCol]])))
+
+  coverageLong <- meta %>%
+    dplyr::transmute(
+      donorID = factor(as.character(donorID), levels = donorLevels),
+      treatmentPhase = factor(as.character(treatmentPhase), levels = phaseLevels),
+      cluster = factor(as.character(.data[[clusterCol]]), levels = clusterLevels)
+    ) %>%
+    dplyr::count(cluster, treatmentPhase, donorID, name = "nCells") %>%
+    tidyr::complete(
+      cluster = factor(clusterLevels, levels = clusterLevels),
+      treatmentPhase = factor(phaseLevels, levels = phaseLevels),
+      donorID = factor(donorLevels, levels = donorLevels),
+      fill = list(nCells = 0)
+    )
+
+  coverageSummary <- coverageLong %>%
+    dplyr::group_by(cluster, treatmentPhase) %>%
+    dplyr::summarise(
+      nCells = sum(nCells),
+      nDonors = sum(nCells > 0),
+      medianCellsPerDonor = ifelse(any(nCells > 0), median(nCells[nCells > 0]), NA_real_),
+      minCellsPerDonor = ifelse(any(nCells > 0), min(nCells[nCells > 0]), NA_real_),
+      maxCellsPerDonor = ifelse(any(nCells > 0), max(nCells[nCells > 0]), NA_real_),
+      .groups = "drop"
+    )
+
+  list(long = coverageLong, summary = coverageSummary)
+}
+
+summarizePrimaryContrastReadiness <- function(coverageLong, contrastDefs) {
+  bind_rows(lapply(names(contrastDefs), function(nm) {
+    phase1 <- contrastDefs[[nm]][1]
+    phase2 <- contrastDefs[[nm]][2]
+
+    coverageLong %>%
+      dplyr::filter(treatmentPhase %in% c(phase1, phase2)) %>%
+      dplyr::mutate(treatmentPhase = as.character(treatmentPhase)) %>%
+      tidyr::pivot_wider(names_from = treatmentPhase, values_from = nCells,
+        values_fill = 0) %>%
+      dplyr::group_by(cluster) %>%
+      dplyr::summarise(
+        contrast = nm,
+        phase1 = phase1,
+        phase2 = phase2,
+        nDonorsPhase1 = sum(.data[[phase1]] > 0),
+        nDonorsPhase2 = sum(.data[[phase2]] > 0),
+        nDonorPairsWithCells = sum(.data[[phase1]] > 0 & .data[[phase2]] > 0),
+        totalCellsPhase1 = sum(.data[[phase1]]),
+        totalCellsPhase2 = sum(.data[[phase2]]),
+        .groups = "drop"
+      ) %>%
+      dplyr::mutate(
+        readyForPairedDA = nDonorPairsWithCells >= 2,
+        limitingPhase = dplyr::case_when(
+          nDonorsPhase1 < nDonorsPhase2 ~ phase1,
+          nDonorsPhase2 < nDonorsPhase1 ~ phase2,
+          TRUE ~ "Balanced"
+        )
+      )
+  }))
+}
+
+plotClusterCoverageHeatmap <- function(coverageSummary, title) {
+  ggplot(coverageSummary, aes(x = treatmentPhase, y = cluster, fill = nDonors)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = paste0(nDonors, "D / ", nCells, "C")), size = 3) +
+    scale_fill_viridis_c(option = "C", name = "# Donors") +
+    labs(
+      x = "Treatment Phase",
+      y = "WNN Cluster",
+      title = title,
+      subtitle = "Tile labels show donors represented and total cells"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+plotPrimaryContrastReadiness <- function(readinessDf, title) {
+  ggplot(readinessDf,
+    aes(x = contrast, y = cluster, fill = nDonorPairsWithCells)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = ifelse(readyForPairedDA,
+      paste0(nDonorPairsWithCells, " pairs"),
+      paste0(nDonorPairsWithCells, " pairs*"))), size = 3) +
+    scale_fill_viridis_c(option = "B", name = "# Donor pairs") +
+    labs(
+      x = "Primary Contrast",
+      y = "WNN Cluster",
+      title = title,
+      subtitle = "* fewer than 2 paired donors with cells in both phases"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+buildClusterAbundanceTable <- function(seuratObj, clusterCol = "wnn_clusters") {
+  meta <- seuratObj@meta.data
+  donorLevels <- sort(unique(as.character(meta$donorID)))
+  clusterLevels <- gtools::mixedsort(unique(as.character(meta[[clusterCol]])))
+
+  meta %>%
+    dplyr::transmute(
+      donorID = factor(as.character(donorID), levels = donorLevels),
+      treatmentPhase = factor(as.character(treatmentPhase), levels = phaseLevels),
+      cluster = factor(as.character(.data[[clusterCol]]), levels = clusterLevels)
+    ) %>%
+    dplyr::count(donorID, treatmentPhase, cluster, name = "nCells") %>%
+    tidyr::complete(
+      donorID = factor(donorLevels, levels = donorLevels),
+      treatmentPhase = factor(phaseLevels, levels = phaseLevels),
+      cluster = factor(clusterLevels, levels = clusterLevels),
+      fill = list(nCells = 0)
+    ) %>%
+    dplyr::group_by(donorID, treatmentPhase) %>%
+    dplyr::mutate(
+      totalCells = sum(nCells),
+      proportion = ifelse(totalCells > 0, nCells / totalCells, NA_real_)
+    ) %>%
+    dplyr::ungroup()
+}
+
+plotClusterAbundanceTrajectories <- function(abundanceDf, title) {
+  validDf <- abundanceDf %>%
+    dplyr::filter(!is.na(proportion), totalCells > 0)
+
+  summaryDf <- validDf %>%
+    dplyr::group_by(cluster, treatmentPhase) %>%
+    dplyr::summarise(
+      medianProportion = median(proportion),
+      nDonors = dplyr::n_distinct(donorID),
+      .groups = "drop"
+    )
+
+  ggplot(validDf, aes(x = treatmentPhase, y = proportion, group = donorID)) +
+    geom_line(color = "grey75", linewidth = 0.4, alpha = 0.8) +
+    geom_point(color = "grey45", size = 0.8, alpha = 0.8) +
+    geom_line(data = summaryDf,
+      aes(x = treatmentPhase, y = medianProportion, group = 1),
+      inherit.aes = FALSE, color = "#8B0000", linewidth = 0.9) +
+    geom_point(data = summaryDf,
+      aes(x = treatmentPhase, y = medianProportion),
+      inherit.aes = FALSE, color = "#8B0000", size = 1.6) +
+    facet_wrap(~cluster, scales = "free_y") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(
+      x = "Treatment Phase",
+      y = "Within-donor cluster proportion",
+      title = title,
+      subtitle = "Grey = individual donors, red = median across donors"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+buildClusterMappingTables <- function(metadata, referenceCol, referenceName,
+                                      wnnCol = "wnn_clusters") {
+  ct <- table(
+    referenceCluster = metadata[[referenceCol]],
+    wnnCluster = metadata[[wnnCol]]
+  )
+
+  counts <- as.data.frame(ct)
+  colnames(counts) <- c("referenceCluster", "wnnCluster", "Count")
+  counts$referenceModality <- referenceName
+
+  proportions <- as.data.frame(prop.table(ct, margin = 1))
+  colnames(proportions) <- c("referenceCluster", "wnnCluster", "Proportion")
+  proportions$referenceModality <- referenceName
+
+  list(counts = counts, proportions = proportions)
+}
+
+plotClusterMappingHeatmap <- function(proportionDf, title, yLabel, highColor) {
+  ggplot(proportionDf, aes(x = wnnCluster, y = referenceCluster, fill = Proportion)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.0f%%", 100 * Proportion)),
+      size = 3, color = "black") +
+    scale_fill_gradient(low = "white", high = highColor, limits = c(0, 1)) +
+    labs(x = "WNN Cluster", y = yLabel, title = title) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+buildPseudobulkHeatmapData <- function(seuratObj, genes, groupCols) {
+  counts <- GetAssayData(seuratObj, layer = "counts")
+  genesPresent <- intersect(genes, rownames(counts))
+  if (length(genesPresent) == 0) return(NULL)
+
+  agg <- aggregateCountsByGroups(
+    countMat = counts[genesPresent, , drop = FALSE],
+    metadata = seuratObj@meta.data,
+    groupCols = groupCols
+  )
+
+  ## Drop pseudobulk samples with zero total counts (empty group combos)
+  libSizes <- colSums(agg$counts)
+  validCols <- is.finite(libSizes) & libSizes > 0
+  if (sum(validCols) == 0) return(NULL)
+  agg$counts <- agg$counts[, validCols, drop = FALSE]
+  agg$groupMeta <- agg$groupMeta[validCols, , drop = FALSE]
+
+  logCpm <- edgeR::cpm(agg$counts, log = TRUE, prior.count = 1)
+  matScaled <- t(scale(t(logCpm)))
+  matScaled[is.na(matScaled)] <- 0
+
+  list(matrix = matScaled, annotation = agg$groupMeta)
+}
+
+buildNamedAnnotationPalette <- function(values, paletteValues = NULL) {
+  valueLevels <- if (is.factor(values)) {
+    levels(values)
+  } else {
+    unique(as.character(values))
+  }
+  valueLevels <- valueLevels[!is.na(valueLevels)]
+
+  if (length(valueLevels) == 0) return(character(0))
+
+  fallback <- setNames(scales::hue_pal()(length(valueLevels)), valueLevels)
+
+  if (is.null(paletteValues) || length(paletteValues) == 0) {
+    return(fallback)
+  }
+
+  paletteValues <- paletteValues[!is.na(paletteValues)]
+  paletteNames <- names(paletteValues)
+
+  if (is.null(paletteNames) || any(paletteNames == "")) {
+    fallback[valueLevels[seq_len(min(length(paletteValues), length(valueLevels)))]] <-
+      unname(paletteValues)[seq_len(min(length(paletteValues), length(valueLevels)))]
+    return(fallback)
+  }
+
+  matchingLevels <- intersect(valueLevels, paletteNames)
+  if (length(matchingLevels) > 0) {
+    fallback[matchingLevels] <- paletteValues[matchingLevels]
+  }
+
+  fallback
+}
+
+normalizeAnnotationColors <- function(annotationDf, annotationColors) {
+  normalized <- lapply(names(annotationColors), function(colName) {
+    if (!colName %in% colnames(annotationDf)) return(character(0))
+    buildNamedAnnotationPalette(annotationDf[[colName]], annotationColors[[colName]])
+  })
+  names(normalized) <- names(annotationColors)
+  normalized[vapply(normalized, length, integer(1)) > 0]
+}
+
+drawPseudobulkHeatmap <- function(matScaled, annotationDf, annotationColors,
+                                  splitCol, title, plotDir, filename,
+                                  width, height) {
+  if (is.null(matScaled) || ncol(matScaled) == 0) return(invisible(NULL))
+
+  matScaled[matScaled > 2.5] <- 2.5
+  matScaled[matScaled < -2.5] <- -2.5
+  annotationColors <- normalizeAnnotationColors(annotationDf, annotationColors)
+
+  htAnnot <- ComplexHeatmap::HeatmapAnnotation(
+    df = annotationDf,
+    col = annotationColors,
+    show_annotation_name = TRUE,
+    annotation_name_side = "left"
+  )
+
+  ht <- ComplexHeatmap::Heatmap(matScaled,
+    name = "z-score",
+    top_annotation = htAnnot,
+    column_split = annotationDf[[splitCol]],
+    cluster_columns = FALSE,
+    show_column_names = FALSE,
+    row_names_gp = grid::gpar(fontsize = 8),
+    column_title_gp = grid::gpar(fontsize = 10),
+    column_title_rot = 0,
+    col = colorRamp2(c(-2.5, 0, 2.5), c("blue", "white", "red")),
+    column_title = title,
+    heatmap_legend_param = list(title = "z-score"),
+    use_raster = TRUE,
+    raster_quality = 3
+  )
+
+  ComplexHeatmap::draw(ht)
+  saveComplexHeatmap(ht, plotDir, filename, width, height)
+}
+
+buildClusterPhenotypeSummary <- function(seuratObj, markers,
+                                         clusterCol = "wnn_clusters") {
+  meta <- seuratObj@meta.data
+  clusterLevels <- gtools::mixedsort(unique(as.character(meta[[clusterCol]])))
+
+  bind_rows(lapply(clusterLevels, function(cl) {
+    clMeta <- meta[as.character(meta[[clusterCol]]) == cl, , drop = FALSE]
+    topMarkers <- markers %>%
+      dplyr::filter(cluster == cl, p_val_adj < 0.05) %>%
+      dplyr::arrange(dplyr::desc(avg_log2FC), p_val_adj) %>%
+      dplyr::slice_head(n = 10)
+
+    data.frame(
+      cluster = cl,
+      nCells = nrow(clMeta),
+      nDonors = dplyr::n_distinct(clMeta$donorID),
+      dominantCellTypistL2 = if ("cellTypistCallingL2" %in% colnames(clMeta)) {
+        mostFrequentValue(clMeta$cellTypistCallingL2)
+      } else {
+        NA_character_
+      },
+      dominantCellTypistL3 = if ("cellTypistCallingL3" %in% colnames(clMeta)) {
+        mostFrequentValue(clMeta$cellTypistCallingL3)
+      } else {
+        NA_character_
+      },
+      topRNAMarkers = if (nrow(topMarkers) > 0) {
+        paste(unique(topMarkers$gene), collapse = "; ")
+      } else {
+        NA_character_
+      },
+      medianRNAWeight = if ("RNA.weight" %in% colnames(clMeta)) {
+        median(clMeta$RNA.weight, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      medianATACWeight = if ("ATAC.weight" %in% colnames(clMeta)) {
+        median(clMeta$ATAC.weight, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      stringsAsFactors = FALSE
+    )
+  }))
+}
+
+buildIl2Stat5Summary <- function(seuratObj, clusterCol = "wnn_clusters",
+                                 scoreCol = "IL2_STAT5_score1") {
+  meta <- seuratObj@meta.data %>%
+    dplyr::transmute(
+      donorID = factor(as.character(donorID), levels = sort(unique(as.character(donorID)))),
+      treatmentPhase = factor(as.character(treatmentPhase), levels = phaseLevels),
+      cluster = factor(as.character(.data[[clusterCol]]),
+        levels = gtools::mixedsort(unique(as.character(.data[[clusterCol]])))),
+      score = .data[[scoreCol]]
+    ) %>%
+    dplyr::filter(!is.na(score))
+
+  donorPhaseCluster <- meta %>%
+    dplyr::group_by(cluster, donorID, treatmentPhase) %>%
+    dplyr::summarise(
+      nCells = dplyr::n(),
+      meanScore = mean(score),
+      medianScore = median(score),
+      .groups = "drop"
+    )
+
+  phaseSummary <- donorPhaseCluster %>%
+    dplyr::group_by(cluster, treatmentPhase) %>%
+    dplyr::summarise(
+      nDonors = dplyr::n_distinct(donorID),
+      medianDonorScore = median(meanScore),
+      meanDonorScore = mean(meanScore),
+      .groups = "drop"
+    )
+
+  list(donorPhaseCluster = donorPhaseCluster, phaseSummary = phaseSummary)
+}
+
+plotIl2Stat5Heatmap <- function(phaseSummary, title) {
+  ggplot(phaseSummary,
+    aes(x = treatmentPhase, y = cluster, fill = medianDonorScore)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.2f\nn=%d", medianDonorScore, nDonors)),
+      size = 3) +
+    scale_fill_viridis_c(option = "D", name = "Median donor score",
+      na.value = "grey95") +
+    labs(
+      x = "Treatment Phase",
+      y = "WNN Cluster",
+      title = title,
+      subtitle = "Tile labels show median donor score and donors represented"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+plotIl2Stat5Trajectories <- function(donorSummary, title) {
+  summaryDf <- donorSummary %>%
+    dplyr::group_by(cluster, treatmentPhase) %>%
+    dplyr::summarise(medianMeanScore = median(meanScore), .groups = "drop")
+
+  ggplot(donorSummary, aes(x = treatmentPhase, y = meanScore, group = donorID)) +
+    geom_line(color = "grey75", linewidth = 0.4, alpha = 0.8) +
+    geom_point(color = "grey45", size = 0.8, alpha = 0.8) +
+    geom_line(data = summaryDf,
+      aes(x = treatmentPhase, y = medianMeanScore, group = 1),
+      inherit.aes = FALSE, color = "#8B0000", linewidth = 0.9) +
+    geom_point(data = summaryDf,
+      aes(x = treatmentPhase, y = medianMeanScore),
+      inherit.aes = FALSE, color = "#8B0000", size = 1.6) +
+    facet_wrap(~cluster, scales = "free_y") +
+    labs(
+      x = "Treatment Phase",
+      y = "Mean IL2-STAT5 score",
+      title = title,
+      subtitle = "Grey = individual donors, red = median across donors"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+addDerivedQCMetrics <- function(seuratObj) {
+  meta <- seuratObj@meta.data
+
+  if (!"complexity" %in% colnames(meta) &&
+    all(c("nFeature_RNA", "nCount_RNA") %in% colnames(meta))) {
+    seuratObj[["complexity"]] <- log10(seuratObj$nFeature_RNA) / log10(seuratObj$nCount_RNA)
+  }
+
+  if (!"tssEnrichment" %in% colnames(meta) &&
+    all(c("cr_arc_atac_TSS_fragments", "cr_arc_atac_fragments") %in% colnames(meta))) {
+    seuratObj[["tssEnrichment"]] <- seuratObj$cr_arc_atac_TSS_fragments /
+      (seuratObj$cr_arc_atac_fragments + 1) * 100
+  }
+
+  if (!"frip" %in% colnames(meta) &&
+    all(c("cr_arc_atac_peak_region_fragments", "cr_arc_atac_fragments") %in% colnames(meta))) {
+    seuratObj[["frip"]] <- seuratObj$cr_arc_atac_peak_region_fragments /
+      (seuratObj$cr_arc_atac_fragments + 1) * 100
+  }
+
+  if (!"atacMitoPct" %in% colnames(meta) &&
+    all(c("cr_arc_atac_mitochondrial_reads", "cr_arc_atac_fragments") %in% colnames(meta))) {
+    seuratObj[["atacMitoPct"]] <- seuratObj$cr_arc_atac_mitochondrial_reads /
+      (seuratObj$cr_arc_atac_fragments + 1) * 100
+  }
+
+  seuratObj
+}
+
+qcMetricSpecs <- list(
+  list(column = "nCount_RNA", label = "RNA UMI count", transform = "log10p"),
+  list(column = "nFeature_RNA", label = "RNA genes detected", transform = "log10p"),
+  list(column = "percentMt", label = "% mitochondrial RNA", transform = "identity"),
+  list(column = "percentRibo", label = "% ribosomal RNA", transform = "identity"),
+  list(column = "complexity", label = "RNA complexity", transform = "identity"),
+  list(column = "pctCountsInTop20Genes", label = "% counts in top 20 genes", transform = "identity"),
+  list(column = "nCount_ATAC", label = "ATAC peak counts", transform = "log10p"),
+  list(column = "cr_arc_atac_fragments", label = "ATAC fragments", transform = "log10p"),
+  list(column = "tssEnrichment", label = "TSS enrichment (%)", transform = "identity"),
+  list(column = "frip", label = "FRiP (%)", transform = "identity"),
+  list(column = "atacMitoPct", label = "% ATAC mitochondrial reads", transform = "identity"),
+  list(column = "nucleosomeSignal", label = "Nucleosome signal", transform = "log10p"),
+  list(column = "nfrFragments", label = "NFR fragments", transform = "log10p"),
+  list(column = "monoFragments", label = "Mononucleosomal fragments", transform = "log10p")
+)
+
+buildQCMetricPlot <- function(seuratObj, metricSpec, compartment) {
+  metricCol <- metricSpec$column
+  metricVals <- seuratObj@meta.data[[metricCol]]
+  if (is.null(metricVals) || sum(!is.na(metricVals)) < 10) return(NULL)
+
+  plotVals <- if (identical(metricSpec$transform, "log10p")) {
+    log10(metricVals + 1)
+  } else {
+    metricVals
+  }
+
+  finiteVals <- plotVals[is.finite(plotVals)]
+  if (length(finiteVals) < 10) return(NULL)
+
+  limits <- stats::quantile(finiteVals, probs = c(0.01, 0.99), na.rm = TRUE)
+  if (!all(is.finite(limits)) || diff(limits) <= 0) {
+    limits <- range(finiteVals, na.rm = TRUE)
+  }
+  if (!all(is.finite(limits)) || diff(limits) <= 0) return(NULL)
+
+  reductionInfo <- list(
+    list(name = "umap.rna", title = "RNA UMAP"),
+    list(name = "umap.atac", title = "ATAC UMAP"),
+    list(name = "umap.wnn", title = "WNN UMAP")
+  )
+
+  legendTitle <- if (identical(metricSpec$transform, "log10p")) {
+    paste0("log10(", metricSpec$label, " + 1)")
+  } else {
+    metricSpec$label
+  }
+
+  plotList <- lapply(reductionInfo, function(red) {
+    if (!red$name %in% names(seuratObj@reductions)) return(NULL)
+
+    emb <- Embeddings(seuratObj, red$name)[, 1:2, drop = FALSE]
+    plotDf <- data.frame(
+      dim1 = emb[, 1],
+      dim2 = emb[, 2],
+      metricValue = plotVals,
+      stringsAsFactors = FALSE
+    )
+
+    ggplot(plotDf, aes(x = dim1, y = dim2, color = metricValue)) +
+      geom_point(size = 0.25, alpha = 0.8) +
+      scale_color_viridis_c(
+        option = "D",
+        limits = limits,
+        oob = scales::squish,
+        na.value = "grey85",
+        name = legendTitle
+      ) +
+      labs(
+        x = NULL,
+        y = NULL,
+        title = paste(compartment, "—", red$title),
+        subtitle = metricSpec$label
+      ) +
+      theme(
+        axis.text = element_blank(),
+        axis.ticks = element_blank()
+      ) +
+      coord_equal()
+  })
+
+  plotList <- Filter(Negate(is.null), plotList)
+  if (length(plotList) == 0) return(NULL)
+
+  wrap_plots(plotList, ncol = length(plotList))
+}
+```
+
 # Load Peak Calling Bundles
 
 ```{r loadBundles}
 compartments <- c("NK", "Treg")
 seuratList <- list()
 macs2PeaksList <- list()
+sourcePeakCallingBundles <- list()
 
 for (comp in compartments) {
   pattern <- sprintf("P697\\..*_%s_peakCallingBundle\\.rds$", comp)
   bundleFiles <- list.files(dataOutputDir, pattern = pattern, full.names = TRUE)
+  if (length(bundleFiles) == 0) {
+    stop(sprintf("No %s peak-calling bundle found in data/outputData", comp))
+  }
   bundleFile <- bundleFiles[which.max(file.mtime(bundleFiles))]
   cat(sprintf("Loading %s bundle: %s\n", comp, basename(bundleFile)))
+  sourcePeakCallingBundles[[comp]] <- basename(bundleFile)
 
   bundle <- readRDS(bundleFile)
 
@@ -146,21 +740,47 @@ rm(seuratObj)
 ```{r recomputeRNAUMAP}
 # The RNA UMAP from preprocessing was computed on all cells (including
 # non-ATAC-passing). After subsetting in peak calling, coordinates are stale.
-# Recompute for fair comparison with ATAC and WNN UMAPs.
+# Recompute on the harmony embedding for fair comparison with ATAC and WNN UMAPs.
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
 
   set.seed(6022)
   seuratObj <- RunUMAP(
     seuratObj,
-    reduction = "harmony",
-    dims = 1:18,
+    reduction = integrationSettings$rnaReduction,
+    dims = integrationSettings$rnaDims,
     reduction.name = "umap.rna",
     reduction.key = "rnaUMAP_",
     verbose = FALSE
   )
 
   cat(sprintf("%s: RNA UMAP recomputed (%d cells)\n", comp, ncol(seuratObj)))
+  seuratList[[comp]] <- seuratObj
+}
+rm(seuratObj)
+gc(verbose = FALSE)
+```
+
+# Recompute ATAC UMAP on Integrated ATAC Embedding
+
+```{r recomputeATACUMAP, cache = FALSE}
+# Recompute the ATAC UMAP from harmony_lsi here so all three displayed embeddings
+# in this script are derived from the integrated reductions used for clustering.
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+
+  set.seed(6022)
+  seuratObj <- RunUMAP(
+    seuratObj,
+    reduction = integrationSettings$atacReduction,
+    dims = integrationSettings$atacDims,
+    reduction.name = "umap.atac",
+    reduction.key = "atacUMAP_",
+    verbose = FALSE
+  )
+
+  cat(sprintf("%s: ATAC UMAP recomputed from %s (%d cells)\n",
+    comp, integrationSettings$atacReduction, ncol(seuratObj)))
   seuratList[[comp]] <- seuratObj
 }
 rm(seuratObj)
@@ -174,13 +794,17 @@ for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
 
   cat(sprintf("\n%s: Running FindMultiModalNeighbors...\n", comp))
-  cat(sprintf("  RNA: harmony (dims 1:18)\n"))
-  cat(sprintf("  ATAC: harmony_lsi (dims 1:29)\n"))
+  cat(sprintf("  RNA: %s (dims %s)\n",
+    integrationSettings$rnaReduction,
+    paste(range(integrationSettings$rnaDims), collapse = ":")))
+  cat(sprintf("  ATAC: %s (dims %s)\n",
+    integrationSettings$atacReduction,
+    paste(range(integrationSettings$atacDims), collapse = ":")))
 
   seuratObj <- FindMultiModalNeighbors(
     seuratObj,
-    reduction.list = list("harmony", "harmony_lsi"),
-    dims.list = list(1:18, 1:29),
+    reduction.list = as.list(integrationSettings$wnnReductions),
+    dims.list = list(integrationSettings$rnaDims, integrationSettings$atacDims),
     modality.weight.name = c("RNA.weight", "ATAC.weight"),
     verbose = FALSE
   )
@@ -219,7 +843,7 @@ gc(verbose = FALSE)
 # WNN Clustering Evaluation
 
 ```{r evaluateResolutions}
-resolutions <- seq(0.1, 2.0, by = 0.1)
+resolutions <- seq(0.05, 0.5, by = 0.05)
 evalResults <- list()
 
 for (comp in compartments) {
@@ -260,7 +884,7 @@ for (comp in compartments) {
       metrics$meanSilhouette[j] <- mean(sil[, 3])
     }
 
-    cat(sprintf("  res %.1f: %d clusters, sil %.3f\n",
+    cat(sprintf("  res %.2f: %d clusters, sil %.3f\n",
       res, metrics$nClusters[j],
       ifelse(is.na(metrics$meanSilhouette[j]), NA, metrics$meanSilhouette[j])))
   }
@@ -303,7 +927,7 @@ savePlot(plot = pSil | pNCl, plotDir = plotDir,
 
 for (comp in compartments) {
   bestIdx <- which.max(evalResults[[comp]]$meanSilhouette)
-  cat(sprintf("%s best silhouette: res %.1f → %d clusters (sil = %.3f)\n",
+  cat(sprintf("%s best silhouette: res %.2f → %d clusters (sil = %.3f)\n",
     comp, evalResults[[comp]]$resolution[bestIdx],
     evalResults[[comp]]$nClusters[bestIdx],
     evalResults[[comp]]$meanSilhouette[bestIdx]))
@@ -312,9 +936,13 @@ for (comp in compartments) {
 
 # Select Final Resolution
 
-```{r selectResolution}
+```{r selectResolution, cache = FALSE}
 # Default: resolution with highest mean silhouette.
 # Override by uncommenting the manual lines below after inspecting the metrics.
+# The counts printed here refer only to WNN clustering on the wsnn graph.
+# RNA-only and ATAC-only clustering below reuse the same numeric resolution for
+# comparability, but they operate on different graphs and are not expected to
+# return the same number of clusters.
 selectedRes <- list()
 for (comp in compartments) {
   bestIdx <- which.max(evalResults[[comp]]$meanSilhouette)
@@ -322,8 +950,8 @@ for (comp in compartments) {
 }
 
 # Manual override (uncomment to use):
-# selectedRes[["NK"]] <- 0.5
-# selectedRes[["Treg"]] <- 0.5
+# selectedRes[["NK"]] <- 0.05
+# selectedRes[["Treg"]] <- 0.05 # 0.05
 
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
@@ -342,14 +970,74 @@ rm(seuratObj)
 gc(verbose = FALSE)
 ```
 
+# WNN Cluster Coverage and Primary Contrast Readiness
+
+```{r clusterCoverageReadiness, fig.height = 10, fig.width = 10, cache = FALSE}
+clusterCoverage <- list()
+clusterReadiness <- list()
+
+for (comp in compartments) {
+  coverageObj <- buildClusterCoverageTable(seuratList[[comp]])
+  readinessDf <- summarizePrimaryContrastReadiness(
+    coverageObj$long,
+    primaryContrastDefs
+  )
+
+  clusterCoverage[[comp]] <- coverageObj
+  clusterReadiness[[comp]] <- readinessDf
+
+  write.csv(
+    coverageObj$long,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_WNN_cluster_donor_phase_cells.csv")),
+    row.names = FALSE
+  )
+  write.csv(
+    coverageObj$summary,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_WNN_cluster_phase_summary.csv")),
+    row.names = FALSE
+  )
+  write.csv(
+    readinessDf,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_WNN_primary_contrast_readiness.csv")),
+    row.names = FALSE
+  )
+
+  pCoverage <- plotClusterCoverageHeatmap(
+    coverageObj$summary,
+    paste(comp, "— WNN Cluster Coverage by Treatment Phase")
+  )
+  pReadiness <- plotPrimaryContrastReadiness(
+    readinessDf,
+    paste(comp, "— Primary Contrast Readiness by WNN Cluster")
+  )
+
+  combined <- pCoverage / pReadiness
+  print(combined)
+  savePlot(
+    plot = combined,
+    plotDir = plotDir,
+    filename = paste0(comp, "_WNN_cluster_readiness"),
+    height = 10,
+    width = 10
+  )
+}
+```
+
 # RNA-Only and ATAC-Only Clustering
 
-```{r rnaClustering}
-# RNA-only clustering using the same resolution as WNN for comparability.
+```{r rnaClustering, cache = FALSE}
+# RNA-only clustering using the same numeric resolution as WNN for comparability.
+# The cluster count can differ from WNN because the RNA_snn graph is built from
+# the harmony RNA reduction alone, not the wsnn graph.
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
 
-  seuratObj <- FindNeighbors(seuratObj, reduction = "harmony", dims = 1:18,
+  seuratObj <- FindNeighbors(seuratObj,
+    reduction = integrationSettings$rnaReduction,
+    dims = integrationSettings$rnaDims,
     graph.name = c("RNA_nn", "RNA_snn"), verbose = FALSE)
   seuratObj <- FindClusters(seuratObj, graph.name = "RNA_snn",
     resolution = selectedRes[[comp]], verbose = FALSE)
@@ -365,12 +1053,16 @@ rm(seuratObj)
 gc(verbose = FALSE)
 ```
 
-```{r atacClustering}
-# ATAC-only clustering using the same resolution as WNN for comparability.
+```{r atacClustering, cache = FALSE}
+# ATAC-only clustering using the same numeric resolution as WNN for comparability.
+# The cluster count can differ from WNN because the ATAC_snn graph is built from
+# harmony_lsi alone, not the wsnn graph.
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
 
-  seuratObj <- FindNeighbors(seuratObj, reduction = "harmony_lsi", dims = 1:29,
+  seuratObj <- FindNeighbors(seuratObj,
+    reduction = integrationSettings$atacReduction,
+    dims = integrationSettings$atacDims,
     graph.name = c("ATAC_nn", "ATAC_snn"), verbose = FALSE)
   seuratObj <- FindClusters(seuratObj, graph.name = "ATAC_snn",
     resolution = selectedRes[[comp]], verbose = FALSE)
@@ -384,6 +1076,122 @@ for (comp in compartments) {
 }
 rm(seuratObj)
 gc(verbose = FALSE)
+```
+
+# Cluster Count Summary at Selected Resolution
+
+```{r clusterCountSummary, fig.height = 4, fig.width = 9, cache = FALSE}
+clusterCountSummary <- list()
+
+for (comp in compartments) {
+  summaryDf <- data.frame(
+    compartment = comp,
+    clustering = c("WNN", "RNA", "ATAC"),
+    graph = c("wsnn", "RNA_snn", "ATAC_snn"),
+    reduction = c(
+      paste(integrationSettings$wnnReductions, collapse = " + "),
+      integrationSettings$rnaReduction,
+      integrationSettings$atacReduction
+    ),
+    resolution = selectedRes[[comp]],
+    nClusters = c(
+      length(unique(seuratList[[comp]]$wnn_clusters)),
+      length(unique(seuratList[[comp]]$rna_clusters)),
+      length(unique(seuratList[[comp]]$atac_clusters))
+    ),
+    stringsAsFactors = FALSE
+  )
+  clusterCountSummary[[comp]] <- summaryDf
+
+  write.csv(
+    summaryDf,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_cluster_count_summary.csv")),
+    row.names = FALSE
+  )
+
+  cat(sprintf("\n%s clustering summary at resolution %.2f:\n",
+    comp, selectedRes[[comp]]))
+  print(summaryDf[, c("clustering", "graph", "reduction", "nClusters")])
+}
+
+clusterCountSummaryDf <- bind_rows(clusterCountSummary)
+
+pCountSummary <- ggplot(clusterCountSummaryDf,
+  aes(x = clustering, y = nClusters, fill = clustering)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = nClusters), vjust = -0.3, size = 4) +
+  facet_wrap(~compartment, scales = "free_y") +
+  scale_fill_manual(values = c("WNN" = "#4DAF4A", "RNA" = "#377EB8", "ATAC" = "#FF7F00")) +
+  labs(
+    x = "Clustering scheme",
+    y = "# Clusters",
+    title = "Cluster Counts at the Selected Resolution",
+    subtitle = "Same numeric resolution across different graphs does not imply the same number of clusters"
+  ) +
+  theme(legend.position = "none")
+
+print(pCountSummary)
+savePlot(
+  plot = pCountSummary,
+  plotDir = plotDir,
+  filename = "cluster_count_summary",
+  height = 4,
+  width = 9
+)
+```
+
+# QC Metrics on Integrated UMAPs
+
+```{r qcMetricsOnUMAPs, fig.height = 5, fig.width = 18, cache = FALSE}
+qcPlotDir <- file.path(plotDir, "QC_UMAPs")
+if (!dir.exists(qcPlotDir)) dir.create(qcPlotDir, recursive = TRUE)
+
+qcMetricAvailability <- list()
+
+for (comp in compartments) {
+  seuratObj <- addDerivedQCMetrics(seuratList[[comp]])
+  seuratList[[comp]] <- seuratObj
+
+  availableSpecs <- Filter(function(spec) {
+    spec$column %in% colnames(seuratObj@meta.data) &&
+      sum(!is.na(seuratObj@meta.data[[spec$column]])) >= 10
+  }, qcMetricSpecs)
+
+  qcMetricAvailability[[comp]] <- data.frame(
+    compartment = comp,
+    metric = vapply(availableSpecs, `[[`, character(1), "column"),
+    label = vapply(availableSpecs, `[[`, character(1), "label"),
+    nNonMissing = vapply(availableSpecs, function(spec) {
+      sum(!is.na(seuratObj@meta.data[[spec$column]]))
+    }, numeric(1)),
+    stringsAsFactors = FALSE
+  )
+
+  cat(sprintf("\n%s: plotting %d QC metrics on integrated UMAPs\n",
+    comp, length(availableSpecs)))
+
+  for (spec in availableSpecs) {
+    pQC <- buildQCMetricPlot(seuratObj, spec, comp)
+    if (is.null(pQC)) next
+
+    print(pQC)
+    savePlot(
+      plot = pQC,
+      plotDir = qcPlotDir,
+      filename = paste0(comp, "_QC_UMAP_", spec$column),
+      height = 5,
+      width = 18
+    )
+  }
+}
+
+qcMetricAvailabilityDf <- bind_rows(qcMetricAvailability)
+write.csv(
+  qcMetricAvailabilityDf,
+  file.path(tableDir, paste0(filenameSuffix, "_QC_metric_availability_for_UMAPs.csv")),
+  row.names = FALSE
+)
 ```
 
 # WNN Visualization {.tabset}
@@ -492,52 +1300,86 @@ for (comp in compartments) {
 }
 ```
 
-# WNN vs RNA Cluster Comparison
+# WNN vs Modality-Specific Cluster Comparison
 
-```{r clusterComparison, fig.height = 6, fig.width = 8}
+```{r clusterComparison, fig.height = 6, fig.width = 8, cache = FALSE}
+clusterMappings <- list()
+
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
+  meta <- seuratObj@meta.data
+  clusterMappings[[comp]] <- list()
+  mappingPlots <- list()
 
-  # Find RNA cluster column from preprocessing
-  rnaClusCol <- intersect(
-    c("seurat_clusters_RNA_0p3", "RNA_snn_res.0.3", "seurat_clusters"),
-    colnames(seuratObj@meta.data)
-  )
+  if ("rna_clusters" %in% colnames(meta)) {
+    cat(sprintf("%s: comparing WNN clusters to RNA-only clusters\n", comp))
+    mapping <- buildClusterMappingTables(meta, "rna_clusters", "RNA")
+    clusterMappings[[comp]]$RNA <- mapping
 
-  if (length(rnaClusCol) == 0) {
-    cat(sprintf("%s: no RNA cluster column found, skipping comparison\n", comp))
+    write.csv(
+      mapping$counts,
+      file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_WNN_vs_RNA_cluster_mapping_counts.csv")),
+      row.names = FALSE
+    )
+    write.csv(
+      mapping$proportions,
+      file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_WNN_vs_RNA_cluster_mapping_proportions.csv")),
+      row.names = FALSE
+    )
+
+    mappingPlots[["RNA"]] <- plotClusterMappingHeatmap(
+      mapping$proportions,
+      title = paste(comp, "— RNA-only → WNN Cluster Mapping"),
+      yLabel = "RNA Cluster",
+      highColor = "#377EB8"
+    )
+  }
+
+  if ("atac_clusters" %in% colnames(meta)) {
+    cat(sprintf("%s: comparing WNN clusters to ATAC-only clusters\n", comp))
+    mapping <- buildClusterMappingTables(meta, "atac_clusters", "ATAC")
+    clusterMappings[[comp]]$ATAC <- mapping
+
+    write.csv(
+      mapping$counts,
+      file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_WNN_vs_ATAC_cluster_mapping_counts.csv")),
+      row.names = FALSE
+    )
+    write.csv(
+      mapping$proportions,
+      file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_WNN_vs_ATAC_cluster_mapping_proportions.csv")),
+      row.names = FALSE
+    )
+
+    mappingPlots[["ATAC"]] <- plotClusterMappingHeatmap(
+      mapping$proportions,
+      title = paste(comp, "— ATAC-only → WNN Cluster Mapping"),
+      yLabel = "ATAC Cluster",
+      highColor = "#FF7F00"
+    )
+  }
+
+  if (length(mappingPlots) == 0) {
+    cat(sprintf("%s: no RNA or ATAC cluster columns found for mapping\n", comp))
     next
   }
-  rnaClusCol <- rnaClusCol[1]
-  cat(sprintf("%s: comparing WNN clusters to RNA clusters (%s)\n", comp, rnaClusCol))
 
-  ct <- table(
-    RNA = seuratObj@meta.data[[rnaClusCol]],
-    WNN = seuratObj$wnn_clusters
-  )
-  ctProp <- prop.table(ct, margin = 1)
-  ctDf <- as.data.frame(ctProp)
-  colnames(ctDf) <- c("RNA_cluster", "WNN_cluster", "Proportion")
+  combined <- wrap_plots(mappingPlots, ncol = length(mappingPlots))
+  print(combined)
 
-  pHeat <- ggplot(ctDf, aes(x = WNN_cluster, y = RNA_cluster, fill = Proportion)) +
-    geom_tile(color = "white") +
-    geom_text(aes(label = sprintf("%.0f%%", 100 * Proportion)),
-      size = 3, color = "black") +
-    scale_fill_gradient(low = "white", high = "#377EB8") +
-    labs(x = "WNN Cluster", y = "RNA Cluster",
-      title = paste(comp, "— RNA → WNN Cluster Mapping"))
-
-  print(pHeat)
-
-  savePlot(plot = pHeat, plotDir = plotDir,
-    filename = paste0(comp, "_WNN_vs_RNA_clusters"),
-    height = 6, width = 8)
+  savePlot(plot = combined, plotDir = plotDir,
+    filename = paste0(comp, "_WNN_cluster_mappings"),
+    height = 6, width = 8 * length(mappingPlots))
 }
 ```
 
 # WNN Cluster Characterization
 
-```{r clusterMarkers}
+```{r clusterMarkers, cache = FALSE}
 allMarkers <- list()
 
 for (comp in compartments) {
@@ -564,7 +1406,7 @@ for (comp in compartments) {
 }
 ```
 
-```{r markerDotplots, fig.height = 6, fig.width = 12}
+```{r markerDotplots, fig.height = 6, fig.width = 12, cache = FALSE}
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
   markers <- allMarkers[[comp]]
@@ -600,9 +1442,9 @@ for (comp in compartments) {
 }
 ```
 
-## Marker Heatmap by Treatment Phase
+## Pseudobulk Marker Heatmap by Treatment Phase
 
-```{r markerHeatmapByPhase, fig.height = 8, fig.width = 12}
+```{r markerHeatmapByPhase, fig.height = 8, fig.width = 12, cache = FALSE}
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
   markers <- allMarkers[[comp]]
@@ -617,73 +1459,48 @@ for (comp in compartments) {
   if (nrow(topMarkers) == 0) next
   topGenes <- unique(topMarkers$gene)
 
-  # Get scaled expression for marker genes
-  seuratObj <- ScaleData(seuratObj, features = topGenes, verbose = FALSE)
-  matScaled <- as.matrix(GetAssayData(seuratObj, layer = "scale.data")[topGenes, , drop = FALSE])
+  heatmapData <- buildPseudobulkHeatmapData(
+    seuratObj = seuratObj,
+    genes = topGenes,
+    groupCols = c("treatmentPhase", "wnn_clusters", "donorID")
+  )
+  if (is.null(heatmapData)) next
 
-  # Order cells by treatment phase, then by WNN cluster within phase
-  cellOrder <- order(seuratObj$treatmentPhase, seuratObj$wnn_clusters)
-  matScaled <- matScaled[, cellOrder]
+  annotDf <- heatmapData$annotation %>%
+    dplyr::mutate(
+      treatmentPhase = factor(treatmentPhase, levels = phaseLevels),
+      wnn_clusters = factor(as.character(wnn_clusters),
+        levels = gtools::mixedsort(unique(as.character(wnn_clusters)))),
+      donorID = factor(as.character(donorID),
+        levels = sort(unique(as.character(donorID))))
+    ) %>%
+    dplyr::arrange(treatmentPhase, wnn_clusters, donorID)
 
-  # Clamp extreme values for visualization
-  matScaled[matScaled > 2.5] <- 2.5
-  matScaled[matScaled < -2.5] <- -2.5
+  matScaled <- heatmapData$matrix[, annotDf$groupID, drop = FALSE]
+  colnames(matScaled) <- annotDf$groupID
 
-  # Build annotations
-  phaseOrdered <- seuratObj$treatmentPhase[cellOrder]
-  clusterOrdered <- factor(seuratObj$wnn_clusters[cellOrder])
-
-  htAnnot <- ComplexHeatmap::HeatmapAnnotation(
-    Phase = phaseOrdered,
-    Cluster = clusterOrdered,
-    col = list(
-      Phase = palTreatmentPhase,
-      Cluster = setNames(
-        scales::hue_pal()(length(levels(clusterOrdered))),
-        levels(clusterOrdered))
+  clusterLevels <- levels(annotDf$wnn_clusters)
+  drawPseudobulkHeatmap(
+    matScaled = matScaled,
+    annotationDf = annotDf[, c("treatmentPhase", "wnn_clusters", "donorID"), drop = FALSE],
+    annotationColors = list(
+      treatmentPhase = palTreatmentPhase,
+      wnn_clusters = setNames(scales::hue_pal()(length(clusterLevels)), clusterLevels),
+      donorID = palDonorId[levels(annotDf$donorID)]
     ),
-    show_annotation_name = TRUE,
-    annotation_name_side = "left",
-    annotation_legend_param = list(
-      Phase = list(title = "Treatment Phase"),
-      Cluster = list(title = "WNN Cluster")
-    )
+    splitCol = "treatmentPhase",
+    title = paste0(comp, " — Pseudobulk Marker Genes by Treatment Phase"),
+    plotDir = plotDir,
+    filename = paste0(comp, "_WNN_markerHeatmap_byPhase_pseudobulk"),
+    width = 12,
+    height = 8
   )
-
-  ht <- ComplexHeatmap::Heatmap(matScaled,
-    name = "z-score",
-    top_annotation = htAnnot,
-    column_split = phaseOrdered,
-    cluster_columns = FALSE,
-    show_column_names = FALSE,
-    row_names_gp = grid::gpar(fontsize = 8),
-    column_title_gp = grid::gpar(fontsize = 10),
-    column_title_rot = 0,
-    col = colorRamp2(c(-2.5, 0, 2.5), c("blue", "white", "red")),
-    column_title = paste0(comp, " — Marker Genes by Treatment Phase"),
-    heatmap_legend_param = list(title = "z-score"),
-    use_raster = TRUE,
-    raster_quality = 3
-  )
-
-  ComplexHeatmap::draw(ht)
-
-  pdf(file.path(plotDir, paste0(filenameSuffix, "_", comp,
-    "_WNN_markerHeatmap_byPhase.pdf")), width = 12, height = 8)
-  ComplexHeatmap::draw(ht)
-  dev.off()
-
-  png(file.path(plotDir, paste0(filenameSuffix, "_", comp,
-    "_WNN_markerHeatmap_byPhase.png")),
-  width = 12, height = 8, units = "in", res = 600)
-  ComplexHeatmap::draw(ht)
-  dev.off()
 }
 ```
 
-## Marker Heatmap by Visit
+## Pseudobulk Marker Heatmap by Visit
 
-```{r markerHeatmapByVisit, fig.height = 8, fig.width = 14}
+```{r markerHeatmapByVisit, fig.height = 8, fig.width = 14, cache = FALSE}
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
   markers <- allMarkers[[comp]]
@@ -698,71 +1515,45 @@ for (comp in compartments) {
   if (nrow(topMarkers) == 0) next
   topGenes <- unique(topMarkers$gene)
 
-  # Get scaled expression for marker genes
-  seuratObj <- ScaleData(seuratObj, features = topGenes, verbose = FALSE)
-  matScaled <- as.matrix(GetAssayData(seuratObj, layer = "scale.data")[topGenes, , drop = FALSE])
+  heatmapData <- buildPseudobulkHeatmapData(
+    seuratObj = seuratObj,
+    genes = topGenes,
+    groupCols = c("visitNum", "treatmentPhase", "wnn_clusters", "donorID")
+  )
+  if (is.null(heatmapData)) next
 
-  # Order cells by visitNum, then by WNN cluster within visit
-  visitFactor <- factor(seuratObj$visitNum,
-    levels = sort(unique(as.numeric(as.character(seuratObj$visitNum)))))
-  cellOrder <- order(visitFactor, seuratObj$wnn_clusters)
-  matScaled <- matScaled[, cellOrder]
+  visitLevels <- sort(unique(as.numeric(as.character(seuratObj$visitNum))))
+  annotDf <- heatmapData$annotation %>%
+    dplyr::mutate(
+      visitNum = factor(as.character(visitNum), levels = as.character(visitLevels)),
+      treatmentPhase = factor(treatmentPhase, levels = phaseLevels),
+      wnn_clusters = factor(as.character(wnn_clusters),
+        levels = gtools::mixedsort(unique(as.character(wnn_clusters)))),
+      donorID = factor(as.character(donorID),
+        levels = sort(unique(as.character(donorID))))
+    ) %>%
+    dplyr::arrange(visitNum, wnn_clusters, donorID)
 
-  matScaled[matScaled > 2.5] <- 2.5
-  matScaled[matScaled < -2.5] <- -2.5
+  matScaled <- heatmapData$matrix[, annotDf$groupID, drop = FALSE]
+  colnames(matScaled) <- annotDf$groupID
 
-  visitOrdered <- visitFactor[cellOrder]
-  clusterOrdered <- factor(seuratObj$wnn_clusters[cellOrder])
-  phaseOrdered <- seuratObj$treatmentPhase[cellOrder]
-
-  htAnnot <- ComplexHeatmap::HeatmapAnnotation(
-    Visit = visitOrdered,
-    Phase = phaseOrdered,
-    Cluster = clusterOrdered,
-    col = list(
-      Visit = palVisit,
-      Phase = palTreatmentPhase,
-      Cluster = setNames(
-        scales::hue_pal()(length(levels(clusterOrdered))),
-        levels(clusterOrdered))
+  clusterLevels <- levels(annotDf$wnn_clusters)
+  drawPseudobulkHeatmap(
+    matScaled = matScaled,
+    annotationDf = annotDf[, c("visitNum", "treatmentPhase", "wnn_clusters", "donorID"), drop = FALSE],
+    annotationColors = list(
+      visitNum = palVisit[levels(annotDf$visitNum)],
+      treatmentPhase = palTreatmentPhase,
+      wnn_clusters = setNames(scales::hue_pal()(length(clusterLevels)), clusterLevels),
+      donorID = palDonorId[levels(annotDf$donorID)]
     ),
-    show_annotation_name = TRUE,
-    annotation_name_side = "left",
-    annotation_legend_param = list(
-      Visit = list(title = "Visit"),
-      Phase = list(title = "Treatment Phase"),
-      Cluster = list(title = "WNN Cluster")
-    )
+    splitCol = "visitNum",
+    title = paste0(comp, " — Pseudobulk Marker Genes by Visit"),
+    plotDir = plotDir,
+    filename = paste0(comp, "_WNN_markerHeatmap_byVisit_pseudobulk"),
+    width = 14,
+    height = 8
   )
-
-  ht <- ComplexHeatmap::Heatmap(matScaled,
-    name = "z-score",
-    top_annotation = htAnnot,
-    column_split = visitOrdered,
-    cluster_columns = FALSE,
-    show_column_names = FALSE,
-    row_names_gp = grid::gpar(fontsize = 8),
-    column_title_gp = grid::gpar(fontsize = 10),
-    column_title_rot = 0,
-    col = colorRamp2(c(-2.5, 0, 2.5), c("blue", "white", "red")),
-    column_title = paste0(comp, " — Marker Genes by Visit"),
-    heatmap_legend_param = list(title = "z-score"),
-    use_raster = TRUE,
-    raster_quality = 3
-  )
-
-  ComplexHeatmap::draw(ht)
-
-  pdf(file.path(plotDir, paste0(filenameSuffix, "_", comp,
-    "_WNN_markerHeatmap_byVisit.pdf")), width = 14, height = 8)
-  ComplexHeatmap::draw(ht)
-  dev.off()
-
-  png(file.path(plotDir, paste0(filenameSuffix, "_", comp,
-    "_WNN_markerHeatmap_byVisit.png")),
-  width = 14, height = 8, units = "in", res = 600)
-  ComplexHeatmap::draw(ht)
-  dev.off()
 }
 ```
 
@@ -770,7 +1561,7 @@ for (comp in compartments) {
 
 ## Cluster-Defining Markers (RNA & ATAC Clusters)
 
-```{r rnaAtacClusterMarkers}
+```{r rnaAtacClusterMarkers, cache = FALSE}
 # FindAllMarkers for RNA-only and ATAC-only cluster identities (WNN already done above).
 rnaClusterMarkers <- list()
 atacClusterMarkers <- list()
@@ -801,7 +1592,7 @@ for (comp in compartments) {
 
 ## Top 15 Marker Dotplots
 
-```{r clusterDefiningDotplots, fig.height = 6, fig.width = 12}
+```{r clusterDefiningDotplots, fig.height = 6, fig.width = 12, cache = FALSE}
 clusteringSchemes <- list(
   list(name = "RNA",  clusterCol = "rna_clusters",  markerList = rnaClusterMarkers),
   list(name = "ATAC", clusterCol = "atac_clusters", markerList = atacClusterMarkers),
@@ -850,7 +1641,7 @@ for (comp in compartments) {
 
 ## Cluster Composition Barplots
 
-```{r clusterCompositionBarplots, fig.height = 14, fig.width = 18}
+```{r clusterCompositionBarplots, fig.height = 14, fig.width = 18, cache = FALSE}
 barTheme <- theme_minimal(base_size = 12) +
   theme(
     legend.position = "right",
@@ -943,9 +1734,103 @@ for (comp in compartments) {
 }
 ```
 
+## Donor-Normalized WNN Cluster Abundance
+
+```{r donorNormalizedClusterAbundance, fig.height = 8, fig.width = 14, cache = FALSE}
+clusterAbundance <- list()
+clusterAbundanceSummary <- list()
+
+for (comp in compartments) {
+  abundanceDf <- buildClusterAbundanceTable(seuratList[[comp]])
+  clusterAbundance[[comp]] <- abundanceDf
+
+  summaryDf <- abundanceDf %>%
+    dplyr::filter(!is.na(proportion), totalCells > 0) %>%
+    dplyr::group_by(cluster, treatmentPhase) %>%
+    dplyr::summarise(
+      nDonors = dplyr::n_distinct(donorID),
+      medianProportion = median(proportion),
+      meanProportion = mean(proportion),
+      .groups = "drop"
+    )
+  clusterAbundanceSummary[[comp]] <- summaryDf
+
+  write.csv(
+    abundanceDf,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_WNN_cluster_abundance_by_donor_phase.csv")),
+    row.names = FALSE
+  )
+  write.csv(
+    summaryDf,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_WNN_cluster_abundance_summary.csv")),
+    row.names = FALSE
+  )
+
+  pHeat <- ggplot(summaryDf,
+    aes(x = treatmentPhase, y = cluster, fill = medianProportion)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = sprintf("%.0f%%", 100 * medianProportion)), size = 3) +
+    scale_fill_viridis_c(option = "C",
+      labels = scales::percent_format(accuracy = 1),
+      name = "Median donor proportion") +
+    labs(
+      x = "Treatment Phase",
+      y = "WNN Cluster",
+      title = paste(comp, "— Donor-Normalized WNN Cluster Abundance"),
+      subtitle = "Median within-donor cluster proportion"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(pHeat)
+  savePlot(
+    plot = pHeat,
+    plotDir = plotDir,
+    filename = paste0(comp, "_WNN_cluster_abundance_heatmap"),
+    height = 6,
+    width = 10
+  )
+
+  pTraj <- plotClusterAbundanceTrajectories(
+    abundanceDf,
+    paste(comp, "— Donor-Normalized WNN Cluster Abundance Trajectories")
+  )
+
+  print(pTraj)
+  savePlot(
+    plot = pTraj,
+    plotDir = plotDir,
+    filename = paste0(comp, "_WNN_cluster_abundance_trajectories"),
+    height = max(6, 2.5 * ceiling(length(unique(abundanceDf$cluster)) / 3)),
+    width = 14
+  )
+}
+```
+
+## WNN Cluster Phenotype Summary
+
+```{r clusterPhenotypeSummary, cache = FALSE}
+clusterPhenotypes <- list()
+
+for (comp in compartments) {
+  clusterPhenotypes[[comp]] <- buildClusterPhenotypeSummary(
+    seuratObj = seuratList[[comp]],
+    markers = allMarkers[[comp]]
+  )
+
+  outFile <- file.path(tableDir,
+    paste0(filenameSuffix, "_", comp, "_WNN_cluster_phenotypes.csv"))
+  write.csv(clusterPhenotypes[[comp]], file = outFile, row.names = FALSE)
+
+  cat(sprintf("%s: cluster phenotype summary saved (%d clusters)\n",
+    comp, nrow(clusterPhenotypes[[comp]])))
+}
+```
+
 ## HALLMARK IL2-STAT5 Signaling Score
 
-```{r il2Stat5Score}
+```{r il2Stat5Score, cache = FALSE}
 library(msigdbr)
 
 il2Stat5Genes <- msigdbr(species = "Homo sapiens", category = "H") %>%
@@ -970,9 +1855,35 @@ for (comp in compartments) {
 }
 ```
 
+## IL2-STAT5 Donor-Phase Summaries
+
+```{r il2Stat5Summaries, cache = FALSE}
+il2Stat5Summaries <- list()
+
+for (comp in compartments) {
+  il2Stat5Summaries[[comp]] <- buildIl2Stat5Summary(seuratList[[comp]])
+
+  write.csv(
+    il2Stat5Summaries[[comp]]$donorPhaseCluster,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_IL2STAT5_scores_by_donor_phase_cluster.csv")),
+    row.names = FALSE
+  )
+  write.csv(
+    il2Stat5Summaries[[comp]]$phaseSummary,
+    file.path(tableDir,
+      paste0(filenameSuffix, "_", comp, "_IL2STAT5_scores_phase_summary.csv")),
+    row.names = FALSE
+  )
+
+  cat(sprintf("%s: IL2-STAT5 donor-phase summaries saved (%d donor-phase-cluster groups)\n",
+    comp, nrow(il2Stat5Summaries[[comp]]$donorPhaseCluster)))
+}
+```
+
 ## IL2-STAT5 UMAPs
 
-```{r il2Stat5UMAPs, fig.height = 5, fig.width = 18}
+```{r il2Stat5UMAPs, fig.height = 5, fig.width = 18, cache = FALSE}
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
 
@@ -1006,7 +1917,7 @@ for (comp in compartments) {
 
 ## IL2-STAT5 Violins by Cluster
 
-```{r il2Stat5Violins, fig.height = 6, fig.width = 14}
+```{r il2Stat5Violins, fig.height = 6, fig.width = 14, cache = FALSE}
 for (comp in compartments) {
   seuratObj <- seuratList[[comp]]
   meta <- seuratObj@meta.data
@@ -1051,9 +1962,44 @@ for (comp in compartments) {
 }
 ```
 
+## IL2-STAT5 Heatmap and Trajectories
+
+```{r il2Stat5SummaryPlots, fig.height = 8, fig.width = 14, cache = FALSE}
+for (comp in compartments) {
+  phaseSummary <- il2Stat5Summaries[[comp]]$phaseSummary
+  donorSummary <- il2Stat5Summaries[[comp]]$donorPhaseCluster
+
+  pHeat <- plotIl2Stat5Heatmap(
+    phaseSummary,
+    paste(comp, "— IL2-STAT5 Median Donor Score by WNN Cluster")
+  )
+  print(pHeat)
+  savePlot(
+    plot = pHeat,
+    plotDir = plotDir,
+    filename = paste0(comp, "_IL2_STAT5_heatmap"),
+    height = 6,
+    width = 10
+  )
+
+  pTraj <- plotIl2Stat5Trajectories(
+    donorSummary,
+    paste(comp, "— IL2-STAT5 Donor Trajectories by WNN Cluster")
+  )
+  print(pTraj)
+  savePlot(
+    plot = pTraj,
+    plotDir = plotDir,
+    filename = paste0(comp, "_IL2_STAT5_trajectories"),
+    height = max(6, 2.5 * ceiling(length(unique(donorSummary$cluster)) / 3)),
+    width = 14
+  )
+}
+```
+
 # Save WNN Bundle
 
-```{r saveBundle}
+```{r saveBundle, cache = FALSE}
 wnnBundle_path <- file.path(dataOutputDir,
   paste0(filenameSuffix, "_WNN_bundle.rds"))
 
@@ -1067,12 +2013,23 @@ wnnBundle <- list(
   rnaClusterMarkers = rnaClusterMarkers,
   atacClusterMarkers = atacClusterMarkers,
   evalResults = evalResults,
+  clusterCountSummary = clusterCountSummary,
+  primaryContrastDefs = primaryContrastDefs,
+  integrationSettings = integrationSettings,
+  clusterCoverage = clusterCoverage,
+  clusterReadiness = clusterReadiness,
+  clusterAbundance = clusterAbundance,
+  clusterAbundanceSummary = clusterAbundanceSummary,
+  clusterMappings = clusterMappings,
+  clusterPhenotypes = clusterPhenotypes,
+  il2Stat5Summaries = il2Stat5Summaries,
 
   # Carry forward
   tcrGeneList = tcrGeneList,
   palDonorId = palDonorId,
   palVisit = palVisit,
   palTreatmentPhase = palTreatmentPhase,
+  sourcePeakCallingBundles = sourcePeakCallingBundles,
 
   # Metadata
   dataDate = dataDate,

@@ -46,6 +46,7 @@ opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE,
 opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
 
 options(stringsAsFactors = FALSE)
+knitr::opts_chunk$set(error = FALSE)
 options(future.globals.maxSize = 1591289600)
 ```
 
@@ -72,6 +73,7 @@ source(file.path(getwd(), "code/P697_functions.R"))
 ```{r loadBundle}
 bundleFiles <- list.files(dataOutputDir,
   pattern = "P697\\..*_WNN_bundle\\.rds$", full.names = TRUE)
+stopifnot("No WNN bundle found in data/outputData" = length(bundleFiles) > 0)
 bundleFile <- bundleFiles[which.max(file.mtime(bundleFiles))]
 cat("Loading WNN bundle:", basename(bundleFile), "\n")
 
@@ -82,6 +84,9 @@ seuratList <- list(
   Treg = wnnBundle$seuratTreg
 )
 compartments <- c("NK", "Treg")
+
+# The downstream updates in this script operate on the existing WNN bundle.
+# Peak-calling does not need to be re-run unless the ATAC feature space changes.
 
 # TODO: clean up this hack rename stuff after we regenerate the bundle
 # Rename Washout → Followup to match updated nomenclature
@@ -123,9 +128,21 @@ contrastDefs <- list(
   PostRAPA_vs_Followup = c("Post-RAPA", "Followup")
 )
 
+primaryContrasts <- c(
+  "PostIL2_vs_BL",
+  "PostRAPA_vs_BL",
+  "Followup_vs_BL",
+  "Followup_vs_PostRAPA"
+)
+
 cat("Contrasts defined:\n")
 for (nm in names(contrastDefs)) {
   cat(sprintf("  %s: %s vs %s\n", nm, contrastDefs[[nm]][1], contrastDefs[[nm]][2]))
+}
+
+cat("\nPrimary PI-facing contrasts:\n")
+for (nm in primaryContrasts) {
+  cat(sprintf("  %s\n", nm))
 }
 ```
 
@@ -263,6 +280,222 @@ plotVolcano <- function(tt, contrastName, featureType = "Gene",
         featureType, nUp, nDown, pCutoff, fcCutoff)) +
     theme(legend.position = "none")
 }
+
+buildCoverageTable <- function(seuratObj) {
+  donorLevels <- sort(unique(as.character(seuratObj$donorID)))
+  phaseLevels <- c("Baseline", "Post-IL2", "Post-RAPA", "Followup")
+
+  seuratObj@meta.data %>%
+    dplyr::count(donorID, treatmentPhase, name = "nCells") %>%
+    tidyr::complete(
+      donorID = donorLevels,
+      treatmentPhase = factor(phaseLevels, levels = phaseLevels),
+      fill = list(nCells = 0)
+    ) %>%
+    dplyr::mutate(
+      donorID = factor(donorID, levels = donorLevels),
+      treatmentPhase = factor(treatmentPhase, levels = phaseLevels)
+    )
+}
+
+summarizeCoverageTable <- function(coverageDf, compartment) {
+  coverageDf %>%
+    dplyr::group_by(treatmentPhase) %>%
+    dplyr::summarise(
+      compartment = compartment,
+      nDonorsWithCells = sum(nCells > 0),
+      medianCellsPerDonor = ifelse(any(nCells > 0), median(nCells[nCells > 0]), NA_real_),
+      minCellsPerDonor = ifelse(any(nCells > 0), min(nCells[nCells > 0]), NA_real_),
+      maxCellsPerDonor = ifelse(any(nCells > 0), max(nCells[nCells > 0]), NA_real_),
+      .groups = "drop"
+    ) %>%
+    dplyr::select(compartment, dplyr::everything())
+}
+
+plotCoverageHeatmap <- function(coverageDf, title) {
+  ggplot(coverageDf, aes(x = treatmentPhase, y = donorID, fill = nCells)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = nCells), size = 3.5) +
+    scale_fill_viridis_c(option = "C", name = "# Cells") +
+    labs(x = "Treatment Phase", y = "Donor", title = title) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+classifyPeakByDistance <- function(distanceToTSS) {
+  dplyr::case_when(
+    is.na(distanceToTSS) ~ "Unassigned",
+    distanceToTSS <= 2000 ~ "Promoter (<=2kb)",
+    distanceToTSS <= 100000 ~ "Distal (2-100kb)",
+    TRUE ~ "Distal (>100kb)"
+  )
+}
+
+buildPeakAnnotationTable <- function(seuratObj) {
+  peakNames <- rownames(seuratObj[["ATAC"]])
+  peakGR <- tryCatch(StringToGRanges(peakNames), error = function(e) NULL)
+
+  if (is.null(peakGR)) {
+    return(data.frame(
+      feature = peakNames,
+      seqnames = NA_character_,
+      start = NA_integer_,
+      end = NA_integer_,
+      width = NA_integer_,
+      nearestGene = NA_character_,
+      distanceToTSS = NA_real_,
+      peakClass = "Unassigned",
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  annotationDf <- data.frame(
+    feature = peakNames,
+    seqnames = as.character(GenomeInfoDb::seqnames(peakGR)),
+    start = GenomicRanges::start(peakGR),
+    end = GenomicRanges::end(peakGR),
+    width = GenomicRanges::width(peakGR),
+    stringsAsFactors = FALSE
+  )
+
+  nearestDf <- tryCatch(ClosestFeature(seuratObj, regions = peakGR), error = function(e) NULL)
+  if (!is.null(nearestDf) && nrow(nearestDf) > 0) {
+    matched <- match(annotationDf$feature, nearestDf$query_region)
+    annotationDf$nearestGene <- nearestDf$gene_name[matched]
+    annotationDf$distanceToTSS <- nearestDf$distance[matched]
+  } else {
+    annotationDf$nearestGene <- NA_character_
+    annotationDf$distanceToTSS <- NA_real_
+  }
+
+  annotationDf$peakClass <- classifyPeakByDistance(annotationDf$distanceToTSS)
+  annotationDf
+}
+
+ensureAtacMotifs <- function(seuratObj) {
+  motifsPresent <- tryCatch(!is.null(seuratObj[["ATAC"]]@motifs), error = function(e) FALSE)
+  if (motifsPresent) return(seuratObj)
+
+  pfm <- TFBSTools::getMatrixSet(
+    JASPAR2020::JASPAR2020,
+    opts = list(collection = "CORE", tax_group = "vertebrates", all_versions = FALSE)
+  )
+
+  AddMotifs(
+    object = seuratObj,
+    genome = BSgenome.Hsapiens.UCSC.hg38::BSgenome.Hsapiens.UCSC.hg38,
+    pfm = pfm
+  )
+}
+
+buildMultimodalPeakGeneTable <- function(rnaTable, atacTable, peakAnnotation,
+                                         maxDistance = 100000,
+                                         pCutoff = 0.05,
+                                         fcCutoff = 0.5) {
+  atacAnnotated <- atacTable %>%
+    dplyr::left_join(peakAnnotation, by = "feature") %>%
+    dplyr::rename(
+      ATAC_logFC = logFC,
+      ATAC_FDR = adj.P.Val,
+      ATAC_t = t
+    )
+
+  rnaCompact <- rnaTable %>%
+    dplyr::select(feature, logFC, adj.P.Val, t) %>%
+    dplyr::rename(
+      nearestGene = feature,
+      RNA_logFC = logFC,
+      RNA_FDR = adj.P.Val,
+      RNA_t = t
+    )
+
+  atacAnnotated %>%
+    dplyr::filter(!is.na(nearestGene) & !is.na(distanceToTSS) & distanceToTSS <= maxDistance) %>%
+    dplyr::inner_join(rnaCompact, by = "nearestGene") %>%
+    dplyr::mutate(
+      ATAC_sig = ATAC_FDR < pCutoff & abs(ATAC_logFC) > fcCutoff,
+      RNA_sig = RNA_FDR < pCutoff & abs(RNA_logFC) > fcCutoff
+    ) %>%
+    dplyr::filter(ATAC_sig) %>%
+    dplyr::mutate(
+      multimodalClass = dplyr::case_when(
+        RNA_sig & ATAC_logFC > 0 & RNA_logFC > 0 ~ "Concordant up",
+        RNA_sig & ATAC_logFC < 0 & RNA_logFC < 0 ~ "Concordant down",
+        RNA_sig ~ "Discordant",
+        TRUE ~ "DA-only nearby gene"
+      ),
+      absCombinedLogFC = abs(ATAC_logFC) + abs(RNA_logFC)
+    ) %>%
+    dplyr::arrange(ATAC_FDR, RNA_FDR, dplyr::desc(absCombinedLogFC))
+}
+```
+
+# Study Coverage and Primary Contrasts {.tabset}
+
+## Global Donor x Phase Coverage
+
+```{r globalCoverage, fig.height = 5, fig.width = 9}
+globalCoverage <- list()
+coverageSummary <- list()
+
+for (comp in compartments) {
+  coverageDf <- buildCoverageTable(seuratList[[comp]])
+  globalCoverage[[comp]] <- coverageDf
+  coverageSummary[[comp]] <- summarizeCoverageTable(coverageDf, comp)
+
+  outCsv <- file.path(tableDir,
+    paste0(filenameSuffix, "_", comp, "_global_donor_phase_coverage.csv"))
+  write.csv(coverageDf, file = outCsv, row.names = FALSE)
+
+  pCoverage <- plotCoverageHeatmap(
+    coverageDf,
+    paste(comp, "— Cells per Donor x Treatment Phase")
+  )
+
+  print(pCoverage)
+  savePlot(
+    plot = pCoverage,
+    plotDir = plotDir,
+    filename = paste0(comp, "_global_donor_phase_coverage"),
+    height = 5,
+    width = 9
+  )
+
+  cat(sprintf("\n%s coverage summary:\n", comp))
+  print(coverageSummary[[comp]])
+}
+
+coverageSummaryDf <- bind_rows(coverageSummary)
+write.csv(
+  coverageSummaryDf,
+  file.path(tableDir, paste0(filenameSuffix, "_global_donor_phase_coverage_summary.csv")),
+  row.names = FALSE
+)
+```
+
+## Primary Contrast Reference
+
+```{r primaryContrastReference, results = "markup"}
+primaryContrastReference <- tibble(
+  contrast = primaryContrasts,
+  comparison = vapply(primaryContrasts, function(nm) {
+    paste(contrastDefs[[nm]], collapse = " vs ")
+  }, character(1)),
+  rationale = c(
+    "Immediate low-dose IL-2 response versus baseline",
+    "State after rapamycin exposure versus baseline",
+    "Net followup remodeling versus baseline",
+    "Resolution or persistence after rapamycin cessation"
+  )
+)
+
+kable(primaryContrastReference, row.names = FALSE,
+  caption = "Primary contrasts emphasized for PI-facing interpretation")
+
+write.csv(
+  primaryContrastReference,
+  file.path(tableDir, paste0(filenameSuffix, "_primary_contrast_reference.csv")),
+  row.names = FALSE
+)
 ```
 
 # Global Pseudobulk RNA DGE {.tabset}
@@ -418,6 +651,127 @@ for (comp in compartments) {
 }
 ```
 
+## Peak Annotation
+
+```{r atacPeakAnnotations}
+peakAnnotations <- list()
+
+for (comp in compartments) {
+  seuratObj <- seuratList[[comp]]
+  DefaultAssay(seuratObj) <- "ATAC"
+
+  peakAnnotations[[comp]] <- buildPeakAnnotationTable(seuratObj)
+
+  outFile <- file.path(tableDir,
+    paste0(filenameSuffix, "_", comp, "_ATAC_peak_annotations.csv"))
+  write.csv(peakAnnotations[[comp]], file = outFile, row.names = FALSE)
+
+  cat(sprintf("%s: peak annotation saved (%d peaks)\n",
+    comp, nrow(peakAnnotations[[comp]])))
+}
+```
+
+## Primary Contrast Motif Enrichment
+
+```{r atacPrimaryMotifs, fig.height = 8, fig.width = 12}
+motifResults <- list()
+motifRequiredPkgs <- c("JASPAR2020", "TFBSTools", "BSgenome.Hsapiens.UCSC.hg38")
+missingMotifPkgs <- motifRequiredPkgs[
+  !vapply(motifRequiredPkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missingMotifPkgs) > 0) {
+  cat("Skipping motif enrichment; missing packages:",
+    paste(missingMotifPkgs, collapse = ", "), "\n")
+} else {
+  for (comp in compartments) {
+    if (is.null(atacResults[[comp]])) next
+
+    seuratObj <- seuratList[[comp]]
+    DefaultAssay(seuratObj) <- "ATAC"
+    seuratObj <- ensureAtacMotifs(seuratObj)
+    seuratList[[comp]] <- seuratObj
+    motifResults[[comp]] <- list()
+
+    plotDf <- data.frame()
+
+    for (nm in intersect(primaryContrasts, names(atacResults[[comp]]$results))) {
+      tt <- atacResults[[comp]]$results[[nm]]
+
+      for (direction in c("Up", "Down")) {
+        peakSubset <- tt %>%
+          dplyr::filter(
+            adj.P.Val < 0.05,
+            if (direction == "Up") logFC > 0.5 else logFC < -0.5
+          ) %>%
+          dplyr::pull(feature)
+
+        if (length(peakSubset) < 25) {
+          cat(sprintf("%s %s %s: only %d DA peaks for motif enrichment — skipping\n",
+            comp, nm, direction, length(peakSubset)))
+          next
+        }
+
+        motifRes <- tryCatch(
+          FindMotifs(seuratObj, features = peakSubset),
+          error = function(e) {
+            cat(sprintf("%s %s %s motif error: %s\n",
+              comp, nm, direction, e$message))
+            NULL
+          }
+        )
+
+        if (is.null(motifRes) || nrow(motifRes) == 0) next
+
+        motifRes$contrast <- nm
+        motifRes$direction <- direction
+        motifResults[[comp]][[paste(nm, direction, sep = "_")]] <- motifRes
+
+        outFile <- file.path(tableDir,
+          paste0(filenameSuffix, "_", comp, "_ATAC_motif_", nm, "_", direction, ".csv"))
+        write.csv(motifRes, file = outFile, row.names = FALSE)
+
+        topMotifs <- motifRes %>%
+          arrange(pvalue) %>%
+          head(5)
+        topMotifs$motifLabel <- if ("motif.name" %in% colnames(topMotifs)) {
+          topMotifs$motif.name
+        } else {
+          topMotifs$motif
+        }
+        topMotifs$contrast <- nm
+        topMotifs$direction <- direction
+        plotDf <- bind_rows(plotDf, topMotifs)
+      }
+    }
+
+    if (nrow(plotDf) > 0) {
+      pMotif <- ggplot(plotDf,
+        aes(x = direction, y = reorder(motifLabel, fold.enrichment))) +
+        geom_point(aes(size = fold.enrichment, color = -log10(pvalue))) +
+        facet_wrap(~contrast, scales = "free_y") +
+        scale_color_viridis_c(name = "-log10(P)") +
+        scale_size_area(max_size = 10, name = "Fold enrichment") +
+        labs(
+          x = "Direction of DA peaks",
+          y = "Motif",
+          title = paste(comp, "— Primary Contrast ATAC Motif Enrichment")
+        ) +
+        theme(axis.text.y = element_text(size = 8))
+
+      print(pMotif)
+      savePlot(
+        plot = pMotif,
+        plotDir = plotDir,
+        filename = paste0(comp, "_ATAC_primary_motif_enrichment"),
+        height = 8,
+        width = 12
+      )
+    }
+  }
+}
+```
+
 ## ATAC Results Tables
 
 ```{r atacResultsTables}
@@ -425,7 +779,8 @@ for (comp in compartments) {
   if (is.null(atacResults[[comp]])) next
 
   for (nm in names(atacResults[[comp]]$results)) {
-    tt <- atacResults[[comp]]$results[[nm]]
+    tt <- atacResults[[comp]]$results[[nm]] %>%
+      left_join(peakAnnotations[[comp]], by = "feature")
     outFile <- file.path(tableDir,
       paste0(filenameSuffix, "_", comp, "_ATAC_DA_", nm, ".csv"))
     write.csv(tt, file = outFile, row.names = FALSE)
@@ -440,6 +795,7 @@ for (comp in compartments) {
 
 ```{r perClusterRNADGE}
 perClusterRNA <- list()
+perClusterRNAStatus <- list()
 
 for (comp in compartments) {
   cat(sprintf("\n=== %s: Per-Cluster RNA DGE ===\n", comp))
@@ -448,14 +804,28 @@ for (comp in compartments) {
 
   clusters <- sort(unique(seuratObj$wnn_clusters))
   perClusterRNA[[comp]] <- list()
+  clusterStatus <- data.frame()
 
   for (cl in clusters) {
     cat(sprintf("\n  Cluster %s:\n", cl))
 
     # Subset to cluster
     cellIdx <- which(seuratObj$wnn_clusters == cl)
+    statusRow <- data.frame(
+      cluster = as.character(cl),
+      nCells = length(cellIdx),
+      nFeaturesPass = NA_integer_,
+      nPhasesWithTwoDonors = NA_integer_,
+      nPseudobulkGroups = NA_integer_,
+      analyzed = FALSE,
+      skipReason = NA_character_,
+      stringsAsFactors = FALSE
+    )
+
     if (length(cellIdx) < 20) {
       cat(sprintf("    Skipping: only %d cells\n", length(cellIdx)))
+      statusRow$skipReason <- "lt20_cells"
+      clusterStatus <- bind_rows(clusterStatus, statusRow)
       next
     }
 
@@ -464,10 +834,13 @@ for (comp in compartments) {
     # Filter genes: >= 30% of cells in this cluster
     geneFilter <- Matrix::rowSums(counts > 0) >= 0.3 * length(cellIdx)
     counts <- counts[geneFilter, ]
+    statusRow$nFeaturesPass <- nrow(counts)
     cat(sprintf("    %d cells, %d genes pass filter\n", length(cellIdx), nrow(counts)))
 
     if (nrow(counts) < 50) {
       cat("    Skipping: too few genes pass filter\n")
+      statusRow$skipReason <- "lt50_genes"
+      clusterStatus <- bind_rows(clusterStatus, statusRow)
       next
     }
 
@@ -476,12 +849,16 @@ for (comp in compartments) {
     # Check: need at least 2 treatment phases with >= 2 donors each
     phaseTab <- table(meta$treatmentPhase, meta$donorID)
     phasesWithData <- rowSums(phaseTab > 0) >= 2
+    statusRow$nPhasesWithTwoDonors <- sum(phasesWithData)
     if (sum(phasesWithData) < 2) {
       cat("    Skipping: insufficient donor coverage across phases\n")
+      statusRow$skipReason <- "insufficient_donor_phase_coverage"
+      clusterStatus <- bind_rows(clusterStatus, statusRow)
       next
     }
 
     agg <- aggregatePseudobulk(counts, meta, c("donorID", "treatmentPhase"))
+    statusRow$nPseudobulkGroups <- ncol(agg$counts)
 
     result <- tryCatch(
       runLimmaVoom(agg$counts, agg$designInfo, contrastDefs),
@@ -493,12 +870,19 @@ for (comp in compartments) {
 
     if (!is.null(result)) {
       perClusterRNA[[comp]][[as.character(cl)]] <- result
+      statusRow$analyzed <- TRUE
       for (nm in names(result$results)) {
         nSig <- sum(result$results[[nm]]$adj.P.Val < 0.05)
         cat(sprintf("    %s: %d DE genes\n", nm, nSig))
       }
+    } else {
+      statusRow$skipReason <- "limma_error"
     }
+
+    clusterStatus <- bind_rows(clusterStatus, statusRow)
   }
+
+  perClusterRNAStatus[[comp]] <- clusterStatus
 }
 ```
 
@@ -560,6 +944,7 @@ for (comp in compartments) {
 
 ```{r perClusterATACDA}
 perClusterATAC <- list()
+perClusterATACStatus <- list()
 
 for (comp in compartments) {
   cat(sprintf("\n=== %s: Per-Cluster ATAC DA ===\n", comp))
@@ -568,13 +953,27 @@ for (comp in compartments) {
 
   clusters <- sort(unique(seuratObj$wnn_clusters))
   perClusterATAC[[comp]] <- list()
+  clusterStatus <- data.frame()
 
   for (cl in clusters) {
     cat(sprintf("\n  Cluster %s:\n", cl))
 
     cellIdx <- which(seuratObj$wnn_clusters == cl)
+    statusRow <- data.frame(
+      cluster = as.character(cl),
+      nCells = length(cellIdx),
+      nFeaturesPass = NA_integer_,
+      nPhasesWithTwoDonors = NA_integer_,
+      nPseudobulkGroups = NA_integer_,
+      analyzed = FALSE,
+      skipReason = NA_character_,
+      stringsAsFactors = FALSE
+    )
+
     if (length(cellIdx) < 20) {
       cat(sprintf("    Skipping: only %d cells\n", length(cellIdx)))
+      statusRow$skipReason <- "lt20_cells"
+      clusterStatus <- bind_rows(clusterStatus, statusRow)
       next
     }
 
@@ -583,10 +982,13 @@ for (comp in compartments) {
     # Filter peaks: >= 5% of cells in this cluster
     peakFilter <- Matrix::rowSums(counts > 0) >= 0.05 * length(cellIdx)
     counts <- counts[peakFilter, ]
+    statusRow$nFeaturesPass <- nrow(counts)
     cat(sprintf("    %d cells, %d peaks pass filter\n", length(cellIdx), nrow(counts)))
 
     if (nrow(counts) < 50) {
       cat("    Skipping: too few peaks pass filter\n")
+      statusRow$skipReason <- "lt50_peaks"
+      clusterStatus <- bind_rows(clusterStatus, statusRow)
       next
     }
 
@@ -594,12 +996,16 @@ for (comp in compartments) {
 
     phaseTab <- table(meta$treatmentPhase, meta$donorID)
     phasesWithData <- rowSums(phaseTab > 0) >= 2
+    statusRow$nPhasesWithTwoDonors <- sum(phasesWithData)
     if (sum(phasesWithData) < 2) {
       cat("    Skipping: insufficient donor coverage across phases\n")
+      statusRow$skipReason <- "insufficient_donor_phase_coverage"
+      clusterStatus <- bind_rows(clusterStatus, statusRow)
       next
     }
 
     agg <- aggregatePseudobulk(counts, meta, c("donorID", "treatmentPhase"))
+    statusRow$nPseudobulkGroups <- ncol(agg$counts)
 
     result <- tryCatch(
       runLimmaVoom(agg$counts, agg$designInfo, contrastDefs),
@@ -611,12 +1017,19 @@ for (comp in compartments) {
 
     if (!is.null(result)) {
       perClusterATAC[[comp]][[as.character(cl)]] <- result
+      statusRow$analyzed <- TRUE
       for (nm in names(result$results)) {
         nSig <- sum(result$results[[nm]]$adj.P.Val < 0.05)
         cat(sprintf("    %s: %d DA peaks\n", nm, nSig))
       }
+    } else {
+      statusRow$skipReason <- "limma_error"
     }
+
+    clusterStatus <- bind_rows(clusterStatus, statusRow)
   }
+
+  perClusterATACStatus[[comp]] <- clusterStatus
 }
 ```
 
@@ -661,13 +1074,53 @@ for (comp in compartments) {
 for (comp in compartments) {
   for (cl in names(perClusterATAC[[comp]])) {
     for (nm in names(perClusterATAC[[comp]][[cl]]$results)) {
-      tt <- perClusterATAC[[comp]][[cl]]$results[[nm]]
+      tt <- perClusterATAC[[comp]][[cl]]$results[[nm]] %>%
+        left_join(peakAnnotations[[comp]], by = "feature")
       outFile <- file.path(tableDir,
         paste0(filenameSuffix, "_", comp, "_cluster", cl, "_ATAC_DA_", nm, ".csv"))
       write.csv(tt, file = outFile, row.names = FALSE)
     }
   }
   cat(sprintf("%s: per-cluster ATAC tables saved\n", comp))
+}
+```
+
+## Per-Cluster Coverage Status
+
+```{r perClusterCoverageStatus, fig.height = 6, fig.width = 10}
+for (comp in compartments) {
+  statusDf <- perClusterRNAStatus[[comp]] %>%
+    dplyr::mutate(analysis = "RNA") %>%
+    bind_rows(perClusterATACStatus[[comp]] %>% dplyr::mutate(analysis = "ATAC")) %>%
+    dplyr::mutate(
+      skipReason = ifelse(is.na(skipReason), "Analyzed", skipReason),
+      cluster = factor(cluster, levels = unique(cluster))
+    )
+
+  outFile <- file.path(tableDir,
+    paste0(filenameSuffix, "_", comp, "_perCluster_analysis_status.csv"))
+  write.csv(statusDf, file = outFile, row.names = FALSE)
+
+  pStatus <- ggplot(statusDf, aes(x = cluster, y = analysis, fill = skipReason)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = nCells), size = 3.5) +
+    scale_fill_brewer(palette = "Set2", name = "Status") +
+    labs(
+      x = "WNN Cluster",
+      y = "Analysis",
+      title = paste(comp, "— Per-Cluster Analysis Status"),
+      subtitle = "Tile labels show cells per cluster"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(pStatus)
+  savePlot(
+    plot = pStatus,
+    plotDir = plotDir,
+    filename = paste0(comp, "_perCluster_analysis_status"),
+    height = 6,
+    width = 10
+  )
 }
 ```
 
@@ -1410,6 +1863,68 @@ for (comp in compartments) {
 }
 ```
 
+## Primary Multimodal Concordance
+
+```{r multimodalConcordance, fig.height = 6, fig.width = 10}
+multimodalSummary <- list()
+multimodalCounts <- data.frame()
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]]) || is.null(atacResults[[comp]])) next
+  multimodalSummary[[comp]] <- list()
+
+  for (nm in intersect(primaryContrasts,
+    intersect(names(rnaResults[[comp]]$results), names(atacResults[[comp]]$results)))) {
+    joined <- buildMultimodalPeakGeneTable(
+      rnaTable = rnaResults[[comp]]$results[[nm]],
+      atacTable = atacResults[[comp]]$results[[nm]],
+      peakAnnotation = peakAnnotations[[comp]]
+    )
+
+    if (nrow(joined) == 0) next
+
+    multimodalSummary[[comp]][[nm]] <- joined
+    write.csv(
+      joined,
+      file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_multimodal_peak_gene_", nm, ".csv")),
+      row.names = FALSE
+    )
+
+    multimodalCounts <- bind_rows(
+      multimodalCounts,
+      joined %>%
+        dplyr::count(multimodalClass, name = "n") %>%
+        dplyr::mutate(compartment = comp, contrast = nm)
+    )
+  }
+}
+
+if (nrow(multimodalCounts) > 0) {
+  pMulti <- ggplot(multimodalCounts,
+    aes(x = contrast, y = n, fill = multimodalClass)) +
+    geom_col(position = "stack") +
+    facet_wrap(~compartment, scales = "free_y") +
+    scale_fill_brewer(palette = "Set2", name = "Peak-gene class") +
+    labs(
+      x = "Primary Contrast",
+      y = "# Significant DA peaks with nearby genes",
+      title = "Primary Multimodal Concordance",
+      subtitle = "Significant ATAC peaks linked to nearest genes within 100 kb"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(pMulti)
+  savePlot(
+    plot = pMulti,
+    plotDir = plotDir,
+    filename = "primary_multimodal_concordance",
+    height = 6,
+    width = 10
+  )
+}
+```
+
 ## LogFC Correlation (Top DE Peaks Nearest Genes)
 
 ```{r logFCCorrelation, fig.height = 6, fig.width = 8}
@@ -1746,9 +2261,19 @@ daBundle <- list(
   rnaResults = rnaResults,
   atacResults = atacResults,
 
+  # Coverage and interpretation helpers
+  primaryContrasts = primaryContrasts,
+  globalCoverage = globalCoverage,
+  coverageSummary = coverageSummaryDf,
+  peakAnnotations = peakAnnotations,
+  motifResults = motifResults,
+  multimodalSummary = multimodalSummary,
+
   # Per-cluster results
   perClusterRNA = perClusterRNA,
   perClusterATAC = perClusterATAC,
+  perClusterRNAStatus = perClusterRNAStatus,
+  perClusterATACStatus = perClusterATACStatus,
 
   # GSEA
   gseaResults = gseaResults,
