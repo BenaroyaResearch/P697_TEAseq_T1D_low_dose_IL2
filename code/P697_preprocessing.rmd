@@ -100,7 +100,7 @@ opts_chunk$set(fig.width = 6, fig.height = 4.0, cache = TRUE, echo = FALSE, warn
 opts_knit$set(root.dir = "/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
 
 options(stringsAsFactors = FALSE)
-
+knitr::opts_chunk$set(error = FALSE)
 options(future.globals.maxSize = 1591289600)
 ```
 

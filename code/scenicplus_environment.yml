@@ -1,0 +1,13 @@
+name: scenicplus_env
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - scenicplus @ git+https://github.com/aertslab/scenicplus
+      - jupyter
+      - ipykernel
+      - session-info
+      - colorcet
+      - adjusttext

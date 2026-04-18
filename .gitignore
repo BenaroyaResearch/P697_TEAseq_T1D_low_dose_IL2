@@ -48,3 +48,10 @@ renv/staging/
 *.sorted
 data/.DS_Store
 .DS_Store
+
+# SCENIC+ cisTarget databases and intermediate outputs
+data/inputData/cisTarget_dbs/
+*.feather
+*.h5mu
+*.hdf5
+*.pkl
