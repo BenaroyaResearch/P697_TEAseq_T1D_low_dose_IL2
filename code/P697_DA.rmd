@@ -14,6 +14,7 @@ editor_options:
 setwd("/Users/tedwards/Documents/projects/P697_TEAseq_T1D_low_dose_IL2")
 
 library(knitr)
+knitr::opts_chunk$set(error = FALSE) # so that code will actually halt on error
 library(dplyr)
 library(tibble)
 library(tidyr)
@@ -29,6 +30,7 @@ library(clusterProfiler)
 library(msigdbr)
 library(ggrepel)
 library(RColorBrewer)
+library(ComplexUpset)
 
 theme_set(
   theme_bw(20) +
@@ -578,6 +580,204 @@ for (comp in compartments) {
       paste0(filenameSuffix, "_", comp, "_RNA_DGE_", nm, ".csv"))
     write.csv(tt, file = outFile, row.names = FALSE)
     cat(sprintf("Saved: %s\n", basename(outFile)))
+  }
+}
+```
+
+## RNA DGE UpSet Plots
+
+```{r rnaDGEUpset, fig.height = 7, fig.width = 12}
+# Build UpSet plots showing the number of significant DEGs per contrast and
+# the overlap between contrasts, for each compartment. Two thresholds:
+#   (1) padj < 0.05
+#   (2) padj < 0.05 AND abs(logFC) > 1
+upsetThresholds <- list(
+  padj05          = list(label = "padj < 0.05",
+    fn = function(tt) tt$adj.P.Val < 0.05),
+  padj05_lfc0p5     = list(label = "padj < 0.05 & |logFC| > 0.5",
+    fn = function(tt) tt$adj.P.Val < 0.05 & abs(tt$logFC) > 0.5)
+)
+
+# Helper: build a wide 0/1 membership data.frame (rows = genes, cols = contrasts)
+buildUpsetMembership <- function(resultsList, sigFn) {
+  contrastNames <- names(resultsList)
+  sigSets <- lapply(resultsList, function(tt) {
+    # Gene ID is typically rownames or a "gene"/"Gene" column; guard for both.
+    if ("gene" %in% colnames(tt)) {
+      rownames(tt) <- tt$gene
+    } else if ("Gene" %in% colnames(tt)) {
+      rownames(tt) <- tt$Gene
+    }
+    rownames(tt)[sigFn(tt)]
+  })
+  allGenes <- unique(unlist(sigSets))
+  if (length(allGenes) == 0) return(NULL)
+
+  mem <- as.data.frame(
+    vapply(sigSets, function(s) as.integer(allGenes %in% s),
+      integer(length(allGenes))),
+    stringsAsFactors = FALSE
+  )
+  rownames(mem) <- allGenes
+  # ComplexUpset requires logical columns
+  mem[] <- lapply(mem, as.logical)
+  mem
+}
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+  resList <- rnaResults[[comp]]$results
+
+  for (thrName in names(upsetThresholds)) {
+    thr <- upsetThresholds[[thrName]]
+    mem <- buildUpsetMembership(resList, thr$fn)
+
+    if (is.null(mem) || sum(rowSums(mem) > 0) < 1) {
+      cat(sprintf("  %s RNA DGE (%s): no significant genes, skipping UpSet.\n",
+        comp, thr$label))
+      next
+    }
+
+    contrastCols <- colnames(mem)
+    p <- upset(
+      mem,
+      intersect = contrastCols,
+      name      = "Contrast",
+      min_size  = 1,
+      sort_sets = FALSE,
+      sort_intersections_by = "cardinality",
+      base_annotations = list(
+        "Intersection size" = intersection_size(
+          text = list(size = 3)
+        )
+      ),
+      set_sizes = upset_set_size() +
+        ylab("DEGs per contrast")
+    ) +
+      patchwork::plot_annotation(
+        title    = sprintf("%s RNA DGE overlap across contrasts", comp),
+        subtitle = sprintf("Significance threshold: %s", thr$label)
+      )
+
+    print(p)
+
+    savePlot(
+      plot = p, plotDir = plotDir,
+      filename = paste0(comp, "_RNA_DGE_upset_", thrName),
+      height = 7, width = 12
+    )
+
+    # Also write the membership matrix so intersections can be inspected.
+    memOut <- tibble::rownames_to_column(mem, var = "gene")
+    write.csv(
+      memOut,
+      file = file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_RNA_DGE_upset_", thrName, "_membership.csv")),
+      row.names = FALSE
+    )
+  }
+}
+```
+
+## RNA DGE UpSet Plots, Split by Direction
+
+```{r rnaDGEUpsetDirectional, fig.height = 7, fig.width = 14}
+# Same two thresholds as above, but each contrast is split into an Up and a
+# Down set so doubly-present genes (e.g. up in one contrast, down in another)
+# show up as distinct intersections. Uses upsetThresholds defined above.
+
+# Helper: membership with each contrast split into "{contrast}_Up" and
+# "{contrast}_Down" columns.
+buildUpsetMembershipDirectional <- function(resultsList, sigFn) {
+  sigSets <- list()
+  for (nm in names(resultsList)) {
+    tt <- resultsList[[nm]]
+    if ("gene" %in% colnames(tt)) {
+      rownames(tt) <- tt$gene
+    } else if ("Gene" %in% colnames(tt)) {
+      rownames(tt) <- tt$Gene
+    }
+    sig <- sigFn(tt)
+    sigSets[[paste0(nm, "_Up")]]   <- rownames(tt)[sig & tt$logFC > 0]
+    sigSets[[paste0(nm, "_Down")]] <- rownames(tt)[sig & tt$logFC < 0]
+  }
+  allGenes <- unique(unlist(sigSets))
+  if (length(allGenes) == 0) return(NULL)
+
+  mem <- as.data.frame(
+    vapply(sigSets, function(s) as.integer(allGenes %in% s),
+      integer(length(allGenes))),
+    stringsAsFactors = FALSE
+  )
+  rownames(mem) <- allGenes
+  mem[] <- lapply(mem, as.logical)
+  mem
+}
+
+for (comp in compartments) {
+  if (is.null(rnaResults[[comp]])) next
+  resList <- rnaResults[[comp]]$results
+
+  for (thrName in names(upsetThresholds)) {
+    thr <- upsetThresholds[[thrName]]
+    mem <- buildUpsetMembershipDirectional(resList, thr$fn)
+
+    if (is.null(mem) || sum(rowSums(mem) > 0) < 1) {
+      cat(sprintf("  %s RNA DGE (%s, directional): no significant genes, skipping UpSet.\n",
+        comp, thr$label))
+      next
+    }
+
+    contrastCols <- colnames(mem)
+    # Color bars by direction (Up = red, Down = blue) via per-set queries.
+    upCols   <- contrastCols[grepl("_Up$",   contrastCols)]
+    downCols <- contrastCols[grepl("_Down$", contrastCols)]
+    # Restrict queries to the matrix dots only; applying fill to bar-chart
+    # geoms (which have a variable row count) causes the aesthetics-length error.
+    directionQueries <- c(
+      lapply(upCols,   function(s) upset_query(set = s, fill = "#D7301F",
+        only_components = "intersections_matrix")),
+      lapply(downCols, function(s) upset_query(set = s, fill = "#2B8CBE",
+        only_components = "intersections_matrix"))
+    )
+
+    p <- upset(
+      mem,
+      intersect = contrastCols,
+      name      = "Contrast (direction)",
+      min_size  = 1,
+      sort_sets = FALSE,
+      sort_intersections_by = "cardinality",
+      base_annotations = list(
+        "Intersection size" = intersection_size(
+          text = list(size = 3)
+        )
+      ),
+      set_sizes = upset_set_size() +
+        ylab("DEGs per contrast (direction)"),
+      queries = directionQueries
+    ) +
+      patchwork::plot_annotation(
+        title    = sprintf("%s RNA DGE overlap across contrasts (Up/Down split)", comp),
+        subtitle = sprintf("Significance threshold: %s", thr$label)
+      )
+
+    print(p)
+
+    savePlot(
+      plot = p, plotDir = plotDir,
+      filename = paste0(comp, "_RNA_DGE_upset_", thrName, "_directional"),
+      height = 7, width = 14
+    )
+
+    memOut <- tibble::rownames_to_column(mem, var = "gene")
+    write.csv(
+      memOut,
+      file = file.path(tableDir,
+        paste0(filenameSuffix, "_", comp, "_RNA_DGE_upset_",
+          thrName, "_directional_membership.csv")),
+      row.names = FALSE
+    )
   }
 }
 ```
