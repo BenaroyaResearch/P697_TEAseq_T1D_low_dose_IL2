@@ -11980,6 +11980,60 @@
       "Maintainer": "Hans W. Borchers <hwborchers@googlemail.com>",
       "Repository": "CRAN"
     },
+    "presto": {
+      "Package": "presto",
+      "Version": "1.0.0",
+      "Source": "GitHub",
+      "Title": "Fast Functions for Differential Expression using Wilcox and AUC",
+      "Authors@R": "c( person(\"Ilya\", \"Korsunsky\", email = \"ilya.korsunsky@gmail.com\",  role = c(\"aut\"), comment = c(ORCID = \"0000-0003-4848-3948\")), person(\"Aparna\", \"Nathan\",  role = \"aut\"), person(\"Nghia\", \"Millard\",  role = \"aut\", comment = c(ORCID = \"0000-0002-0518-7674\")), person(\"Soumya\", \"Raychaudhuri\",  role = c(\"aut\"), comment = c(ORCID = \"0000-0002-1901-8265\")), person(\"Kamil\", \"Slowikowski\", email = \"kslowikowski@gmail.com\", role = c(\"cre\", \"ctb\"), comment = c(ORCID = \"0000-0002-2843-6370\")), person(\"Austin\", \"Hartman\", role = c(\"ctb\"), comment = c(ORCID = \"0000-0001-7278-1852\")) )",
+      "Description": "Scalable implementation of the Wilcoxon rank sum test and auROC statistic. Interfaces to dense and sparse matrices, as well as genomics analysis frameworks Seurat and SingleCellExperiment.",
+      "License": "GPL-3",
+      "LazyData": "true",
+      "Encoding": "UTF-8",
+      "Depends": [
+        "R (>= 3.5.0)",
+        "Rcpp",
+        "data.table"
+      ],
+      "LinkingTo": [
+        "Rcpp",
+        "RcppArmadillo"
+      ],
+      "biocViews": "",
+      "Imports": [
+        "dplyr",
+        "methods",
+        "tidyr",
+        "purrr",
+        "tibble",
+        "Matrix",
+        "rlang",
+        "stats",
+        "utils"
+      ],
+      "RoxygenNote": "7.3.3",
+      "Suggests": [
+        "knitr",
+        "rmarkdown",
+        "testthat",
+        "Seurat",
+        "SingleCellExperiment",
+        "SummarizedExperiment",
+        "broom",
+        "BiocStyle",
+        "DESeq2"
+      ],
+      "NeedsCompilation": "yes",
+      "VignetteBuilder": "knitr",
+      "Author": "Ilya Korsunsky [aut] (ORCID: <https://orcid.org/0000-0003-4848-3948>), Aparna Nathan [aut], Nghia Millard [aut] (ORCID: <https://orcid.org/0000-0002-0518-7674>), Soumya Raychaudhuri [aut] (ORCID: <https://orcid.org/0000-0002-1901-8265>), Kamil Slowikowski [cre, ctb] (ORCID: <https://orcid.org/0000-0002-2843-6370>), Austin Hartman [ctb] (ORCID: <https://orcid.org/0000-0001-7278-1852>)",
+      "Maintainer": "Kamil Slowikowski <kslowikowski@gmail.com>",
+      "RemoteType": "github",
+      "RemoteHost": "api.github.com",
+      "RemoteUsername": "immunogenomics",
+      "RemoteRepo": "presto",
+      "RemoteRef": "master",
+      "RemoteSha": "a24772a135c7895a8183b007376050556c60a05b"
+    },
     "prettyunits": {
       "Package": "prettyunits",
       "Version": "1.2.0",
@@ -13710,7 +13764,7 @@
     },
     "scDEED": {
       "Package": "scDEED",
-      "Version": "0.1.0",
+      "Version": "0.1.1",
       "Source": "GitHub",
       "Type": "Package",
       "Title": "Single-cell Dubious Embedding Detector",
@@ -13722,29 +13776,28 @@
       "Encoding": "UTF-8",
       "LazyData": "true",
       "Imports": [
-        "Seurat(== 3.2.3)",
-        "distances(== 0.1.8)",
-        "foreach(== 1.5.0)",
-        "ggplot2(== 3.3.2)",
-        "pracma(== 2.2.9)",
-        "doParallel(== 1.0.15)",
-        "ggsci(== 2.0)",
-        "Rfast(== 1.9.9)",
-        "VGAM(== 1.1.3)",
-        "rlang(== 0.4.11)",
-        "fastmap(== 1.1.0)",
-        "Matrix(== 1.3-4)"
+        "Seurat",
+        "distances",
+        "foreach",
+        "ggplot2",
+        "pracma",
+        "doParallel",
+        "ggsci",
+        "Rfast",
+        "VGAM",
+        "rlang",
+        "fastmap",
+        "Matrix"
       ],
       "Depends": [
         "R (>= 4.0.0)"
       ],
       "RemoteType": "github",
       "RemoteHost": "api.github.com",
+      "RemoteUsername": "BenaroyaResearch",
       "RemoteRepo": "scDEED",
-      "RemoteUsername": "JSB-UCLA",
-      "RemoteRef": "HEAD",
-      "RemoteSha": "920acbc1b00c32ee4f4205d4ea595dec8cebef59",
-      "NeedsCompilation": "no"
+      "RemoteRef": "main",
+      "RemoteSha": "0c667ddd30c3538843f863d31f5a126fcc9f1890"
     },
     "scales": {
       "Package": "scales",
