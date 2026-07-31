@@ -8,3 +8,10 @@
 # presto: used internally by Seurat::FindMarkers() (fast Wilcoxon / AUC) when
 #   installed -- nothing in this project calls presto:: directly.
 library(presto)
+
+# gitcreds: not used by any analysis code -- it is what lets renv authenticate to
+#   the PRIVATE BenaroyaResearch/theTools repo when restoring. Without it,
+#   renv::restore() fails on theTools with a bare "error code 56" download error.
+#   It is on CRAN, so renv installs it before it needs to reach GitHub and the
+#   restore becomes self-sufficient.
+library(gitcreds)

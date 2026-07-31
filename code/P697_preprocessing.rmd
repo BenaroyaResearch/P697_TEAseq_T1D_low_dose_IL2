@@ -210,7 +210,13 @@ for (sp in unique(P697_files_df$subproject)) {
 
 ```{r setupFunctions}
 # Source shared functions from external file
-source(file.path(getwd(), "code/P697_functions.R"))
+suppressPackageStartupMessages(library(theTools))
+# theTools's savePlot takes its figure-name prefix from this option rather
+# than reading a `filenameSuffix` global out of the calling frame, which is what
+# the retired local copy did. Without it every figure silently loses its
+# "<proj>.<date>_" prefix, writes to a new name, and stops overwriting the
+# previous run's output.
+options(theTools.filenameSuffix = filenameSuffix)
 ```
 
 ```{r fragmentConversionUtility}
